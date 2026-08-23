@@ -7,7 +7,6 @@ members = [
     "crates/graph",
     "crates/rules",
     "crates/config",
-    "crates/lsp",
     "crates/cli",
 ]
 
