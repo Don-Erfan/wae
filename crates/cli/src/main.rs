@@ -713,7 +713,7 @@ fn infer_feature_name(module_ref: &str) -> Option<String> {
 }
 
 fn infer_public_api_target(module_ref: &str) -> String {
-    if let Some((head, tail)) = module_ref.split_once("/internal") {
+    if let Some((head, _)) = module_ref.split_once("/internal") {
         return head.to_string();
     }
     if let Some((head, _)) = module_ref.split_once("/ui/") {
@@ -875,7 +875,7 @@ fn render_check_report(modules: usize, diagnostics: &[CheckDiagnostic]) -> Strin
     for diagnostic in diagnostics {
         output.push_str("\n\n");
         output.push_str(&diagnostic.rule_id);
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(&diagnostic.message);
 
         if !diagnostic.path.is_empty() {
@@ -958,10 +958,6 @@ fn format_count(value: usize) -> String {
     }
 
     result.chars().rev().collect()
-}
-
-fn banner() -> String {
-    wae_core::banner_lines().join("\n")
 }
 
 fn default_config_yaml() -> &'static str {
