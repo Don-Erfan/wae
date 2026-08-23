@@ -122,8 +122,43 @@ jobs:
   publish-npm:
     name: Publish npm package
     needs: release
-    uses: ./.github/workflows/publish-npm.yml
-    with:
-      tag: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Resolve and verify release version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          NPM_VERSION=$(node -p "require('./npm/wae/package.json').version")
+          test -n "$VERSION"
+          test "$VERSION" != "$RELEASE_TAG"
+          test "$CARGO_VERSION" = "$VERSION"
+          test "$NPM_VERSION" = "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify npm package contents
+        working-directory: npm/wae
+        env:
+          WAE_SKIP_DOWNLOAD: "1"
+        run: npm pack --dry-run
+
+      - name: Publish to npmjs.com
+        working-directory: npm/wae
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
