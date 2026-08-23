@@ -59,10 +59,7 @@ impl ModuleGraph {
             return Vec::new();
         };
 
-        self.outgoing[index]
-            .iter()
-            .map(|target| self.nodes[*target].clone())
-            .collect()
+        self.outgoing[index].iter().map(|target| self.nodes[*target].clone()).collect()
     }
 
     pub fn incoming(&self, node: &ModuleId) -> Vec<ModuleId> {
@@ -70,10 +67,7 @@ impl ModuleGraph {
             return Vec::new();
         };
 
-        self.incoming[index]
-            .iter()
-            .map(|source| self.nodes[*source].clone())
-            .collect()
+        self.incoming[index].iter().map(|source| self.nodes[*source].clone()).collect()
     }
 
     pub fn reachable_from(&self, start: &ModuleId) -> Vec<ModuleId> {
@@ -405,10 +399,7 @@ impl PackageGraph {
                 continue;
             }
 
-            graph.add_edge(PackageDependency {
-                from: from_package,
-                to: to_package,
-            });
+            graph.add_edge(PackageDependency { from: from_package, to: to_package });
         }
 
         graph
@@ -437,10 +428,7 @@ impl PackageGraph {
     }
 
     pub fn has_edge(&self, from: &PackageName, to: &PackageName) -> bool {
-        self.outgoing
-            .get(from)
-            .map(|targets| targets.contains(to))
-            .unwrap_or(false)
+        self.outgoing.get(from).map(|targets| targets.contains(to)).unwrap_or(false)
     }
 
     fn add_node(&mut self, package: PackageName) {
@@ -461,14 +449,8 @@ impl PackageGraph {
             return;
         }
 
-        self.outgoing
-            .entry(edge.from.clone())
-            .or_default()
-            .insert(edge.to.clone());
-        self.incoming
-            .entry(edge.to.clone())
-            .or_default()
-            .insert(edge.from.clone());
+        self.outgoing.entry(edge.from.clone()).or_default().insert(edge.to.clone());
+        self.incoming.entry(edge.to.clone()).or_default().insert(edge.from.clone());
         self.edges.push(edge);
     }
 }
@@ -505,10 +487,8 @@ mod tests {
 
     #[test]
     fn graph_supports_basic_queries() {
-        let package = Package {
-            name: PackageName(String::from("web")),
-            root_path: String::from("/app"),
-        };
+        let package =
+            Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
 
         let graph = ModuleGraph::from_project(
             &ProjectBuilder::new()
@@ -546,10 +526,8 @@ mod tests {
 
     #[test]
     fn graph_detects_scc_and_cycle_path() {
-        let package = Package {
-            name: PackageName(String::from("web")),
-            root_path: String::from("/app"),
-        };
+        let package =
+            Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
 
         let graph = ModuleGraph::from_project(
             &ProjectBuilder::new()
@@ -569,15 +547,16 @@ mod tests {
 
         let cycles = graph.cycles();
         assert_eq!(cycles.len(), 1);
-        assert_eq!(cycles[0].iter().map(|node| node.0.as_str()).collect::<Vec<_>>(), vec!["user", "payment", "checkout", "user"]);
+        assert_eq!(
+            cycles[0].iter().map(|node| node.0.as_str()).collect::<Vec<_>>(),
+            vec!["user", "payment", "checkout", "user"]
+        );
     }
 
     #[test]
     fn graph_handles_thousands_of_modules() {
-        let package = Package {
-            name: PackageName(String::from("web")),
-            root_path: String::from("/app"),
-        };
+        let package =
+            Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
 
         let mut builder = ProjectBuilder::new().add_package(package.clone());
 
@@ -587,7 +566,8 @@ mod tests {
         }
 
         for index in 0..(total_modules - 1) {
-            builder = builder.add_dependency(dependency(&format!("m{index}"), &format!("m{}", index + 1)));
+            builder = builder
+                .add_dependency(dependency(&format!("m{index}"), &format!("m{}", index + 1)));
         }
 
         let graph = ModuleGraph::from_project(&builder.build());
@@ -667,8 +647,17 @@ mod tests {
 
         assert_eq!(package_graph.nodes().len(), 3);
         assert_eq!(package_graph.edges().len(), 2);
-        assert!(package_graph.has_edge(&PackageName(String::from("apps/web")), &PackageName(String::from("packages/ui"))));
-        assert!(package_graph.has_edge(&PackageName(String::from("packages/ui")), &PackageName(String::from("packages/auth"))));
-        assert!(!package_graph.has_edge(&PackageName(String::from("packages/auth")), &PackageName(String::from("apps/web"))));
+        assert!(package_graph.has_edge(
+            &PackageName(String::from("apps/web")),
+            &PackageName(String::from("packages/ui"))
+        ));
+        assert!(package_graph.has_edge(
+            &PackageName(String::from("packages/ui")),
+            &PackageName(String::from("packages/auth"))
+        ));
+        assert!(!package_graph.has_edge(
+            &PackageName(String::from("packages/auth")),
+            &PackageName(String::from("apps/web"))
+        ));
     }
 }

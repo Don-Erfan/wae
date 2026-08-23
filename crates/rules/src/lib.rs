@@ -23,9 +23,6 @@ impl RuleSet {
     }
 
     pub fn check_all(&self, project: &Project) -> Vec<Diagnostic> {
-        self.rules
-            .iter()
-            .flat_map(|rule| rule.check(project))
-            .collect()
+        self.rules.iter().flat_map(|rule| rule.check(project)).collect()
     }
 }

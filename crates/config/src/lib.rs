@@ -9,9 +9,6 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            workspace_name: String::from("default"),
-            packages: Vec::new(),
-        }
+        Self { workspace_name: String::from("default"), packages: Vec::new() }
     }
 }

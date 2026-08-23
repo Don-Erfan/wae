@@ -188,10 +188,7 @@ pub mod domain {
 
     impl LayerPolicy {
         pub fn new(name: impl Into<String>) -> Self {
-            Self {
-                name: name.into(),
-                ..Self::default()
-            }
+            Self { name: name.into(), ..Self::default() }
         }
 
         pub fn with_patterns(mut self, patterns: Vec<String>) -> Self {
@@ -230,7 +227,8 @@ pub mod domain {
         }
 
         pub fn invalid_references(&self) -> Vec<(String, String)> {
-            let known: HashSet<&str> = self.layers.iter().map(|layer| layer.name.as_str()).collect();
+            let known: HashSet<&str> =
+                self.layers.iter().map(|layer| layer.name.as_str()).collect();
 
             self.layers
                 .iter()
@@ -402,7 +400,10 @@ pub mod domain {
             self
         }
 
-        pub fn add_dependency_candidate(mut self, dependency_candidate: DependencyCandidate) -> Self {
+        pub fn add_dependency_candidate(
+            mut self,
+            dependency_candidate: DependencyCandidate,
+        ) -> Self {
             self.dependency_candidates.push(dependency_candidate);
             self
         }
@@ -474,10 +475,8 @@ mod tests {
 
     #[test]
     fn can_build_project_graph_without_parser() {
-        let package = Package {
-            name: PackageName(String::from("web")),
-            root_path: String::from("/app"),
-        };
+        let package =
+            Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
 
         let module_a = Module {
             id: ModuleId(String::from("A")),

@@ -45,27 +45,15 @@ struct CliOutput {
 
 impl CliOutput {
     fn success(stdout: String) -> Self {
-        Self {
-            exit_code: EXIT_PASSED,
-            stdout,
-            stderr: String::new(),
-        }
+        Self { exit_code: EXIT_PASSED, stdout, stderr: String::new() }
     }
 
     fn violations(stdout: String) -> Self {
-        Self {
-            exit_code: EXIT_VIOLATIONS,
-            stdout,
-            stderr: String::new(),
-        }
+        Self { exit_code: EXIT_VIOLATIONS, stdout, stderr: String::new() }
     }
 
     fn failure(stderr: String) -> Self {
-        Self {
-            exit_code: EXIT_INTERNAL_OR_CONFIG,
-            stdout: String::new(),
-            stderr,
-        }
+        Self { exit_code: EXIT_INTERNAL_OR_CONFIG, stdout: String::new(), stderr }
     }
 }
 
@@ -118,29 +106,20 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 return Ok(Command::Check { changed: true });
             }
 
-            Err(String::from(
-                "Invalid check arguments. Usage: wae check [--changed]",
-            ))
+            Err(String::from("Invalid check arguments. Usage: wae check [--changed]"))
         }
         "explain" => {
             if args.len() < 2 {
                 return Err(String::from("Missing RULE_ID. Usage: wae explain <RULE_ID>"));
             }
-            Ok(Command::Explain {
-                rule_id: args[1].clone(),
-            })
+            Ok(Command::Explain { rule_id: args[1].clone() })
         }
         "mcp" => {
             if args.len() < 2 {
-                return Err(String::from(
-                    "Missing MCP tool name. Usage: wae mcp <TOOL> [ARGS]",
-                ));
+                return Err(String::from("Missing MCP tool name. Usage: wae mcp <TOOL> [ARGS]"));
             }
 
-            Ok(Command::Mcp {
-                tool: args[1].clone(),
-                args: args[2..].to_vec(),
-            })
+            Ok(Command::Mcp { tool: args[1].clone(), args: args[2..].to_vec() })
         }
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("Unknown command: {other}")),
@@ -165,10 +144,7 @@ fn run_init(cwd: &Path) -> CliOutput {
     output.push_str("features\n  ↓\nentities\n  ↓\nshared\n");
 
     if config_path.exists() {
-        output.push_str(&format!(
-            "\nConfiguration already exists: {}",
-            config_path.display()
-        ));
+        output.push_str(&format!("\nConfiguration already exists: {}", config_path.display()));
         return CliOutput::success(output);
     }
 
@@ -215,11 +191,7 @@ fn discover_architecture(cwd: &Path) -> ArchitectureDiscovery {
 
     let generated_config = default_config_yaml();
 
-    ArchitectureDiscovery {
-        detected,
-        structure,
-        generated_config: generated_config.to_string(),
-    }
+    ArchitectureDiscovery { detected, structure, generated_config: generated_config.to_string() }
 }
 
 fn run_scan(cwd: &Path) -> CliOutput {
@@ -256,11 +228,7 @@ fn run_check(cwd: &Path, changed: bool) -> CliOutput {
         .iter()
         .any(|diagnostic| matches!(diagnostic.severity, Severity::Error | Severity::Warning));
 
-    if has_violations {
-        CliOutput::violations(report)
-    } else {
-        CliOutput::success(report)
-    }
+    if has_violations { CliOutput::violations(report) } else { CliOutput::success(report) }
 }
 
 fn run_check_changed(cwd: &Path, modules: usize, diagnostics: &[CheckDiagnostic]) -> CliOutput {
@@ -287,11 +255,7 @@ fn run_check_changed(cwd: &Path, modules: usize, diagnostics: &[CheckDiagnostic]
 
     let report = render_changed_report(modules, existing_count, new_count, passed);
 
-    if passed {
-        CliOutput::success(report)
-    } else {
-        CliOutput::violations(report)
-    }
+    if passed { CliOutput::success(report) } else { CliOutput::violations(report) }
 }
 
 fn collect_signatures(diagnostics: &[CheckDiagnostic]) -> HashSet<String> {
@@ -324,12 +288,7 @@ fn save_baseline(path: &Path, signatures: &HashSet<String>) -> io::Result<()> {
 
 fn load_baseline(path: &Path) -> io::Result<HashSet<String>> {
     let raw = fs::read_to_string(path)?;
-    Ok(raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+    Ok(raw.lines().map(str::trim).filter(|line| !line.is_empty()).map(ToOwned::to_owned).collect())
 }
 
 fn run_explain(rule_id: &str) -> CliOutput {
@@ -346,18 +305,16 @@ fn run_explain(rule_id: &str) -> CliOutput {
 
 fn rule_explanation(rule_id: &str) -> Option<(&'static str, &'static str)> {
     match rule_id {
-        "ARCH-001" => Some((
-            "Circular dependency",
-            "Detects dependency cycles across modules/layers.",
-        )),
+        "ARCH-001" => {
+            Some(("Circular dependency", "Detects dependency cycles across modules/layers."))
+        }
         "ARCH-002" => Some((
             "Forbidden dependency",
             "Blocks imports that are explicitly forbidden by policy.",
         )),
-        "ARCH-003" => Some((
-            "Layer violation",
-            "Ensures each layer imports only allowed target layers.",
-        )),
+        "ARCH-003" => {
+            Some(("Layer violation", "Ensures each layer imports only allowed target layers."))
+        }
         "ARCH-004" => Some((
             "Feature boundary violation",
             "A feature cannot import another feature's internal modules.\nUse the feature public API instead.",
@@ -421,18 +378,12 @@ fn run_mcp_architecture_check(cwd: &Path, args: &[String]) -> CliOutput {
         }
     };
 
-    let errors = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Error)
-        .count();
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
-        .count();
-    let info = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Info)
-        .count();
+    let errors =
+        diagnostics.iter().filter(|diagnostic| diagnostic.severity == Severity::Error).count();
+    let warnings =
+        diagnostics.iter().filter(|diagnostic| diagnostic.severity == Severity::Warning).count();
+    let info =
+        diagnostics.iter().filter(|diagnostic| diagnostic.severity == Severity::Info).count();
 
     let mut baseline_created = false;
     let mut existing_violations = 0usize;
@@ -488,11 +439,7 @@ fn run_mcp_architecture_check(cwd: &Path, args: &[String]) -> CliOutput {
         .collect::<Vec<_>>()
         .join(",");
 
-    let passed = if changed {
-        new_violations == 0
-    } else {
-        errors == 0 && warnings == 0
-    };
+    let passed = if changed { new_violations == 0 } else { errors == 0 && warnings == 0 };
 
     let output = format!(
         "{{\"tool\":\"architecture_check\",\"ok\":true,\"changed\":{},\"passed\":{},\"modules\":{},\"summary\":{{\"errors\":{},\"warnings\":{},\"info\":{},\"total\":{}}},\"ratchet\":{{\"baseline_created\":{},\"existing_violations\":{},\"new_violations\":{}}},\"diagnostics\":[{}]}}",
@@ -585,20 +532,10 @@ fn run_mcp_architecture_graph(cwd: &Path) -> CliOutput {
         }
     }
 
-    let nodes_json = nodes
-        .iter()
-        .map(|node| json_string(node))
-        .collect::<Vec<_>>()
-        .join(",");
+    let nodes_json = nodes.iter().map(|node| json_string(node)).collect::<Vec<_>>().join(",");
     let edges_json = edges
         .iter()
-        .map(|(from, to)| {
-            format!(
-                "{{\"from\":{},\"to\":{}}}",
-                json_string(from),
-                json_string(to)
-            )
-        })
+        .map(|(from, to)| format!("{{\"from\":{},\"to\":{}}}", json_string(from), json_string(to)))
         .collect::<Vec<_>>()
         .join(",");
 
@@ -660,11 +597,8 @@ fn run_mcp_architecture_fix(args: &[String]) -> CliOutput {
         ));
     }
 
-    let suggestions_json = suggestions
-        .iter()
-        .map(|suggestion| json_string(suggestion))
-        .collect::<Vec<_>>()
-        .join(",");
+    let suggestions_json =
+        suggestions.iter().map(|suggestion| json_string(suggestion)).collect::<Vec<_>>().join(",");
 
     CliOutput::success(format!(
         "{{\"tool\":\"architecture_fix\",\"ok\":true,\"rule_id\":{},\"auto_apply\":false,\"suggestions\":[{}]}}",
@@ -690,11 +624,7 @@ fn evaluate_dependency_policy(from: &str, to: &str) -> DependencyPolicyResult {
             return DependencyPolicyResult {
                 allowed: false,
                 rule_id: Some("ARCH-004"),
-                reason: format!(
-                    "Feature boundary violation: {} cannot import {}",
-                    from,
-                    to
-                ),
+                reason: format!("Feature boundary violation: {} cannot import {}", from, to),
                 suggestion: Some(format!(
                     "Use {} public API instead of internal path.",
                     infer_public_api_target(to)
@@ -706,10 +636,7 @@ fn evaluate_dependency_policy(from: &str, to: &str) -> DependencyPolicyResult {
             allowed: false,
             rule_id: Some("ARCH-005"),
             reason: format!("Private module import is not allowed: {to}"),
-            suggestion: Some(format!(
-                "Use {} public API entrypoint.",
-                infer_public_api_target(to)
-            )),
+            suggestion: Some(format!("Use {} public API entrypoint.", infer_public_api_target(to))),
         };
     }
 
@@ -775,17 +702,11 @@ fn infer_feature_name(module_ref: &str) -> Option<String> {
     let normalized = module_ref.replace('\\', "/");
 
     if let Some((_, tail)) = normalized.split_once("features/") {
-        return tail
-            .split('/')
-            .find(|segment| !segment.is_empty())
-            .map(ToOwned::to_owned);
+        return tail.split('/').find(|segment| !segment.is_empty()).map(ToOwned::to_owned);
     }
 
     if normalized.contains("/internal") || normalized.ends_with("internal") {
-        return normalized
-            .split('/')
-            .find(|segment| !segment.is_empty())
-            .map(ToOwned::to_owned);
+        return normalized.split('/').find(|segment| !segment.is_empty()).map(ToOwned::to_owned);
     }
 
     None
@@ -812,17 +733,23 @@ fn is_private_module_path(module_ref: &str) -> bool {
 fn fix_suggestions(rule_id: &str, from: Option<&str>, to: Option<&str>) -> Vec<String> {
     match rule_id {
         "ARCH-001" => vec![
-            String::from("Break the cycle by introducing an abstraction boundary (port/interface)."),
+            String::from(
+                "Break the cycle by introducing an abstraction boundary (port/interface).",
+            ),
             String::from(
                 "Move shared logic to a lower-level module (usually shared/entities) to keep dependency direction one-way.",
             ),
         ],
         "ARCH-002" => vec![
             String::from("Remove the forbidden import from source module."),
-            String::from("If the dependency is valid by design, update architecture policy explicitly."),
+            String::from(
+                "If the dependency is valid by design, update architecture policy explicitly.",
+            ),
         ],
         "ARCH-003" => vec![
-            String::from("Move the importing code to a layer that is allowed to depend on the target layer."),
+            String::from(
+                "Move the importing code to a layer that is allowed to depend on the target layer.",
+            ),
             String::from("Introduce an application-level facade to preserve layer boundaries."),
         ],
         "ARCH-004" => {
@@ -916,12 +843,7 @@ fn parse_diagnostic_line(line: &str) -> Option<CheckDiagnostic> {
         })
         .unwrap_or_default();
 
-    Some(CheckDiagnostic {
-        rule_id,
-        severity,
-        message,
-        path,
-    })
+    Some(CheckDiagnostic { rule_id, severity, message, path })
 }
 
 fn parse_severity(value: &str) -> Option<Severity> {
@@ -934,14 +856,10 @@ fn parse_severity(value: &str) -> Option<Severity> {
 }
 
 fn render_check_report(modules: usize, diagnostics: &[CheckDiagnostic]) -> String {
-    let errors = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Error)
-        .count();
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
-        .count();
+    let errors =
+        diagnostics.iter().filter(|diagnostic| diagnostic.severity == Severity::Error).count();
+    let warnings =
+        diagnostics.iter().filter(|diagnostic| diagnostic.severity == Severity::Warning).count();
 
     let mut output = String::new();
     output.push_str(&format!("Analyzing {} modules...\n\n", format_count(modules)));
@@ -976,7 +894,12 @@ fn render_check_report(modules: usize, diagnostics: &[CheckDiagnostic]) -> Strin
     output
 }
 
-fn render_changed_report(modules: usize, existing_violations: usize, new_violations: usize, passed: bool) -> String {
+fn render_changed_report(
+    modules: usize,
+    existing_violations: usize,
+    new_violations: usize,
+    passed: bool,
+) -> String {
     let mut output = String::new();
     output.push_str(&format!("Analyzing {} modules...\n\n", format_count(modules)));
     output.push_str("Architecture Ratchet\n\n");
@@ -1019,10 +942,7 @@ fn count_modules(root: &Path) -> io::Result<usize> {
 }
 
 fn is_module_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("ts" | "tsx" | "js" | "jsx")
-    )
+    matches!(path.extension().and_then(|value| value.to_str()), Some("ts" | "tsx" | "js" | "jsx"))
 }
 
 fn format_count(value: usize) -> String {
@@ -1057,8 +977,8 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_config_yaml, run_cli, BASELINE_FILE, DIAGNOSTICS_FILE, EXIT_INTERNAL_OR_CONFIG, EXIT_PASSED,
-        EXIT_VIOLATIONS,
+        BASELINE_FILE, DIAGNOSTICS_FILE, EXIT_INTERNAL_OR_CONFIG, EXIT_PASSED, EXIT_VIOLATIONS,
+        default_config_yaml, run_cli,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1075,10 +995,7 @@ mod tests {
     }
 
     fn fixtures_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("fixtures")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("fixtures")
     }
 
     fn copy_dir_recursive(source: &Path, destination: &Path) {
@@ -1113,7 +1030,8 @@ mod tests {
             .split("\"violations\":")
             .nth(1)
             .and_then(|tail| {
-                let digits: String = tail.chars().take_while(|char| char.is_ascii_digit()).collect();
+                let digits: String =
+                    tail.chars().take_while(|char| char.is_ascii_digit()).collect();
                 digits.parse::<usize>().ok()
             })
             .unwrap_or(0);
@@ -1179,10 +1097,7 @@ mod tests {
     #[test]
     fn explain_arch_004_is_supported() {
         let workspace = temp_dir("wae-cli-explain");
-        let output = run_cli(
-            &[String::from("explain"), String::from("ARCH-004")],
-            &workspace,
-        );
+        let output = run_cli(&[String::from("explain"), String::from("ARCH-004")], &workspace);
 
         assert_eq!(output.exit_code, EXIT_PASSED);
         assert!(output.stdout.contains("Feature boundary violation"));
@@ -1192,10 +1107,7 @@ mod tests {
     #[test]
     fn explain_unknown_rule_returns_error_code_2() {
         let workspace = temp_dir("wae-cli-explain-unknown");
-        let output = run_cli(
-            &[String::from("explain"), String::from("ARCH-999")],
-            &workspace,
-        );
+        let output = run_cli(&[String::from("explain"), String::from("ARCH-999")], &workspace);
 
         assert_eq!(output.exit_code, EXIT_INTERNAL_OR_CONFIG);
         assert!(output.stderr.contains("Unknown rule id"));
@@ -1204,15 +1116,7 @@ mod tests {
 
     #[test]
     fn fixture_folders_exist() {
-        let required = [
-            "basic",
-            "circular",
-            "layers",
-            "features",
-            "aliases",
-            "monorepo",
-            "broken",
-        ];
+        let required = ["basic", "circular", "layers", "features", "aliases", "monorepo", "broken"];
 
         let fixtures = fixtures_root();
         for name in required {
@@ -1226,15 +1130,7 @@ mod tests {
 
     #[test]
     fn fixtures_can_be_checked_against_expected_json() {
-        let names = [
-            "basic",
-            "circular",
-            "layers",
-            "features",
-            "aliases",
-            "monorepo",
-            "broken",
-        ];
+        let names = ["basic", "circular", "layers", "features", "aliases", "monorepo", "broken"];
 
         for fixture_name in names {
             let workspace = temp_dir(&format!("wae-cli-fixture-{fixture_name}"));
@@ -1257,10 +1153,7 @@ mod tests {
             let output = run_cli(&[String::from("check")], &workspace);
 
             if violations == 0 {
-                assert_eq!(
-                    output.exit_code, EXIT_PASSED,
-                    "fixture `{fixture_name}` should pass"
-                );
+                assert_eq!(output.exit_code, EXIT_PASSED, "fixture `{fixture_name}` should pass");
                 assert!(output.stdout.contains("✖ 0 errors"));
             } else {
                 assert_eq!(
@@ -1341,11 +1234,7 @@ mod tests {
     fn mcp_architecture_explain_returns_json_payload() {
         let workspace = temp_dir("wae-cli-mcp-explain");
         let output = run_cli(
-            &[
-                String::from("mcp"),
-                String::from("architecture_explain"),
-                String::from("ARCH-004"),
-            ],
+            &[String::from("mcp"), String::from("architecture_explain"), String::from("ARCH-004")],
             &workspace,
         );
 
@@ -1365,11 +1254,7 @@ mod tests {
         );
 
         let output = run_cli(
-            &[
-                String::from("mcp"),
-                String::from("architecture_check"),
-                String::from("--changed"),
-            ],
+            &[String::from("mcp"), String::from("architecture_check"), String::from("--changed")],
             &workspace,
         );
 
@@ -1409,10 +1294,8 @@ mod tests {
             "ARCH-001|error|Circular dependency|user > payment > checkout > user",
         );
 
-        let output = run_cli(
-            &[String::from("mcp"), String::from("architecture_graph")],
-            &workspace,
-        );
+        let output =
+            run_cli(&[String::from("mcp"), String::from("architecture_graph")], &workspace);
 
         assert_eq!(output.exit_code, EXIT_PASSED);
         assert!(output.stdout.contains("\"tool\":\"architecture_graph\""));
