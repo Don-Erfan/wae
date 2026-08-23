@@ -1,0 +1,110 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (example: v0.1.0)"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: wae-x86_64-unknown-linux-gnu
+            exe_suffix: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: wae-x86_64-apple-darwin
+            exe_suffix: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: wae-aarch64-apple-darwin
+            exe_suffix: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: wae-x86_64-pc-windows-msvc.exe
+            exe_suffix: ".exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p wae-cli --target ${{ matrix.target }}
+
+      - name: Collect binary asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          src=""
+          for candidate in wae wae-cli wae_cli; do
+            path="target/${{ matrix.target }}/release/${candidate}${{ matrix.exe_suffix }}"
+            if [ -f "$path" ]; then
+              src="$path"
+              break
+            fi
+          done
+
+          if [ -z "$src" ]; then
+            echo "Could not locate built binary in target/${{ matrix.target }}/release"
+            ls -la "target/${{ matrix.target }}/release"
+            exit 1
+          fi
+
+          cp "$src" "dist/${{ matrix.artifact }}"
+
+      - name: Upload binary asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Upload binaries to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: dist/*
+          fail_on_unmatched_files: true

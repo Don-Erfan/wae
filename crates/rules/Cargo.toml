@@ -1,0 +1,9 @@
+[package]
+name = "wae-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wae-core = { path = "../core" }
+wae-graph = { path = "../graph" }
