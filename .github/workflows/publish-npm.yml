@@ -1,8 +1,19 @@
 name: Publish npm Package
 
 on:
-  release:
-    types: [published]
+  # Called by release-binaries.yml once the release assets are uploaded.
+  # A `release: published` trigger cannot be used: the release is created by
+  # the default GITHUB_TOKEN, and releases created that way do not trigger
+  # other workflows, so publishing silently never ran.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to publish (example: v0.1.0)"
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -23,11 +34,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${{ github.event.release.tag_name }}"
-          fi
+          TAG="${{ inputs.tag }}"
 
           if [ -z "$TAG" ]; then
             echo "A release tag is required"

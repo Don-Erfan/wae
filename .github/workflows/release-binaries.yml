@@ -111,3 +111,12 @@ jobs:
           name: ${{ env.RELEASE_TAG }}
           files: dist/*
           fail_on_unmatched_files: true
+
+  publish-npm:
+    name: Publish npm package
+    needs: release
+    uses: ./.github/workflows/publish-npm.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
