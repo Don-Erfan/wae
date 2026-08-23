@@ -131,6 +131,13 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`Failed to install WAE binary: ${error.message}`);
-  process.exit(1);
+  // Never fail the host project's install over this. WAE is a dev-time
+  // architecture linter; a download outage, an offline CI box, or a missing
+  // release asset must not break `npm/yarn install` for the whole app.
+  // `bin/wae.js` reports the missing binary if someone actually runs the CLI.
+  console.warn(`Warning: could not install the WAE binary: ${error.message}`);
+  console.warn(
+    "The `wae` command will be unavailable. Re-run `npm rebuild @don-erfan/wae` once the download works, " +
+      "or set WAE_SKIP_DOWNLOAD=1 to silence this."
+  );
 });
