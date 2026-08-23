@@ -709,6 +709,10 @@ fn infer_feature_name(module_ref: &str) -> Option<String> {
         return normalized.split('/').find(|segment| !segment.is_empty()).map(ToOwned::to_owned);
     }
 
+    if !normalized.is_empty() && !normalized.contains('/') {
+        return Some(normalized);
+    }
+
     None
 }
 
