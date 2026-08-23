@@ -4,7 +4,7 @@ pub trait Rule {
     fn check(&self, _project: &Project) -> Vec<Diagnostic>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RuleSet {
     rules: Vec<Box<dyn Rule + Send + Sync>>,
 }
