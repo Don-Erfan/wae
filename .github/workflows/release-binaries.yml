@@ -32,10 +32,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: wae-aarch64-unknown-linux-gnu
             exe_suffix: ""
-          # Both Apple targets build on the arm64 runner: the macOS SDK ships
-          # both slices, so x86_64 is a plain cross-compile. Avoids depending on
-          # a dedicated Intel runner label, which can be retired without notice.
-          - os: macos-latest
+          # Tree-sitter compiles native C code, so each Apple architecture uses
+          # a native runner instead of relying on a partial cross toolchain.
+          - os: macos-26-intel
             target: x86_64-apple-darwin
             artifact: wae-x86_64-apple-darwin
             exe_suffix: ""
@@ -87,7 +86,11 @@ jobs:
           fi
 
           cp "$src" "dist/${{ matrix.artifact }}"
-          (cd dist && sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          else
+            (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          fi
 
       - name: Upload binary asset artifact
         uses: actions/upload-artifact@v4
