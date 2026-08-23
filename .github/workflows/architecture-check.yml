@@ -9,110 +9,48 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run architecture check in ratchet mode
-        id: wae_check
+      - name: Run changed-file architecture analysis
+        id: check
         continue-on-error: true
+        env:
+          WAE_BASE_REF: ${{ github.base_ref && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
         run: |
-          set -o pipefail
           set +e
-          cargo run -p wae-cli -- check --changed | tee wae-check-output.txt
-          CHECK_EXIT=${PIPESTATUS[0]}
-          set -e
-          echo "check_exit=${CHECK_EXIT}" >> "$GITHUB_OUTPUT"
+          cargo run -p wae-cli -- check --changed --format json > wae-result.json
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Build summary
-        id: summary
+      - name: Publish summary
         if: always()
         run: |
           python3 - <<'PY'
+          import json
           import os
           from pathlib import Path
-          import re
 
-          output = Path("wae-check-output.txt").read_text(encoding="utf-8") if Path("wae-check-output.txt").exists() else ""
-
-          existing_match = re.search(r"Existing violations:\s*([\d,]+)", output)
-          new_match = re.search(r"New violations:\s*([\d,]+)", output)
-          modules_match = re.search(r"Analyzing\s*([\d,]+)\s*modules", output)
-
-          existing = existing_match.group(1) if existing_match else "0"
-          new = new_match.group(1) if new_match else "0"
-          modules = modules_match.group(1) if modules_match else "0"
-
+          result_path = Path("wae-result.json")
+          result = json.loads(result_path.read_text()) if result_path.exists() and result_path.stat().st_size else {"modules": 0, "diagnostics": []}
+          baseline = json.loads(Path(".wae/baseline.json").read_text())
+          diagnostics = result.get("diagnostics", [])
           lines = [
-              "### Architecture Check",
-              "",
-              f"✓ {modules} modules analyzed",
-              "",
-              f"Existing violations: {existing}",
-              f"New violations: {new}",
-              "",
+              "### WAE Architecture Check", "",
+              f"Modules analyzed: {result.get('modules', 0)}",
+              f"Baseline violations: {len(baseline.get('fingerprints', []))}",
+              f"New affected violations: {len(diagnostics)}", "",
+              "✅ No architecture regression." if not diagnostics else "❌ Architecture regression detected.",
           ]
-
-          has_regression = new.replace(",", "").isdigit() and int(new.replace(",", "")) > 0
-          if has_regression:
-              lines.append("❌ Architecture regression detected.")
-          else:
-              lines.append("✅ No new architecture regressions.")
-
-          summary = "\n".join(lines)
-          Path("wae-summary.md").write_text(summary, encoding="utf-8")
-
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write(summary + "\n")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"existing={existing}\n")
-              fh.write(f"new={new}\n")
-              fh.write(f"modules={modules}\n")
-              fh.write(f"has_regression={'true' if has_regression else 'false'}\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
+              stream.write("\n".join(lines) + "\n")
           PY
 
-      - name: PR annotation for regressions
-        if: github.event_name == 'pull_request' && steps.summary.outputs.has_regression == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const output = fs.existsSync('wae-check-output.txt') ? fs.readFileSync('wae-check-output.txt', 'utf8') : '';
-            const body = [
-              '### ❌ Architecture Check',
-              '',
-              'Architecture regression detected.',
-              '',
-              `Existing violations: ${{ steps.summary.outputs.existing }}`,
-              `New violations: ${{ steps.summary.outputs.new }}`,
-              '',
-              '```text',
-              output.slice(0, 60000),
-              '```',
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body,
-            });
-
-      - name: Fail on architecture regression
+      - name: Fail on violations or tool errors
         if: always()
-        run: |
-          if [ "${{ steps.wae_check.outputs.check_exit }}" = "2" ]; then
-            exit 1
-          fi
-          if [ "${{ steps.summary.outputs.has_regression }}" = "false" ]; then
-            exit 0
-          fi
-          exit 1
+        run: test "${{ steps.check.outputs.exit_code }}" = "0"

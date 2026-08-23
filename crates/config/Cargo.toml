@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 wae-core = { path = "../core" }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
+serde_yaml.workspace = true

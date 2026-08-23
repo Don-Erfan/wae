@@ -1,54 +1,52 @@
 # Web Architecture Engine (WAE)
 
-Workspace  `WebLint / ArchLint`.
+WAE analyzes JavaScript and TypeScript dependency architecture. Its production path is:
 
-## Run from source
+```text
+source discovery → import parsing → Node/TypeScript resolution → module graph → rules → diagnostics
+```
+
+The current engine extracts static imports, type-only imports, re-exports, dynamic imports, and CommonJS `require` calls; resolves relative extension/index imports and `tsconfig` path aliases; and evaluates `ARCH-001` through `ARCH-005` against a shared graph.
+
+## Use from source
 
 ```bash
-cargo run -p wae-cli
+cargo run -p wae-cli -- check
+cargo run -p wae-cli -- check --format json
+cargo run -p wae-cli -- graph
+cargo run -p wae-cli -- doctor
 ```
 
-## Install as npm package (frontend teams)
-
-The npm wrapper lives at `npm/wae` and exposes a `wae` binary for frontend projects.
-
-### Frontend developer usage
+Create a typed, versioned configuration:
 
 ```bash
-yarn add -D @don-erfan/wae
+cargo run -p wae-cli -- init
 ```
 
-Add scripts to your frontend `package.json`:
-
-```json
-{
-  "scripts": {
-    "arch:init": "wae init",
-    "arch:scan": "wae scan",
-    "arch:check": "wae check",
-    "arch:changed": "wae check --changed"
-  }
-}
-```
-
-Run checks:
+Ratchet mode never creates state implicitly. Review the current diagnostics, explicitly create and commit the baseline, then compare affected files and their importer closure against Git:
 
 ```bash
-yarn arch:init
-yarn arch:check
+cargo run -p wae-cli -- baseline create
+WAE_BASE_REF=origin/master cargo run -p wae-cli -- check --changed
 ```
 
-### Maintainer release flow
+Supported reporters are `human`, `json`, `jsonl`, and `sarif`. Exit codes are stable: `0` passed, `1` violations, `2` project/config error, and `3` internal error.
 
-1. Ensure repository settings/secrets are configured:
-   - GitHub repo: `https://github.com/Don-Erfan/wae`
-   - npm token in repository secret: `NPM_TOKEN`
-2. Create and push a tag like `v0.1.0`.
-3. `release-binaries.yml` builds Linux/macOS/Windows binaries and uploads them to the GitHub Release.
-4. `publish-npm.yml` publishes `npm/wae` to npmjs.com using the same tag version.
+## npm wrapper
 
-## CI checks
+```bash
+npm install --save-dev @don-erfan/wae
+npx wae check
+```
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace`
+The installer supports Linux x64/arm64, macOS x64/arm64, and Windows x64. It enforces redirect, timeout, and size limits and verifies the downloaded binary against the release SHA-256 asset before installation.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+See [Architecture](docs/ARCHITECTURE.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).

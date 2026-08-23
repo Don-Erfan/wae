@@ -7,10 +7,22 @@ members = [
     "crates/graph",
     "crates/rules",
     "crates/config",
+    "crates/engine",
+    "crates/reporters",
     "crates/cli",
 ]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.1"
+version = "0.0.5"
 license = "MIT"
+
+[workspace.dependencies]
+ignore = "=0.4.23"
+globset = "=0.4.15"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tree-sitter = "=0.24.7"
+tree-sitter-typescript = "=0.23.2"

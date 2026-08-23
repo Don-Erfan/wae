@@ -1,3 +1,5 @@
 /target
+.idea/
+.wae/cache/
 npm/wae/bin/wae
 npm/wae/bin/wae.exe

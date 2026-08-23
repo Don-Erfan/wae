@@ -1,4 +1,4 @@
-# WebLint / ArchLint — Compatibility Policy
+# WAE — Compatibility Policy
 
 ## 1) اصل سیاست سازگاری
 

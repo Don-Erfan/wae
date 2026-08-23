@@ -414,17 +414,23 @@ impl PackageGraph {
     }
 
     pub fn outgoing(&self, package: &PackageName) -> Vec<PackageName> {
-        self.outgoing
+        let mut packages: Vec<PackageName> = self
+            .outgoing
             .get(package)
             .map(|targets| targets.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        packages.sort_by(|a: &PackageName, b| a.0.cmp(&b.0));
+        packages
     }
 
     pub fn incoming(&self, package: &PackageName) -> Vec<PackageName> {
-        self.incoming
+        let mut packages: Vec<PackageName> = self
+            .incoming
             .get(package)
             .map(|sources| sources.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        packages.sort_by(|a: &PackageName, b| a.0.cmp(&b.0));
+        packages
     }
 
     pub fn has_edge(&self, from: &PackageName, to: &PackageName) -> bool {

@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 
 const MAX_REDIRECTS = 5;
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 30_000;
 
 function resolveTarget() {
   const platform = os.platform();
@@ -14,6 +17,7 @@ function resolveTarget() {
   const targets = {
     linux: {
       x64: "x86_64-unknown-linux-gnu",
+      arm64: "aarch64-unknown-linux-gnu",
     },
     darwin: {
       x64: "x86_64-apple-darwin",
@@ -64,8 +68,23 @@ function downloadFile(url, destination, redirects = 0) {
           return;
         }
 
+        const declaredSize = Number(response.headers["content-length"] || 0);
+        if (declaredSize > MAX_DOWNLOAD_BYTES) {
+          response.resume();
+          reject(new Error(`Download exceeds ${MAX_DOWNLOAD_BYTES} bytes`));
+          return;
+        }
+
         const tempPath = `${destination}.tmp`;
         const stream = fs.createWriteStream(tempPath);
+        let received = 0;
+
+        response.on("data", (chunk) => {
+          received += chunk.length;
+          if (received > MAX_DOWNLOAD_BYTES) {
+            response.destroy(new Error(`Download exceeds ${MAX_DOWNLOAD_BYTES} bytes`));
+          }
+        });
 
         response.pipe(stream);
 
@@ -89,7 +108,14 @@ function downloadFile(url, destination, redirects = 0) {
     );
 
     request.on("error", reject);
+    request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+      request.destroy(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS}ms`));
+    });
   });
+}
+
+function sha256(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
 async function main() {
@@ -117,11 +143,21 @@ async function main() {
   const downloadUrl = `https://github.com/${repository}/releases/download/${releaseTag}/${assetName}`;
   const binDir = path.join(__dirname, "..", "bin");
   const binaryPath = path.join(binDir, `wae${extension}`);
+  const checksumPath = `${binaryPath}.sha256`;
 
   fs.mkdirSync(binDir, { recursive: true });
 
   console.log(`Downloading ${assetName} from ${downloadUrl}`);
   await downloadFile(downloadUrl, binaryPath);
+  await downloadFile(`${downloadUrl}.sha256`, checksumPath);
+
+  const expected = fs.readFileSync(checksumPath, "utf8").trim().split(/\s+/)[0];
+  const actual = sha256(binaryPath);
+  fs.rmSync(checksumPath, { force: true });
+  if (!/^[a-f0-9]{64}$/i.test(expected) || actual !== expected.toLowerCase()) {
+    fs.rmSync(binaryPath, { force: true });
+    throw new Error(`SHA-256 verification failed for ${assetName}`);
+  }
 
   if (os.platform() !== "win32") {
     fs.chmodSync(binaryPath, 0o755);
@@ -131,13 +167,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  // Never fail the host project's install over this. WAE is a dev-time
-  // architecture linter; a download outage, an offline CI box, or a missing
-  // release asset must not break `npm/yarn install` for the whole app.
-  // `bin/wae.js` reports the missing binary if someone actually runs the CLI.
-  console.warn(`Warning: could not install the WAE binary: ${error.message}`);
-  console.warn(
-    "The `wae` command will be unavailable. Re-run `npm rebuild @don-erfan/wae` once the download works, " +
-      "or set WAE_SKIP_DOWNLOAD=1 to silence this."
-  );
+  console.error(`Could not install the verified WAE binary: ${error.message}`);
+  process.exitCode = 1;
 });

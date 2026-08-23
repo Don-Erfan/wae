@@ -1,3 +1,1 @@
-import { uiButton } from "../../../../packages/ui/src/button";
-
-export const web = uiButton;
+export const web = "web";

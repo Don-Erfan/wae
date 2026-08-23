@@ -1,0 +1,16 @@
+[package]
+name = "wae-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+globset.workspace = true
+ignore.workspace = true
+serde_json.workspace = true
+wae-config = { path = "../config" }
+wae-core = { path = "../core" }
+wae-graph = { path = "../graph" }
+wae-parser = { path = "../parser" }
+wae-resolver = { path = "../resolver" }
+wae-rules = { path = "../rules" }

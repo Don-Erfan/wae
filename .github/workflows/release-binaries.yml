@@ -28,6 +28,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: wae-x86_64-unknown-linux-gnu
             exe_suffix: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: wae-aarch64-unknown-linux-gnu
+            exe_suffix: ""
           # Both Apple targets build on the arm64 runner: the macOS SDK ships
           # both slices, so x86_64 is a plain cross-compile. Avoids depending on
           # a dedicated Intel runner label, which can be retired without notice.
@@ -83,12 +87,15 @@ jobs:
           fi
 
           cp "$src" "dist/${{ matrix.artifact }}"
+          (cd dist && sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
 
       - name: Upload binary asset artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
           if-no-files-found: error
 
   release:

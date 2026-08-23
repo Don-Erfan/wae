@@ -61,9 +61,23 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      - name: Enforce Cargo, npm and tag version parity
+        shell: bash
+        run: |
+          CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          NPM_VERSION=$(node -p "require('./npm/wae/package.json').version")
+          test "$CARGO_VERSION" = "${{ steps.meta.outputs.version }}"
+          test "$NPM_VERSION" = "$CARGO_VERSION"
+
       - name: Set npm package version from tag
         working-directory: npm/wae
-        run: npm version ${{ steps.meta.outputs.version }} --no-git-tag-version
+        run: npm version ${{ steps.meta.outputs.version }} --no-git-tag-version --allow-same-version
+
+      - name: Verify npm package contents
+        working-directory: npm/wae
+        env:
+          WAE_SKIP_DOWNLOAD: "1"
+        run: npm pack --dry-run
 
       - name: Publish to npmjs.com
         working-directory: npm/wae

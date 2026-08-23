@@ -1,5 +1,5 @@
 pub const ENGINE_NAME: &str = "Web Architecture Engine";
-pub const ENGINE_VERSION: &str = "v0.0.1";
+pub const ENGINE_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 pub fn banner_lines() -> [&'static str; 2] {
     [ENGINE_NAME, ENGINE_VERSION]
@@ -32,6 +32,7 @@ pub mod domain {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+    #[serde(rename_all = "lowercase")]
     pub enum Severity {
         #[default]
         Error,
@@ -72,6 +73,9 @@ pub mod domain {
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum ConfigErrorKind {
+        Io,
+        InvalidYaml,
+        UnsupportedVersion,
         UnknownRule,
         DuplicateLayer,
         InvalidPattern,
@@ -258,6 +262,8 @@ pub mod domain {
         Static,
         Dynamic,
         Require,
+        TypeOnly,
+        ReExport,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +327,8 @@ pub mod domain {
                 ImportKind::Static => DependencyKind::Static,
                 ImportKind::Dynamic => DependencyKind::Dynamic,
                 ImportKind::Require => DependencyKind::Require,
+                ImportKind::TypeOnly => DependencyKind::TypeOnly,
+                ImportKind::ReExport => DependencyKind::ReExport,
             };
 
             Self {
@@ -429,6 +437,8 @@ pub mod domain {
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Diagnostic {
+        /// Stable identity derived from the rule and canonical involved locations.
+        pub fingerprint: String,
         pub rule_id: RuleId,
         pub severity: Severity,
         pub message: String,
@@ -437,6 +447,37 @@ pub mod domain {
         pub dependency_path: Vec<ModuleId>,
         pub suggestion: Option<String>,
         pub metadata: BTreeMap<String, String>,
+    }
+
+    impl Diagnostic {
+        pub fn new(rule_id: impl Into<String>, message: impl Into<String>) -> Self {
+            Self { rule_id: RuleId(rule_id.into()), message: message.into(), ..Self::default() }
+        }
+
+        /// FNV-1a is intentionally used instead of `DefaultHasher`: its output is stable
+        /// across processes and Rust releases, which makes baseline files portable.
+        pub fn refresh_fingerprint(&mut self) {
+            let mut identity = self.rule_id.0.clone();
+            if let Some(location) = &self.primary_location {
+                identity.push('|');
+                identity.push_str(&location.file.replace('\\', "/"));
+                identity.push(':');
+                identity.push_str(&location.line.to_string());
+                identity.push(':');
+                identity.push_str(&location.column.to_string());
+            }
+            for module in &self.dependency_path {
+                identity.push('|');
+                identity.push_str(&module.0.replace('\\', "/"));
+            }
+
+            let mut hash = 0xcbf29ce484222325_u64;
+            for byte in identity.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            self.fingerprint = format!("{:016x}", hash);
+        }
     }
 }
 
@@ -447,6 +488,7 @@ pub struct AnalyzeRequest {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnalyzeOutput {
+    pub schema_version: u32,
     pub module_count: usize,
     pub diagnostics: Vec<domain::Diagnostic>,
 }
@@ -465,7 +507,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.1"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.5"]);
     }
 
     #[test]

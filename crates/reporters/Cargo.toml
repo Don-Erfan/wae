@@ -1,12 +1,10 @@
 [package]
-name = "wae-cli"
+name = "wae-reporters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-wae-core = { path = "../core" }
-wae-config = { path = "../config" }
-wae-engine = { path = "../engine" }
-wae-reporters = { path = "../reporters" }
 serde_json.workspace = true
+wae-core = { path = "../core" }
+wae-engine = { path = "../engine" }

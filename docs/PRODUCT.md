@@ -1,8 +1,8 @@
-# WebLint / ArchLint — Product Contract (Phase 0)
+# WAE — Product Contract (Phase 0)
 
 ## 1) تعریف یک‌خطی محصول
 
-WebLint یک **Web Architecture Compiler / Integrity Engine** است که graph معماری پروژه‌های وب را می‌سازد و
+WAE یک **Web Architecture Compiler / Integrity Engine** است که graph معماری پروژه‌های وب را می‌سازد و
 regressionهای معماری را قبل از merge تشخیص می‌دهد.
 
 ## 2) Problem Statement
@@ -34,17 +34,17 @@ Lintهای کلاسیک بیشتر syntax-centric هستند و روابط مع�
 
 ### 3.3 CLI Contract (MVP تا Beta)
 
-- `weblint init`
-- `weblint scan`
-- `weblint check`
-- `weblint check --changed`
-- `weblint explain <RULE_ID>`
-- `weblint graph`
-- `weblint doctor`
+- `wae init`
+- `wae scan`
+- `wae check`
+- `wae check --changed`
+- `wae explain <RULE_ID>`
+- `wae graph`
+- `wae doctor`
 
 ## 4) Non-Goals (مرزهای عمدی)
 
-WebLint **عمداً** این موارد را به ابزارهای دیگر می‌سپارد:
+WAE **عمداً** این موارد را به ابزارهای دیگر می‌سپارد:
 
 - سبک کدنویسی، formatting و style (`ESLint`, `Biome`, `Prettier`)
 - function-level correctness linting
@@ -53,14 +53,14 @@ WebLint **عمداً** این موارد را به ابزارهای دیگر م�
 
 ## 5) Detect vs Delegate (بدون ابهام)
 
-WebLint **detect می‌کند**:
+WAE **detect می‌کند**:
 
 - graph-level dependency violations
 - boundary/rule regressions
 - runtime reachability violations (direct/indirect)
 - policy violations در monorepo/package graph
 
-WebLint **delegate می‌کند**:
+WAE **delegate می‌کند**:
 
 - syntax parse errors low-level (تا حد provider)
 - style/code-quality ruleهای سنتی
@@ -77,6 +77,6 @@ WebLint **delegate می‌کند**:
 
 فاز 0 وقتی Done است که تیم بتواند دقیق، قابل‌تست و بدون ابهام پاسخ دهد:
 
-1. WebLint چه چیزهایی را **detect** می‌کند؟
+1. WAE چه چیزهایی را **detect** می‌کند؟
 2. چه چیزهایی را **عمداً** به ESLint/Biome/TypeScript می‌سپارد؟
 3. قرارداد خروجی و کدهای خطا برای CI چیست؟

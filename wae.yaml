@@ -1,0 +1,52 @@
+version: 1
+
+project:
+  include: ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
+  exclude:
+    - "fixtures/**"
+    - "**/*.test.*"
+    - "**/*.spec.*"
+    - "**/node_modules/**"
+    - "**/.git/**"
+    - "**/.idea/**"
+    - "**/.wae/**"
+    - "**/.next/**"
+    - "**/dist/**"
+    - "**/build/**"
+    - "**/coverage/**"
+    - "**/target/**"
+  roots: ["."]
+  follow_symlinks: false
+  max_file_size_kb: 2048
+
+architecture:
+  layers:
+    app:
+      patterns: ["**/app/**"]
+      canImport: ["features", "entities", "shared"]
+    features:
+      patterns: ["**/features/**"]
+      canImport: ["entities", "shared"]
+    entities:
+      patterns: ["**/entities/**"]
+      canImport: ["shared"]
+    shared:
+      patterns: ["**/shared/**"]
+      canImport: []
+
+rules:
+  ARCH-001: error
+  ARCH-002: error
+  ARCH-003: error
+  ARCH-004: error
+  ARCH-005: error
+
+baseline:
+  file: ".wae/baseline.json"
+
+output:
+  format: human
+
+cache:
+  enabled: true
+  directory: ".wae/cache"

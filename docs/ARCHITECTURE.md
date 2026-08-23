@@ -1,15 +1,15 @@
-# WebLint / ArchLint — Architecture Contract (Phase 0)
+# WAE — Architecture Contract
 
 ## 1) اصل معماری
 
 Pipeline محصول باید با این مرزبندی ثابت کار کند:
 
 ```text
-Parser AST
+JS/TS source
   ↓
-Internal Representation (IR)
+Dependency-oriented parser adapter → normalized IR
   ↓
-Module/Package/Runtime Graphs
+Resolver chain → module/package graphs
   ↓
 Rule Engine
   ↓
@@ -34,43 +34,29 @@ Diagnostics / Reporters / Integrations
 - `graph`: module/package/runtime graph engine
 - `rules`: rule interfaces + rule implementations
 - `config`: schema + validation + model building
+- `engine`: public Facade and pipeline orchestration
+- `reporters`: human/JSON/JSONL/SARIF presentation strategies
 - `lsp`: thin adapter روی core services
-- `cli`: orchestration + reporters
+- `cli`: command parsing and thin delivery adapter
 
 ## 4) Design Pattern Map (Refactoring.Guru-aligned)
 
-### 4.1 CLI و Orchestration
+### 4.1 الگوهای پیاده‌شده
 
-- `Command`: هر دستور (`init`, `scan`, `check`, `explain`, `graph`, `doctor`) یک handler مستقل
-- `Factory Method`: ساخت handler بر اساس command line
-- `Facade`: یک API سطح‌بالا برای اجرای pipeline کامل
+- `Facade`: `wae-engine::Engine` تنها API سطح‌بالای pipeline برای CLI و integrationهای آینده است.
+- `Strategy / Adapter`: قرارداد `ParserAdapter` جزئیات parser را از IR و engine جدا می‌کند.
+- `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias و package را به‌ترتیب اجرا می‌کند.
+- `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.
+- `Repository`: baseline storage پشت command صریح `baseline create` قرار دارد و `check --changed` هرگز آن را ایجاد نمی‌کند.
+- `Ports & Adapters`: filesystem/Git/CLI در لبه قرار دارند؛ ruleها به command یا reporter وابسته نیستند.
 
-### 4.2 Parser / Resolver / Framework
+این انتخاب‌ها با تعریف‌های Refactoring.Guru هم‌راستا هستند: Facade سطح ساده‌ای روی subsystem می‌دهد، Strategy الگوریتم‌های قابل‌تعویض را جدا می‌کند، Chain درخواست را در handlerهای مرتب عبور می‌دهد، و Composite مجموعه‌ای از اجزا را پشت قرارداد مشترک قرار می‌دهد.
 
-- `Strategy`: انتخاب parser/resolver/framework policy بر اساس context
-- `Adapter`: نرمال‌سازی خروجی parserهای بیرونی به IR داخلی
-- `Chain of Responsibility`: رزولوشن مرحله‌ای import (`relative -> alias -> package -> fallback`)
-- `Abstract Factory`: ساخت یک بسته سازگار از parser+resolver+classifier برای هر framework
+منابع: [Facade](https://refactoring.guru/design-patterns/facade)، [Strategy](https://refactoring.guru/design-patterns/strategy)، [Chain of Responsibility](https://refactoring.guru/design-patterns/chain-of-responsibility)، [Composite](https://refactoring.guru/design-patterns/composite).
 
-### 4.3 Graph و Rule Engine
+### 4.2 الگوهای تعمداً به‌تعویق‌افتاده
 
-- `Builder`: ساخت مرحله‌ای Project/Graph با validate-on-build
-- `Composite`: RuleSet به‌عنوان مجموعه ruleهای مستقل
-- `Template Method`: فلو استاندارد اجرای rule (`prepare -> evaluate -> normalize diagnostics`)
-- `Specification`: policyهای معماری قابل compose (`allowed/forbidden dependency`)
-
-### 4.4 Baseline / Suppression / Config
-
-- `Policy Object`: سیاست‌های suppression/baseline به‌صورت شیء مستقل
-- `Interpreter` (سبک): تفسیر patternهای path/rule در suppressions
-- `Repository`: abstraction برای cache/baseline storage
-
-### 4.5 Integrations (LSP/VS Code/JetBrains/CI)
-
-- `Ports & Adapters` (Hexagonal):
-  - Core فقط port تعریف می‌کند
-  - هر integration یک adapter نازک است
-  - خروجی‌ها باید از یک مدل واحد `Diagnostic` تولید شوند
+`Abstract Factory` تا زمانی که provider/framework دوم وجود ندارد اضافه نمی‌شود. `Template Method` و hierarchy برای commandها نیز تا وقتی variation واقعی نداشته باشند ارزش کافی ندارند. Specification برای policyهای پیچیده‌تر و framework adapter برای Next.js در milestone مربوطه اضافه می‌شوند.
 
 ## 5) Anti-patternهای ممنوع در V1
 
@@ -99,6 +85,8 @@ Diagnostics / Reporters / Integrations
 - `dependency_path`
 - `suggestion`
 - `metadata`
+- `fingerprint` پایدار و مستقل از message/severity
+- `schemaVersion` در envelope خروجی machine-readable
 
 ## 8) معیار Done فاز 0
 

@@ -1,4 +1,4 @@
-# RFC-001: Intermediate Representation (IR) for WebLint
+# RFC-001: Intermediate Representation (IR) for WAE
 
 ## وضعیت
 
@@ -118,8 +118,8 @@ Diagnostic:
 
 ## 9) سازگاری با CLI اولیه
 
-- `weblint graph --format json` خروجی مستقیم از `GraphIR`
-- `weblint check` و `weblint check --changed` مصرف‌کننده IR در Rule Engine
+- `wae graph --format json` خروجی مستقیم از `GraphIR`
+- `wae check` و `wae check --changed` مصرف‌کننده IR در Rule Engine
 
 ## 10) نمونه Diagnostic
 

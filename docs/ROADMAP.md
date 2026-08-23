@@ -1,4 +1,4 @@
-# WebLint / ArchLint — Engineering Roadmap (Phase 0 → Phase 40)
+# WAE — Engineering Roadmap (Phase 0 → Phase 40)
 
 این roadmap مرجع اجرای پروژه است. اصل اجرایی:
 
@@ -53,7 +53,7 @@
 19. **Phase 18 — Next.js Adapter**: fixtureهای واقعی App/Pages/runtime conventions.
 20. **Phase 19 — Runtime Model**: explainable runtime dependency path.
 21. **Phase 20 — Runtime Rules**: direct + transitive violations covered.
-22. **Phase 21 — Architecture Discovery**: `weblint init` پیشنهاد معماری معقول ارائه دهد.
+22. **Phase 21 — Architecture Discovery**: `wae init` پیشنهاد معماری معقول ارائه دهد.
 23. **Phase 22 — Cache & Incremental**: تغییر یک فایل full parse ایجاد نکند.
 24. **Phase 23 — Performance**: benchmark regression در CI قابل مشاهده.
 25. **Phase 24 — Observability/Debugging**: ابزار explain/debug برای bug reportها کافی.

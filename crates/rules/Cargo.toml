@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 wae-core = { path = "../core" }
 wae-graph = { path = "../graph" }
+wae-config = { path = "../config" }
