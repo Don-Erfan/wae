@@ -31,17 +31,12 @@ pub mod domain {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
     pub enum Severity {
+        #[default]
         Error,
         Warning,
         Info,
-    }
-
-    impl Default for Severity {
-        fn default() -> Self {
-            Self::Error
-        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
