@@ -669,9 +669,11 @@ impl ResolutionHandler for WorkspaceResolver {
         match target {
             Some(PackageTarget::InternalPath(target)) => {
                 let candidate = package.root.join(target.trim_start_matches("./"));
-                lexically_within(&candidate, &package.root)
-                    .then(|| resolution_candidates(&candidate, request.mode))
-                    .unwrap_or_default()
+                if lexically_within(&candidate, &package.root) {
+                    resolution_candidates(&candidate, request.mode)
+                } else {
+                    Vec::new()
+                }
             }
             _ => Vec::new(),
         }

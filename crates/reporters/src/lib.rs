@@ -157,10 +157,14 @@ fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {
         Severity::Info => "note",
     };
     let locations = diagnostic.primary_location.as_ref().map(|location| vec![json!({ "physicalLocation": { "artifactLocation": { "uri": location.file }, "region": { "startLine": location.line.max(1), "startColumn": location.column.max(1) } } })]).unwrap_or_default();
-    let suppressions = diagnostic.suppressed.then(|| vec![json!({
-        "kind": "inSource", "status": "accepted",
-        "justification": diagnostic.suppression_reason.as_deref().unwrap_or("WAE source suppression")
-    })]).unwrap_or_default();
+    let suppressions = if diagnostic.suppressed {
+        vec![json!({
+            "kind": "inSource", "status": "accepted",
+            "justification": diagnostic.suppression_reason.as_deref().unwrap_or("WAE source suppression")
+        })]
+    } else {
+        Vec::new()
+    };
     json!({ "ruleId": diagnostic.rule_id.0, "level": level, "message": { "text": diagnostic.message }, "partialFingerprints": { "waeViolationId": diagnostic.fingerprint }, "locations": locations, "suppressions": suppressions })
 }
 
