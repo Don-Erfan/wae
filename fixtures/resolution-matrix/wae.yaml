@@ -1,0 +1,6 @@
+version: 1
+project:
+  include: ["**/*.ts", "**/*.mts", "**/*.cts", "**/*.js", "**/*.mjs", "**/*.cjs"]
+  exclude: ["**/*.d.ts", "**/node_modules/**"]
+architecture:
+  layers: {}

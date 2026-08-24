@@ -62,10 +62,16 @@ pub struct ProjectConfig {
 impl Default for ProjectConfig {
     fn default() -> Self {
         Self {
-            include: vec!["**/*.ts".into(), "**/*.tsx".into(), "**/*.js".into(), "**/*.jsx".into()],
+            include: ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]
+                .into_iter()
+                .map(|extension| format!("**/*.{extension}"))
+                .collect(),
             exclude: vec![
                 "**/*.test.*".into(),
                 "**/*.spec.*".into(),
+                "**/*.d.ts".into(),
+                "**/*.d.mts".into(),
+                "**/*.d.cts".into(),
                 "**/node_modules/**".into(),
                 "**/.git/**".into(),
                 "**/.idea/**".into(),
@@ -157,7 +163,19 @@ impl Default for FeatureConfig {
         Self {
             root: "src/features".into(),
             roots: Vec::new(),
-            public_entrypoints: vec!["index.ts".into(), "index.tsx".into(), "index.js".into()],
+            public_entrypoints: [
+                "index.ts",
+                "index.tsx",
+                "index.mts",
+                "index.cts",
+                "index.js",
+                "index.jsx",
+                "index.mjs",
+                "index.cjs",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             private_segments: vec!["internal".into(), "private".into()],
         }
     }
@@ -253,11 +271,44 @@ impl Default for BaselineConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
-    pub format: String,
+    pub format: OutputFormat,
 }
 impl Default for OutputConfig {
     fn default() -> Self {
-        Self { format: "human".into() }
+        Self { format: OutputFormat::Human }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+    Jsonl,
+    Sarif,
+}
+
+impl OutputFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "human" => Some(Self::Human),
+            "json" => Some(Self::Json),
+            "jsonl" => Some(Self::Jsonl),
+            "sarif" => Some(Self::Sarif),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Human => "human",
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+            Self::Sarif => "sarif",
+        })
     }
 }
 
@@ -330,13 +381,6 @@ impl Config {
             validate_relative_path(root, "architecture.features.roots")?;
         }
         validate_relative_path(&self.cache.directory, "cache.directory")?;
-        if !matches!(self.output.format.as_str(), "human" | "json" | "jsonl" | "sarif") {
-            return Err(config_error(
-                ConfigErrorKind::ConflictingConfig,
-                Some("output.format".into()),
-                format!("unsupported output format `{}`", self.output.format),
-            ));
-        }
         for (name, layer) in &self.architecture.layers {
             validate_patterns(&layer.patterns, &format!("architecture.layers.{name}.patterns"))?;
             for target in &layer.can_import {
@@ -470,5 +514,31 @@ mod tests {
         let config = Config::load(&root).unwrap();
         assert!(!config.configured);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn output_format_is_a_closed_deserialized_enum() {
+        let error = yaml_serde::from_str::<Config>("version: 1\noutput:\n  format: xml\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown variant") || error.contains("expected one of"));
+    }
+
+    #[test]
+    fn defaults_cover_modern_node_module_extensions_and_exclude_declarations() {
+        let config = Config::default();
+        for extension in ["mts", "cts", "mjs", "cjs"] {
+            assert!(config.project.include.contains(&format!("**/*.{extension}")));
+            assert!(
+                config
+                    .architecture
+                    .features
+                    .public_entrypoints
+                    .contains(&format!("index.{extension}"))
+            );
+        }
+        for declaration in ["**/*.d.ts", "**/*.d.mts", "**/*.d.cts"] {
+            assert!(config.project.exclude.iter().any(|pattern| pattern == declaration));
+        }
     }
 }

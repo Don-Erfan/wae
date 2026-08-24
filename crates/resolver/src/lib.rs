@@ -7,8 +7,13 @@ use serde::Deserialize;
 use wae_config::ResolutionMode;
 use wae_core::domain::{DependencyKind, ModulePath};
 
+mod relative;
 mod request;
-pub use request::{ModuleResolver, Resolution, ResolutionHandler, ResolutionRequest};
+use relative::{resolution_candidates, resolve_relative};
+pub use relative::{resolve_file, resolve_file_with_mode};
+pub use request::{
+    ModuleFormat, ModuleResolver, Resolution, ResolutionHandler, ResolutionKind, ResolutionRequest,
+};
 
 #[derive(Default)]
 pub struct ResolverPipeline {
@@ -91,6 +96,8 @@ impl ModuleResolver for ResolverPipeline {
                 importer: request.importer,
                 specifier: &specifier,
                 dependency_kind: request.dependency_kind.clone(),
+                resolution_kind: request.resolution_kind,
+                importer_format: request.importer_format,
                 mode: request.mode,
                 custom_conditions: request.custom_conditions,
             };
@@ -130,10 +137,7 @@ impl ResolutionHandler for RelativeResolver {
             ));
         }
         let base = importer.parent()?.join(specifier);
-        Some(
-            resolve_file_with_mode(&base, request.mode)
-                .map_or(Resolution::Unresolved, Resolution::Module),
-        )
+        Some(resolve_relative(&base, request).map_or(Resolution::Unresolved, Resolution::Module))
     }
 
     fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
@@ -344,11 +348,18 @@ fn load_tsconfig(path: &Path, visited: &mut BTreeSet<PathBuf>) -> Result<Resolve
     let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&source))
         .map_err(|error| format!("invalid JSONC in tsconfig `{}`: {error}", canonical.display()))?;
     let directory = canonical.parent().unwrap_or(Path::new("."));
-    let mut resolved = if let Some(parent) = json.get("extends").and_then(|value| value.as_str()) {
-        let parent_path = resolve_extends(directory, parent)?;
-        load_tsconfig(&parent_path, visited)?
-    } else {
-        ResolvedTsConfig { base_url: directory.to_path_buf(), aliases: BTreeMap::new() }
+    let mut resolved = match json.get("extends") {
+        Some(serde_json::Value::String(parent)) => {
+            let parent_path = resolve_extends(directory, parent)?;
+            load_tsconfig(&parent_path, visited)?
+        }
+        Some(_) => {
+            return Err(format!(
+                "tsconfig `extends` in `{}` must be a single string; arrays are not supported",
+                canonical.display()
+            ));
+        }
+        None => ResolvedTsConfig { base_url: directory.to_path_buf(), aliases: BTreeMap::new() },
     };
     let compiler = &json["compilerOptions"];
     if let Some(base_url) = compiler.get("baseUrl").and_then(|value| value.as_str()) {
@@ -377,13 +388,31 @@ fn load_tsconfig(path: &Path, visited: &mut BTreeSet<PathBuf>) -> Result<Resolve
 }
 
 fn resolve_extends(directory: &Path, value: &str) -> Result<PathBuf, String> {
-    let mut candidate = if value.starts_with('.') || value.starts_with('/') {
-        directory.join(value)
-    } else {
-        directory.join("node_modules").join(value)
-    };
+    if value.starts_with('.') || value.starts_with('/') {
+        return finalize_extended_config(directory.join(value), value);
+    }
+    for ancestor in directory.ancestors() {
+        let candidate = ancestor.join("node_modules").join(value);
+        if let Ok(path) = finalize_extended_config(candidate, value) {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "cannot resolve extended tsconfig `{value}` from `{}` or an ancestor node_modules directory",
+        directory.display()
+    ))
+}
+
+fn finalize_extended_config(mut candidate: PathBuf, value: &str) -> Result<PathBuf, String> {
     if candidate.is_dir() {
-        candidate = candidate.join("tsconfig.json");
+        let manifest = candidate.join("package.json");
+        candidate = fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|source| serde_json::from_str::<serde_json::Value>(&source).ok())
+            .and_then(|json| {
+                json.get("tsconfig").and_then(|value| value.as_str()).map(str::to_owned)
+            })
+            .map_or_else(|| candidate.join("tsconfig.json"), |path| candidate.join(path));
     } else if !candidate.exists() {
         let with_json = PathBuf::from(format!("{}.json", candidate.to_string_lossy()));
         if with_json.exists() {
@@ -771,12 +800,12 @@ fn condition_is_active(condition: &str, request: &ResolutionRequest<'_>) -> bool
     {
         return true;
     }
-    let dependency_condition = match request.dependency_kind {
-        DependencyKind::Require => "require",
-        DependencyKind::TypeOnly => "types",
-        DependencyKind::Static | DependencyKind::Dynamic | DependencyKind::ReExport => "import",
+    let resolution_condition = match request.resolution_kind {
+        ResolutionKind::Import => "import",
+        ResolutionKind::Require => "require",
     };
-    condition == dependency_condition
+    condition == resolution_condition
+        || request.dependency_kind == DependencyKind::TypeOnly && condition == "types"
         || match request.mode {
             ResolutionMode::Node | ResolutionMode::Node16 | ResolutionMode::NodeNext => {
                 condition == "node"
@@ -838,82 +867,6 @@ fn resolve_package_target(
         return Resolution::Unresolved;
     }
     resolve_file_with_mode(&candidate, mode).map_or(Resolution::Unresolved, Resolution::Module)
-}
-
-pub fn resolve_file(base: &Path) -> Option<ModulePath> {
-    resolve_file_with_mode(base, ResolutionMode::NodeNext)
-}
-
-pub fn resolve_file_with_mode(base: &Path, mode: ResolutionMode) -> Option<ModulePath> {
-    const EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
-    if base.is_file() {
-        return Some(ModulePath(normalize(base)));
-    }
-
-    let source_extensions: &[&str] = match (mode, base.extension().and_then(|value| value.to_str()))
-    {
-        (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
-            Some("js"),
-        ) => &["ts", "tsx", "js", "jsx"],
-        (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
-            Some("mjs"),
-        ) => &["mts", "mjs"],
-        (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
-            Some("cjs"),
-        ) => &["cts", "cjs"],
-        _ => &[],
-    };
-    for extension in source_extensions {
-        let candidate = base.with_extension(extension);
-        if candidate.is_file() {
-            return Some(ModulePath(normalize(&candidate)));
-        }
-    }
-
-    if source_extensions.is_empty() {
-        for extension in EXTENSIONS {
-            let candidate = PathBuf::from(format!("{}.{}", base.to_string_lossy(), extension));
-            if candidate.is_file() {
-                return Some(ModulePath(normalize(&candidate)));
-            }
-        }
-    }
-    if base.is_dir() {
-        for extension in EXTENSIONS {
-            let candidate = base.join(format!("index.{extension}"));
-            if candidate.is_file() {
-                return Some(ModulePath(normalize(&candidate)));
-            }
-        }
-    }
-    None
-}
-
-fn resolution_candidates(base: &Path, mode: ResolutionMode) -> Vec<ModulePath> {
-    let mut candidates = vec![ModulePath(normalize(base))];
-    let extensions: &[&str] = match (mode, base.extension().and_then(|value| value.to_str())) {
-        (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
-            Some("js"),
-        ) => &["ts", "tsx", "js", "jsx"],
-        (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
-            Some("mjs"),
-        ) => &["mts", "mjs"],
-        (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
-            Some("cjs"),
-        ) => &["cts", "cjs"],
-        _ => &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"],
-    };
-    for extension in extensions {
-        candidates.push(ModulePath(normalize(&base.with_extension(extension))));
-        candidates.push(ModulePath(normalize(&base.join(format!("index.{extension}")))));
-    }
-    candidates
 }
 
 fn lexically_within(path: &Path, directory: &Path) -> bool {
@@ -1039,12 +992,38 @@ mod tests {
         specifier: &str,
         dependency_kind: DependencyKind,
     ) -> Option<Resolution> {
+        let resolution_kind = match dependency_kind {
+            DependencyKind::Require => ResolutionKind::Require,
+            _ => ResolutionKind::Import,
+        };
+        resolve_request_with(
+            resolver,
+            importer,
+            specifier,
+            dependency_kind,
+            resolution_kind,
+            ModuleFormat::CommonJs,
+            ResolutionMode::NodeNext,
+        )
+    }
+
+    fn resolve_request_with(
+        resolver: &dyn ResolutionHandler,
+        importer: &Path,
+        specifier: &str,
+        dependency_kind: DependencyKind,
+        resolution_kind: ResolutionKind,
+        importer_format: ModuleFormat,
+        mode: ResolutionMode,
+    ) -> Option<Resolution> {
         let importer = ModulePath(importer.to_string_lossy().into_owned());
         resolver.try_resolve(&ResolutionRequest {
             importer: &importer,
             specifier,
             dependency_kind,
-            mode: ResolutionMode::NodeNext,
+            resolution_kind,
+            importer_format,
+            mode,
             custom_conditions: &[],
         })
     }
@@ -1141,6 +1120,41 @@ mod tests {
     }
 
     #[test]
+    fn package_tsconfig_extends_resolves_from_ancestor_node_modules() {
+        let root =
+            std::env::temp_dir().join(format!("wae-hoisted-tsconfig-{}", std::process::id()));
+        let config_package = root.join("node_modules/@acme/tsconfig");
+        let app = root.join("packages/app");
+        fs::create_dir_all(&config_package).unwrap();
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::write(
+            config_package.join("package.json"),
+            r#"{"name":"@acme/tsconfig","tsconfig":"base.json"}"#,
+        )
+        .unwrap();
+        fs::write(
+            config_package.join("base.json"),
+            r#"{"compilerOptions":{"baseUrl":"../../../","paths":{"@shared/*":["shared/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(app.join("tsconfig.json"), r#"{"extends":"@acme/tsconfig"}"#).unwrap();
+        let loaded = TsConfigLoader::load(&app).unwrap();
+        assert_eq!(loaded.aliases[0].pattern, "@shared/*");
+        assert!(loaded.aliases[0].targets[0].ends_with("shared/*"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tsconfig_extends_arrays_are_explicitly_rejected() {
+        let root = std::env::temp_dir().join(format!("wae-array-tsconfig-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("tsconfig.json"), r#"{"extends":["./base.json"]}"#).unwrap();
+        let error = TsConfigLoader::load(&root).unwrap_err();
+        assert!(error.contains("must be a single string"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn resolves_workspace_exports_and_subpaths_before_external_packages() {
         let root = std::env::temp_dir().join(format!("wae-workspace-{}", std::process::id()));
         let package = root.join("packages/ui");
@@ -1195,6 +1209,57 @@ mod tests {
             resolve_with(&resolver, &root.join("a.ts"), "./config.prod"),
             Some(Resolution::Module(path)) if path.0.ends_with("config.prod.ts")
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nodenext_esm_requires_explicit_relative_extensions() {
+        let root = std::env::temp_dir().join(format!("wae-nodenext-esm-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("value.ts"), "").unwrap();
+        let resolver = RelativeResolver { mode: ResolutionMode::NodeNext };
+        assert_eq!(
+            resolve_request_with(
+                &resolver,
+                &root.join("app.mts"),
+                "./value",
+                DependencyKind::Static,
+                ResolutionKind::Import,
+                ModuleFormat::Esm,
+                ResolutionMode::NodeNext,
+            ),
+            Some(Resolution::Unresolved)
+        );
+        assert!(matches!(
+            resolve_request_with(
+                &resolver,
+                &root.join("app.mts"),
+                "./value.js",
+                DependencyKind::Static,
+                ResolutionKind::Import,
+                ModuleFormat::Esm,
+                ResolutionMode::NodeNext,
+            ),
+            Some(Resolution::Module(path)) if path.0.ends_with("value.ts")
+        ));
+        for (mode, format) in [
+            (ResolutionMode::NodeNext, ModuleFormat::CommonJs),
+            (ResolutionMode::Bundler, ModuleFormat::Esm),
+        ] {
+            let resolver = RelativeResolver { mode };
+            assert!(matches!(
+                resolve_request_with(
+                    &resolver,
+                    &root.join("app.ts"),
+                    "./value",
+                    DependencyKind::Static,
+                    ResolutionKind::Import,
+                    format,
+                    mode,
+                ),
+                Some(Resolution::Module(_))
+            ));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1296,6 +1361,55 @@ mod tests {
     }
 
     #[test]
+    fn package_conditions_combine_module_format_and_type_only_resolution() {
+        let root =
+            std::env::temp_dir().join(format!("wae-nested-conditions-{}", std::process::id()));
+        let package = root.join("packages/lib");
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"repo","workspaces":["packages/*"]}"#)
+            .unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"pkg","exports":{".":{"import":{"types":"./src/import.d.ts","default":"./src/import.js"},"require":{"types":"./src/require.d.ts","default":"./src/require.cjs"}}}}"#,
+        )
+        .unwrap();
+        for file in ["import.d.ts", "import.js", "require.d.ts", "require.cjs"] {
+            fs::write(package.join("src").join(file), "").unwrap();
+        }
+        let resolver = WorkspaceResolver::discover(&root).unwrap();
+        for (kind, format, suffix) in [
+            (ResolutionKind::Import, ModuleFormat::Esm, "import.d.ts"),
+            (ResolutionKind::Require, ModuleFormat::CommonJs, "require.d.ts"),
+        ] {
+            assert!(matches!(
+                resolve_request_with(
+                    &resolver,
+                    &root.join("app.ts"),
+                    "pkg",
+                    DependencyKind::TypeOnly,
+                    kind,
+                    format,
+                    ResolutionMode::NodeNext,
+                ),
+                Some(Resolution::Module(path)) if path.0.ends_with(suffix)
+            ));
+        }
+        assert!(matches!(
+            resolve_request_with(
+                &resolver,
+                &root.join("app.cts"),
+                "pkg",
+                DependencyKind::Static,
+                ResolutionKind::Require,
+                ModuleFormat::CommonJs,
+                ResolutionMode::NodeNext,
+            ),
+            Some(Resolution::Module(path)) if path.0.ends_with("require.cjs")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn package_imports_can_redirect_to_external_packages_and_detect_loops() {
         let root = std::env::temp_dir().join(format!("wae-import-map-{}", std::process::id()));
         fs::create_dir_all(root.join("src")).unwrap();
@@ -1312,6 +1426,8 @@ mod tests {
             importer: &importer,
             specifier,
             dependency_kind: DependencyKind::Static,
+            resolution_kind: ResolutionKind::Import,
+            importer_format: ModuleFormat::Esm,
             mode: ResolutionMode::NodeNext,
             custom_conditions: &[],
         };
@@ -1378,6 +1494,8 @@ mod tests {
             importer: &importer,
             specifier: "/outside/secret.ts",
             dependency_kind: DependencyKind::Static,
+            resolution_kind: ResolutionKind::Import,
+            importer_format: ModuleFormat::Esm,
             mode: ResolutionMode::NodeNext,
             custom_conditions: &[],
         };

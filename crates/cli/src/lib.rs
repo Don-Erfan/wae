@@ -38,6 +38,7 @@ enum Command {
     Graph,
     Doctor,
     Explain(String),
+    Version,
     Help,
 }
 
@@ -54,6 +55,7 @@ pub fn run(args: &[String], cwd: &Path) -> CliOutput {
         Command::Graph => commands::graph(cwd),
         Command::Doctor => commands::doctor(cwd),
         Command::Explain(rule) => commands::explain(&rule),
+        Command::Version => CliOutput::success(format!("wae {}", env!("CARGO_PKG_VERSION"))),
         Command::Help => CliOutput::success(usage()),
     }
 }
@@ -70,6 +72,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
         }
         "explain" if args.len() == 2 => Ok(Command::Explain(args[1].clone())),
         "check" => parse_check(&args[1..]),
+        "--version" | "-V" if args.len() == 1 => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         _ => Err(format!("Invalid command or arguments: {}", args.join(" "))),
     }
@@ -102,7 +105,7 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: wae <COMMAND>\n\nCommands:\n  init                         Create wae.yaml\n  scan                         Analyze and report module count\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n  baseline create              Explicitly record current violations\n  graph                        Print the real dependency graph as JSON\n  doctor                       Validate project/config/tooling\n  explain <RULE_ID>            Explain an architecture rule\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error"
+    "Usage: wae <COMMAND>\n\nCommands:\n  init                         Create wae.yaml\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n  baseline create              Explicitly record current violations\n  graph                        Print the real dependency graph as JSON\n  doctor                       Validate project/config/tooling\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error"
 }
 
 #[cfg(test)]
@@ -111,6 +114,14 @@ mod tests {
     use std::path::PathBuf;
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(name)
+    }
+    #[test]
+    fn version_flags_report_the_package_version() {
+        for flag in ["-V", "--version"] {
+            let output = run(&[flag.into()], Path::new("."));
+            assert_eq!(output.exit_code, EXIT_PASSED);
+            assert_eq!(output.stdout, format!("wae {}", env!("CARGO_PKG_VERSION")));
+        }
     }
     #[test]
     fn circular_fixture_runs_end_to_end_without_a_diagnostic_input_file() {

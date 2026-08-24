@@ -3,6 +3,10 @@ use wae_core::domain::{
     Import, ImportKind, ModuleId, ModulePath, ParseError, ParseErrorKind, SourceLocation,
 };
 
+/// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
+/// persist this value so parser upgrades can never reuse stale import IR.
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v2");
+
 pub trait ParserAdapter: Send + Sync {
     fn parse_imports(
         &self,

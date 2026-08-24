@@ -140,38 +140,13 @@ pub mod domain {
         Unknown,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    pub enum Framework {
-        NextJs,
-        Unknown,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    pub enum NextRouterKind {
-        App,
-        Pages,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-    pub enum NextModuleKind {
-        ServerComponent,
-        ClientComponent,
-        ServerAction,
-        RouteHandler,
-        Middleware,
-    }
-
-    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct NextMetadata {
-        pub router: Option<NextRouterKind>,
-        pub kind: Option<NextModuleKind>,
-        pub edge_runtime: bool,
-    }
-
+    /// Framework-neutral metadata emitted by optional framework adapters. Core intentionally
+    /// treats adapter identifiers and attributes as open values so adding a framework does not
+    /// require changing the IR crate.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct FrameworkMetadata {
-        pub framework: Option<Framework>,
-        pub next: Option<NextMetadata>,
+        pub adapter_id: Option<String>,
+        pub attributes: BTreeMap<String, String>,
     }
 
     /// Open layer identity; configured layer names remain first-class in the IR.
@@ -610,7 +585,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.9"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.10"]);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::process::Command;
 
 use serde_json::json;
 use wae_config::{CONFIG_FILE, Config};
-use wae_core::domain::{Diagnostic, Severity};
+use wae_core::domain::{Diagnostic, ModuleKind, Severity};
 use wae_engine::{
     Analysis, AnalysisError, AnalyzeRequest, ChangeSet, Engine, ImpactAnalyzer, VcsPort,
 };
@@ -34,11 +34,30 @@ pub fn init(root: &Path) -> CliOutput {
 
 pub fn scan(root: &Path) -> CliOutput {
     match analyze(root) {
-        Ok(result) => CliOutput::success(format!(
-            "Analyzed {} modules and {} dependencies.",
-            result.project.modules.len(),
-            result.project.dependencies.len()
-        )),
+        Ok(result) => {
+            let source = result
+                .project
+                .modules
+                .iter()
+                .filter(|module| module.kind == ModuleKind::Source)
+                .count();
+            let excluded = result
+                .project
+                .modules
+                .iter()
+                .filter(|module| module.kind == ModuleKind::Excluded)
+                .count();
+            let external = result
+                .project
+                .modules
+                .iter()
+                .filter(|module| module.kind == ModuleKind::External)
+                .count();
+            CliOutput::success(format!(
+                "Analyzed {source} source modules, {excluded} excluded modules, {external} external packages, and {} dependencies.",
+                result.project.resolved_dependencies.len()
+            ))
+        }
         Err(output) => output,
     }
 }
@@ -69,10 +88,10 @@ pub fn check(
     }
     let format = match format {
         Some(format) => format,
-        None => match Config::load(root).map_err(|error| error.message).and_then(|config| {
-            Format::parse(&config.output.format)
-                .ok_or_else(|| format!("unsupported output format `{}`", config.output.format))
-        }) {
+        None => match Config::load(root)
+            .map_err(|error| error.message)
+            .map(|config| config.output.format)
+        {
             Ok(format) => format,
             Err(error) => return CliOutput::project_error(error),
         },
@@ -94,10 +113,12 @@ pub fn baseline_create(root: &Path) -> CliOutput {
         Err(output) => return output,
     };
     match baseline::save(root, &analysis.diagnostics) {
-        Ok(path) => CliOutput::success(format!(
-            "Recorded {} violations in {}",
-            analysis.diagnostics.len(),
-            path.display()
+        Ok(result) => CliOutput::success(format!(
+            "Recorded {} fail-level violations in {} (excluded: {} suppressed, {} informational)",
+            result.recorded,
+            result.path.display(),
+            result.suppressed,
+            result.informational,
         )),
         Err(error) => CliOutput::project_error(error),
     }

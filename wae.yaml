@@ -1,11 +1,14 @@
 version: 1
 
 project:
-  include: ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
+  include: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"]
   exclude:
     - "fixtures/**"
     - "**/*.test.*"
     - "**/*.spec.*"
+    - "**/*.d.ts"
+    - "**/*.d.mts"
+    - "**/*.d.cts"
     - "**/node_modules/**"
     - "**/.git/**"
     - "**/.idea/**"

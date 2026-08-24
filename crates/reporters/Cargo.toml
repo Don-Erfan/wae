@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 serde_json.workspace = true
 wae-core = { path = "../core" }
+wae-config = { path = "../config" }
 wae-engine = { path = "../engine" }

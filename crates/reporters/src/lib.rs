@@ -1,26 +1,7 @@
 use serde_json::json;
-use wae_core::domain::{Diagnostic, Severity};
+pub use wae_config::OutputFormat as Format;
+use wae_core::domain::{Diagnostic, ModuleKind, Severity};
 use wae_engine::Analysis;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
-    Human,
-    Json,
-    Jsonl,
-    Sarif,
-}
-
-impl Format {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "human" => Some(Self::Human),
-            "json" => Some(Self::Json),
-            "jsonl" => Some(Self::Jsonl),
-            "sarif" => Some(Self::Sarif),
-            _ => None,
-        }
-    }
-}
 
 pub fn render(analysis: &Analysis, format: Format) -> Result<String, serde_json::Error> {
     match format {
@@ -32,6 +13,7 @@ pub fn render(analysis: &Analysis, format: Format) -> Result<String, serde_json:
 }
 
 fn human(analysis: &Analysis) -> String {
+    let counts = counts(analysis);
     let errors = analysis
         .diagnostics
         .iter()
@@ -43,8 +25,11 @@ fn human(analysis: &Analysis) -> String {
         .filter(|d| !d.suppressed && d.severity == Severity::Warning)
         .count();
     let mut output = format!(
-        "Analyzing {} modules...\n\nArchitecture\n\n✖ {errors} errors\n⚠ {warnings} warnings\n",
-        analysis.project.modules.len()
+        "Analyzing {} source modules, {} excluded modules, {} external packages and {} dependencies...\n\nArchitecture\n\n✖ {errors} errors\n⚠ {warnings} warnings\n",
+        counts.source_modules,
+        counts.excluded_modules,
+        counts.external_packages,
+        counts.dependencies,
     );
     for diagnostic in &analysis.diagnostics {
         output.push_str(&format!(
@@ -83,16 +68,28 @@ fn human(analysis: &Analysis) -> String {
 }
 
 fn json_report(analysis: &Analysis) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(
-        &json!({ "schemaVersion": analysis.schema_version, "modules": analysis.project.modules.len(), "diagnostics": analysis.diagnostics }),
-    )
+    let counts = counts(analysis);
+    serde_json::to_string_pretty(&json!({
+        "schemaVersion": analysis.schema_version,
+        "modules": analysis.project.modules.len(),
+        "sourceModules": counts.source_modules,
+        "excludedModules": counts.excluded_modules,
+        "externalPackages": counts.external_packages,
+        "dependencies": counts.dependencies,
+        "diagnostics": analysis.diagnostics
+    }))
 }
 
 fn jsonl(analysis: &Analysis) -> Result<String, serde_json::Error> {
+    let counts = counts(analysis);
     let mut events = vec![serde_json::to_string(&json!({
         "schemaVersion": analysis.schema_version,
         "type": "analysis",
         "modules": analysis.project.modules.len(),
+        "sourceModules": counts.source_modules,
+        "excludedModules": counts.excluded_modules,
+        "externalPackages": counts.external_packages,
+        "dependencies": counts.dependencies,
     }))?];
     for diagnostic in &analysis.diagnostics {
         events.push(serde_json::to_string(&json!({
@@ -114,10 +111,6 @@ fn sarif(analysis: &Analysis) -> Result<String, serde_json::Error> {
     rule_ids.sort_unstable();
     rule_ids.dedup();
     let rules = rule_ids.into_iter().map(sarif_rule).collect::<Vec<_>>();
-    let successful = !analysis
-        .diagnostics
-        .iter()
-        .any(|diagnostic| !diagnostic.suppressed && diagnostic.severity == Severity::Error);
     serde_json::to_string_pretty(&json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
         "runs": [{
@@ -127,10 +120,42 @@ fn sarif(analysis: &Analysis) -> Result<String, serde_json::Error> {
                 "informationUri": "https://github.com/Don-Erfan/wae",
                 "rules": rules
             } },
-            "invocations": [{ "executionSuccessful": successful }],
+            "invocations": [{ "executionSuccessful": true }],
             "results": results
         }]
     }))
+}
+
+#[derive(Clone, Copy)]
+struct Counts {
+    source_modules: usize,
+    excluded_modules: usize,
+    external_packages: usize,
+    dependencies: usize,
+}
+
+fn counts(analysis: &Analysis) -> Counts {
+    Counts {
+        source_modules: analysis
+            .project
+            .modules
+            .iter()
+            .filter(|module| module.kind == ModuleKind::Source)
+            .count(),
+        excluded_modules: analysis
+            .project
+            .modules
+            .iter()
+            .filter(|module| module.kind == ModuleKind::Excluded)
+            .count(),
+        external_packages: analysis
+            .project
+            .modules
+            .iter()
+            .filter(|module| module.kind == ModuleKind::External)
+            .count(),
+        dependencies: analysis.project.resolved_dependencies.len(),
+    }
 }
 
 fn sarif_rule(rule_id: &str) -> serde_json::Value {
@@ -221,6 +246,7 @@ mod tests {
             diagnostics: vec![diagnostic],
         };
         let value: serde_json::Value = serde_json::from_str(&sarif(&analysis).unwrap()).unwrap();
+        assert_eq!(value["runs"][0]["invocations"][0]["executionSuccessful"], true);
         assert_eq!(value["runs"][0]["tool"]["driver"]["rules"][0]["id"], "ARCH-003");
         assert!(
             value["runs"][0]["results"][0]["partialFingerprints"]["waeViolationId"].is_string()

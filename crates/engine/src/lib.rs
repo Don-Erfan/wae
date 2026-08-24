@@ -12,14 +12,16 @@ use wae_core::domain::{
     Severity, SourceLocation,
 };
 use wae_graph::ModuleGraph;
-use wae_parser::{JsTsParser, ParserAdapter};
+use wae_parser::{JsTsParser, PARSER_CACHE_VERSION, ParserAdapter};
 use wae_resolver::{
-    ModuleResolver, Resolution, ResolutionRequest, ResolverPipeline, TsConfigIndex,
-    WorkspacePackage, WorkspaceResolver,
+    ModuleFormat, ModuleResolver, Resolution, ResolutionKind, ResolutionRequest, ResolverPipeline,
+    TsConfigIndex, WorkspacePackage, WorkspaceResolver,
 };
 use wae_rules::{CompiledRulePolicies, RuleContext, RuleSet};
 
+mod resolution_context;
 mod suppression;
+use resolution_context::module_format;
 
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
@@ -147,6 +149,7 @@ impl<P: ParserAdapter> Engine<P> {
         let workspace_resolver =
             WorkspaceResolver::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_packages = workspace_resolver.packages().to_vec();
+        let package_contexts = workspace_resolver.clone();
         let resolver = ResolverPipeline::indexed_node_with_workspaces(
             tsconfigs,
             workspace_resolver,
@@ -228,10 +231,21 @@ impl<P: ParserAdapter> Engine<P> {
                         import.module_id = module_id.clone();
                         import.location.file = module_id.0.clone();
                         let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
+                        let importer_format = module_format(&module_path, &package_contexts);
+                        let resolution_kind = match candidate.kind {
+                            wae_core::domain::DependencyKind::Dynamic => ResolutionKind::Import,
+                            wae_core::domain::DependencyKind::Require => ResolutionKind::Require,
+                            _ if importer_format == ModuleFormat::CommonJs => {
+                                ResolutionKind::Require
+                            }
+                            _ => ResolutionKind::Import,
+                        };
                         let resolution_request = ResolutionRequest {
                             importer: &module_path,
                             specifier: &import.specifier,
                             dependency_kind: candidate.kind.clone(),
+                            resolution_kind,
+                            importer_format,
                             mode: config.resolution.mode,
                             custom_conditions: &config.resolution.custom_conditions,
                         };
@@ -435,6 +449,8 @@ struct CachedImports {
 #[derive(Default, Serialize, Deserialize)]
 struct CacheFile {
     schema_version: u32,
+    #[serde(default)]
+    parser_version: String,
     files: std::collections::BTreeMap<String, CachedImports>,
 }
 
@@ -451,10 +467,20 @@ impl AnalysisCache {
             fs::read_to_string(&path)
                 .ok()
                 .and_then(|source| serde_json::from_str::<CacheFile>(&source).ok())
-                .filter(|cache| cache.schema_version == 1)
-                .unwrap_or_else(|| CacheFile { schema_version: 1, ..CacheFile::default() })
+                .filter(|cache| {
+                    cache.schema_version == 1 && cache.parser_version == PARSER_CACHE_VERSION
+                })
+                .unwrap_or_else(|| CacheFile {
+                    schema_version: 1,
+                    parser_version: PARSER_CACHE_VERSION.into(),
+                    ..CacheFile::default()
+                })
         } else {
-            CacheFile { schema_version: 1, ..CacheFile::default() }
+            CacheFile {
+                schema_version: 1,
+                parser_version: PARSER_CACHE_VERSION.into(),
+                ..CacheFile::default()
+            }
         };
         Ok(Self { enabled: config.cache.enabled, path, file })
     }
@@ -484,7 +510,11 @@ impl AnalysisCache {
         fs::create_dir_all(parent).map_err(|error| {
             AnalysisError::Project(format!("cannot create cache directory: {error}"))
         })?;
-        let temporary = self.path.with_extension(format!("tmp-{}", std::process::id()));
+        let _lock = CacheWriteLock::acquire(&self.path)?;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
+        let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.path.with_extension(format!("tmp-{}-{write_id}", std::process::id()));
         let contents = serde_json::to_vec(&self.file)
             .map_err(|error| AnalysisError::Internal(error.to_string()))?;
         fs::write(&temporary, contents)
@@ -502,6 +532,39 @@ impl AnalysisCache {
             }
         }
         Ok(())
+    }
+}
+
+struct CacheWriteLock {
+    path: PathBuf,
+}
+
+impl CacheWriteLock {
+    fn acquire(cache_path: &Path) -> Result<Self, AnalysisError> {
+        let path = cache_path.with_extension("lock");
+        for _ in 0..500 {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(AnalysisError::Project(format!(
+                        "cannot acquire cache write lock: {error}"
+                    )));
+                }
+            }
+        }
+        Err(AnalysisError::Project(format!(
+            "timed out waiting for cache write lock `{}`",
+            path.display()
+        )))
+    }
+}
+
+impl Drop for CacheWriteLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -805,6 +868,26 @@ mod tests {
     }
 
     #[test]
+    fn realistic_resolution_matrix_covers_esm_cjs_exports_tsconfigs_and_cycles() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/resolution-matrix");
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(root)).unwrap();
+        assert!(analysis.project.modules.iter().any(|module| module.id.0.ends_with("index.mts")));
+        assert!(analysis.project.modules.iter().any(|module| module.id.0.ends_with("index.cts")));
+        assert_eq!(
+            analysis
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.rule_id.0 == "ARCH-001")
+                .count(),
+            1
+        );
+        assert!(
+            !analysis.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001")
+        );
+    }
+
+    #[test]
     fn feature_roots_are_relative_to_each_workspace_package() {
         let root =
             std::env::temp_dir().join(format!("wae-feature-workspace-{}", std::process::id()));
@@ -950,7 +1033,39 @@ mod tests {
         Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
         let cache = root.join(".wae/cache/imports-v1.json");
         assert!(cache.is_file());
+        let mut stale: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+        stale["parser_version"] = serde_json::Value::String("stale-parser".into());
+        fs::write(&cache, serde_json::to_vec(&stale).unwrap()).unwrap();
         Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let refreshed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+        assert_eq!(refreshed["parser_version"], PARSER_CACHE_VERSION);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_cache_writers_leave_a_valid_atomic_cache_file() {
+        let root = std::env::temp_dir().join(format!("wae-cache-race-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.ts"), "export const value = 1;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\ncache:\n  enabled: true\n  directory: .wae/cache\n",
+        )
+        .unwrap();
+        let handles = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || Engine::default().analyze(AnalyzeRequest::new(root)))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let cache = fs::read_to_string(root.join(".wae/cache/imports-v1.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&cache).unwrap();
+        assert_eq!(parsed["parser_version"], PARSER_CACHE_VERSION);
         fs::remove_dir_all(root).unwrap();
     }
 }

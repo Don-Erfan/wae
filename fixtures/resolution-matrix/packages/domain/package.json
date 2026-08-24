@@ -1,0 +1,1 @@
+{"name":"@fixture/domain","type":"module","exports":{".":{"import":{"types":"./src/import.d.ts","default":"./src/import.js"},"require":{"types":"./src/require.d.ts","default":"./src/require.cjs"}},"./public":{"import":"./src/public.js","require":"./src/public.cjs"}}}

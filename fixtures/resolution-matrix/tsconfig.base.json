@@ -1,0 +1,1 @@
+{"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","baseUrl":".","paths":{"@fixture/domain-alias":["packages/domain/src/public.ts"]}}}

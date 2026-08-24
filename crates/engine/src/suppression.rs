@@ -9,7 +9,7 @@ pub(crate) struct SuppressionDirective {
     line: usize,
     rule_id: String,
     reason: String,
-    used: bool,
+    matched_count: usize,
 }
 
 pub(crate) fn collect(
@@ -20,7 +20,15 @@ pub(crate) fn collect(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (index, line) in source.lines().enumerate() {
-        let Some((_, declaration)) = line.split_once("wae-ignore") else { continue };
+        // Suppressions are deliberately restricted to standalone line comments. This avoids
+        // interpreting examples in string literals, templates and documentation as directives.
+        let Some(comment) = line.trim_start().strip_prefix("//") else { continue };
+        let Some(declaration) = comment.trim_start().strip_prefix("wae-ignore") else {
+            continue;
+        };
+        if declaration.chars().next().is_some_and(|character| !character.is_whitespace()) {
+            continue;
+        }
         let declaration = declaration.trim();
         let (rule_id, reason) = declaration
             .split_once("--")
@@ -41,7 +49,7 @@ pub(crate) fn collect(
                 line: line_number,
                 rule_id: rule_id.into(),
                 reason: reason.into(),
-                used: false,
+                matched_count: 0,
             });
         }
     }
@@ -55,18 +63,17 @@ pub(crate) fn apply(
     for diagnostic in diagnostics.iter_mut() {
         let Some(location) = &diagnostic.primary_location else { continue };
         if let Some(directive) = directives.iter_mut().find(|directive| {
-            !directive.used
-                && directive.rule_id == diagnostic.rule_id.0
+            directive.rule_id == diagnostic.rule_id.0
                 && directive.file == location.file
                 && (directive.line == location.line || directive.line + 1 == location.line)
         }) {
-            directive.used = true;
+            directive.matched_count += 1;
             diagnostic.suppressed = true;
             diagnostic.suppression_reason = Some(directive.reason.clone());
         }
     }
     if report_unused {
-        diagnostics.extend(directives.iter().filter(|directive| !directive.used).map(
+        diagnostics.extend(directives.iter().filter(|directive| directive.matched_count == 0).map(
             |directive| {
                 warning(
                     &directive.file,
@@ -84,4 +91,49 @@ fn warning(file: &str, line: usize, message: String) -> Diagnostic {
     diagnostic.primary_location = Some(SourceLocation { file: file.into(), line, column: 1 });
     diagnostic.refresh_fingerprint();
     diagnostic
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diagnostic(rule: &str, line: usize) -> Diagnostic {
+        let mut diagnostic = Diagnostic::new(rule, "test");
+        diagnostic.primary_location =
+            Some(SourceLocation { file: "src/app.ts".into(), line, column: 1 });
+        diagnostic
+    }
+
+    #[test]
+    fn ignores_directive_text_inside_source_strings() {
+        let mut directives = Vec::new();
+        let mut diagnostics = Vec::new();
+        collect(
+            "src/app.ts",
+            r#"const example = "// wae-ignore ARCH-001 -- documentation";"#,
+            true,
+            &mut directives,
+            &mut diagnostics,
+        );
+        assert!(directives.is_empty());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn one_directive_suppresses_every_matching_diagnostic_in_its_scope() {
+        let mut directives = Vec::new();
+        let mut collection_diagnostics = Vec::new();
+        collect(
+            "src/app.ts",
+            "// wae-ignore ARCH-003 -- approved boundary\nimports();",
+            true,
+            &mut directives,
+            &mut collection_diagnostics,
+        );
+        let mut diagnostics = vec![diagnostic("ARCH-003", 2), diagnostic("ARCH-003", 2)];
+        apply(&mut diagnostics, &mut directives, true);
+        assert!(diagnostics.iter().all(|diagnostic| diagnostic.suppressed));
+        assert_eq!(directives[0].matched_count, 2);
+        assert!(!diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "SUPPRESS-001"));
+    }
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
@@ -98,15 +98,6 @@ impl RuleSet {
                 diagnostic.refresh_fingerprint();
             }
         }
-        let feature_edges = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.rule_id.0 == "ARCH-004")
-            .map(|diagnostic| diagnostic.dependency_path.clone())
-            .collect::<HashSet<_>>();
-        diagnostics.retain(|diagnostic| {
-            diagnostic.rule_id.0 != "ARCH-005"
-                || !feature_edges.contains(&diagnostic.dependency_path)
-        });
         Ok(diagnostics)
     }
 }
@@ -467,12 +458,20 @@ mod tests {
     }
 
     #[test]
-    fn feature_and_private_rules_do_not_duplicate_the_same_edge() {
+    fn overlapping_feature_and_private_rules_preserve_the_strongest_enforcement() {
         let edge =
             dependency("src/features/payment/service.ts", "src/features/user/internal/token.ts");
         let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
         let graph = ModuleGraph::from_project(&project);
-        let config = Config { configured: true, ..Config::default() };
+        let mut config = Config { configured: true, ..Config::default() };
+        config.rules.insert(
+            "ARCH-004".into(),
+            wae_config::RuleConfig::Severity(wae_core::domain::Severity::Info),
+        );
+        config.rules.insert(
+            "ARCH-005".into(),
+            wae_config::RuleConfig::Severity(wae_core::domain::Severity::Error),
+        );
         let features = HashMap::from([
             (edge.from, FeatureId { package: PackageName("app".into()), name: "payment".into() }),
             (edge.to, FeatureId { package: PackageName("app".into()), name: "user".into() }),
@@ -480,6 +479,9 @@ mod tests {
         let diagnostics =
             RuleSet::defaults().evaluate(&context(&project, &graph, &config, &features)).unwrap();
         assert_eq!(diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-004").count(), 1);
-        assert_eq!(diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-005").count(), 0);
+        assert_eq!(diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-005").count(), 1);
+        assert!(diagnostics.iter().any(|d| {
+            d.rule_id.0 == "ARCH-005" && d.severity == wae_core::domain::Severity::Error
+        }));
     }
 }

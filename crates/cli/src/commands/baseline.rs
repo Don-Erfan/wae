@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use wae_config::Config;
-use wae_core::domain::Diagnostic;
+use wae_core::domain::{Diagnostic, Severity};
 
 const BASELINE_SCHEMA_VERSION: u32 = 2;
 
@@ -42,16 +42,35 @@ struct StoredEntry {
     fingerprint: String,
 }
 
-pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<PathBuf, String> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct SaveResult {
+    pub path: PathBuf,
+    pub recorded: usize,
+    pub suppressed: usize,
+    pub informational: usize,
+}
+
+pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
     let path = root.join(config.baseline.file);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let mut sorted = diagnostics.iter().collect::<Vec<_>>();
+    let suppressed = diagnostics.iter().filter(|diagnostic| diagnostic.suppressed).count();
+    let informational = diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.suppressed && diagnostic.severity == Severity::Info)
+        .count();
+    let mut sorted = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            !diagnostic.suppressed
+                && matches!(diagnostic.severity, Severity::Error | Severity::Warning)
+        })
+        .collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
     sorted.dedup_by(|left, right| left.fingerprint == right.fingerprint);
-    let entries = sorted
+    let entries: Vec<_> = sorted
         .into_iter()
         .map(|diagnostic| BaselineEntry {
             fingerprint: &diagnostic.fingerprint,
@@ -61,6 +80,7 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<PathBuf, String> 
             reason: None,
         })
         .collect();
+    let recorded = entries.len();
     let created_at_unix =
         SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs();
     let contents = serde_json::to_string_pretty(&BaselineFile {
@@ -70,7 +90,7 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<PathBuf, String> 
     })
     .map_err(|error| error.to_string())?;
     fs::write(&path, format!("{contents}\n")).map_err(|error| error.to_string())?;
-    Ok(path)
+    Ok(SaveResult { path, recorded, suppressed, informational })
 }
 
 pub fn load(root: &Path) -> Result<HashSet<String>, String> {
@@ -109,12 +129,31 @@ mod tests {
         diagnostic.dependency_path =
             vec![ModuleId("src/app.ts".into()), ModuleId("src/shared.ts".into())];
         diagnostic.refresh_fingerprint();
-        save(&root, &[diagnostic.clone()]).unwrap();
+        let saved = save(&root, &[diagnostic.clone()]).unwrap();
+        assert_eq!(saved.recorded, 1);
         let source = fs::read_to_string(root.join(".wae/baseline.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&source).unwrap();
         assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["entries"][0]["ruleId"], "ARCH-003");
         assert!(load(&root).unwrap().contains(&diagnostic.fingerprint));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn excludes_suppressed_and_informational_diagnostics() {
+        let root = std::env::temp_dir().join(format!("wae-baseline-filter-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let kept = Diagnostic::new("ARCH-001", "kept");
+        let mut suppressed = Diagnostic::new("ARCH-002", "suppressed");
+        suppressed.suppressed = true;
+        let mut info = Diagnostic::new("ARCH-003", "info");
+        info.severity = Severity::Info;
+        let saved = save(&root, &[kept.clone(), suppressed, info]).unwrap();
+        assert_eq!(saved.recorded, 1);
+        assert_eq!(saved.suppressed, 1);
+        assert_eq!(saved.informational, 1);
+        let baseline = load(&root).unwrap();
+        assert_eq!(baseline, HashSet::from([kept.fingerprint]));
         fs::remove_dir_all(root).unwrap();
     }
 

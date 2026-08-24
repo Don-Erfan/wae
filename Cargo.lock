@@ -303,7 +303,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "wae-cli"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "wae-config"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "globset",
  "serde",
@@ -325,14 +325,14 @@ dependencies = [
 
 [[package]]
 name = "wae-core"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "wae-engine"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "globset",
  "ignore",
@@ -348,14 +348,14 @@ dependencies = [
 
 [[package]]
 name = "wae-graph"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "wae-core",
 ]
 
 [[package]]
 name = "wae-parser"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde_json",
  "tree-sitter",
@@ -365,16 +365,17 @@ dependencies = [
 
 [[package]]
 name = "wae-reporters"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde_json",
+ "wae-config",
  "wae-core",
  "wae-engine",
 ]
 
 [[package]]
 name = "wae-resolver"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "globset",
  "ignore",
@@ -387,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "wae-rules"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "globset",
  "wae-config",
