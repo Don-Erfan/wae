@@ -99,7 +99,7 @@ impl<P: ParserAdapter> Engine<P> {
             if let Some(value) = &layer_name {
                 layers.insert(id.clone(), value.clone());
             }
-            let package_root = relative_path(&root, Path::new(&package.root_path));
+            let package_root = relative_resolved_path(&root, &package.root_path);
             if let Some((feature, feature_root)) =
                 architecture.feature(&relative, &package, &package_root)
             {
@@ -185,7 +185,7 @@ impl<P: ParserAdapter> Engine<P> {
                                         layers.insert(target_id.clone(), value.clone());
                                     }
                                     let package_root =
-                                        relative_path(&root, Path::new(&package.root_path));
+                                        relative_resolved_path(&root, &package.root_path);
                                     if let Some((feature, feature_root)) =
                                         architecture.feature(&target_id.0, &package, &package_root)
                                     {
@@ -561,6 +561,9 @@ fn relative_path(root: &Path, path: &Path) -> String {
 fn relative_resolved_path(root: &Path, resolved: &str) -> String {
     let root = normalize(root);
     let resolved = resolved.replace('\\', "/");
+    if resolved == root {
+        return String::new();
+    }
     resolved
         .strip_prefix(root.trim_end_matches('/'))
         .and_then(|relative| relative.strip_prefix('/'))
@@ -617,6 +620,7 @@ mod tests {
     fn resolved_windows_verbatim_paths_become_project_relative_ids() {
         let root = Path::new(r"\\?\D:\a\wae\wae");
         let resolved = "//?/D:/a/wae/wae/src/a.ts";
+        assert_eq!(relative_resolved_path(root, "//?/D:/a/wae/wae"), "");
         assert_eq!(relative_resolved_path(root, resolved), "src/a.ts");
         assert!(normalized_path_is_within(resolved, Path::new(r"\\?\D:\a\wae\wae")));
     }
