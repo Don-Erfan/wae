@@ -46,6 +46,16 @@ their underlying `import`/`require` condition, including nested conditional-expo
 `node` or `browser` is selected by `resolution.mode`; additional explicit conditions belong in
 `custom_conditions`.
 
+Package format and workspace identity use separate indexes. `PackageScopeIndex` records every
+`package.json` under the project—including private manifests without `name` and nested manifests
+that are not workspaces—and chooses the nearest ancestor for `type`. `WorkspacePackageIndex`
+contains only named, declared workspace packages and owns package-name/exports/imports resolution.
+Consequently, `name` never affects ESM/CommonJS classification.
+
+Bundler mode activates `import` or `require`, `types` for type-only edges, `default`, and configured
+custom conditions. It does **not** activate `browser` implicitly; add `browser` to
+`resolution.custom_conditions` only when that matches the project's bundler profile.
+
 Node16/NodeNext ESM relative imports require an explicit runtime extension (for example,
 `./user.js`, which may map to `user.ts`). CommonJS and Bundler resolution retain extension and
 directory-index probing.
@@ -59,6 +69,9 @@ plugins are not yet interpreted by the resolver.
 Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are excluded from default source discovery. They
 can still be resolved as type targets, and projects that intentionally analyze declarations may
 override `project.exclude`.
+
+Type-only dependency classification covers `import type`, `export type`, and named clauses whose
+specifiers are all marked `type`. Mixed clauses remain runtime `Static`/`ReExport` edges.
 
 Absolute module specifiers are rejected because they escape the project analysis boundary.
 Duplicate workspace package names are configuration errors.
@@ -83,6 +96,13 @@ and unused directives produce `SUPPRESS-001` warnings when the corresponding opt
 `wae baseline create` records only unsuppressed error/warning diagnostics. Informational and
 suppressed diagnostics remain visible in reports but are excluded from the ratchet file; the
 command prints the recorded and excluded counts.
+
+## Cache concurrency
+
+The cache repository uses an operating-system advisory lock held across read, merge, atomic write,
+and rename. The `.lock` path is a persistent coordination inode, not an ownership marker: its mere
+existence is harmless, and the OS releases ownership automatically when a process crashes or is
+killed. Cache payloads are also invalidated by parser behavior version.
 
 ## Changed mode
 

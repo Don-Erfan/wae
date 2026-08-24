@@ -17,7 +17,11 @@ git tag -s vX.Y.Z -m "WAE vX.Y.Z"
 git push origin master vX.Y.Z
 ```
 
-GitHub Actions builds every supported native target, publishes checksums with the binaries, creates the GitHub Release, and publishes to npm through OIDC. No long-lived `NPM_TOKEN` or interactive OTP belongs in CI.
+GitHub Actions builds every supported native target, verifies and publishes an aggregate
+`SHA256SUMS` manifest, signs that manifest through keyless Sigstore, generates an SPDX JSON SBOM,
+and records GitHub SLSA build-provenance attestations for every binary. The curated section for the
+version in `CHANGELOG.md` is prepended to GitHub's generated pull-request notes. npm publication
+uses OIDC; no long-lived `NPM_TOKEN` or interactive OTP belongs in CI.
 
 ## Recovery
 

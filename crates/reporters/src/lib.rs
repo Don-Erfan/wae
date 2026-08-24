@@ -1,7 +1,7 @@
 use serde_json::json;
 pub use wae_config::OutputFormat as Format;
 use wae_core::domain::{Diagnostic, ModuleKind, Severity};
-use wae_engine::Analysis;
+use wae_engine::{Analysis, FailurePolicy};
 
 pub fn render(analysis: &Analysis, format: Format) -> Result<String, serde_json::Error> {
     match format {
@@ -61,7 +61,7 @@ fn human(analysis: &Analysis) -> String {
         }
         output.push('\n');
     }
-    if analysis.diagnostics.is_empty() {
+    if FailurePolicy::count(&analysis.diagnostics) == 0 {
         output.push_str("\n✓ Passed\n");
     }
     output.trim_end().to_string()
@@ -76,6 +76,7 @@ fn json_report(analysis: &Analysis) -> Result<String, serde_json::Error> {
         "excludedModules": counts.excluded_modules,
         "externalPackages": counts.external_packages,
         "dependencies": counts.dependencies,
+        "failureCount": FailurePolicy::count(&analysis.diagnostics),
         "diagnostics": analysis.diagnostics
     }))
 }
@@ -90,6 +91,7 @@ fn jsonl(analysis: &Analysis) -> Result<String, serde_json::Error> {
         "excludedModules": counts.excluded_modules,
         "externalPackages": counts.external_packages,
         "dependencies": counts.dependencies,
+        "failureCount": FailurePolicy::count(&analysis.diagnostics),
     }))?];
     for diagnostic in &analysis.diagnostics {
         events.push(serde_json::to_string(&json!({
@@ -110,7 +112,18 @@ fn sarif(analysis: &Analysis) -> Result<String, serde_json::Error> {
         .collect::<Vec<_>>();
     rule_ids.sort_unstable();
     rule_ids.dedup();
-    let rules = rule_ids.into_iter().map(sarif_rule).collect::<Vec<_>>();
+    let rules = rule_ids
+        .into_iter()
+        .map(|rule_id| {
+            let severity = analysis
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.rule_id.0 == rule_id)
+                .map(|diagnostic| &diagnostic.severity)
+                .unwrap_or(&Severity::Error);
+            sarif_rule(rule_id, severity)
+        })
+        .collect::<Vec<_>>();
     serde_json::to_string_pretty(&json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
         "runs": [{
@@ -158,7 +171,7 @@ fn counts(analysis: &Analysis) -> Counts {
     }
 }
 
-fn sarif_rule(rule_id: &str) -> serde_json::Value {
+fn sarif_rule(rule_id: &str, severity: &Severity) -> serde_json::Value {
     let descriptor = wae_core::rule_registry::descriptor(rule_id);
     let title = descriptor.map_or("WAE diagnostic", |rule| rule.title);
     let description =
@@ -170,17 +183,13 @@ fn sarif_rule(rule_id: &str) -> serde_json::Value {
         "shortDescription": { "text": title },
         "fullDescription": { "text": description },
         "helpUri": format!("https://github.com/Don-Erfan/wae/blob/master/docs/RULES.md#{}", rule_id.to_ascii_lowercase()),
-        "defaultConfiguration": { "level": "error" },
+        "defaultConfiguration": { "level": sarif_level(severity) },
         "properties": { "tags": ["architecture", category] }
     })
 }
 
 fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {
-    let level = match diagnostic.severity {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Info => "note",
-    };
+    let level = sarif_level(&diagnostic.severity);
     let locations = diagnostic.primary_location.as_ref().map(|location| vec![json!({ "physicalLocation": { "artifactLocation": { "uri": location.file }, "region": { "startLine": location.line.max(1), "startColumn": location.column.max(1) } } })]).unwrap_or_default();
     let suppressions = if diagnostic.suppressed {
         vec![json!({
@@ -191,6 +200,14 @@ fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {
         Vec::new()
     };
     json!({ "ruleId": diagnostic.rule_id.0, "level": level, "message": { "text": diagnostic.message }, "partialFingerprints": { "waeViolationId": diagnostic.fingerprint }, "locations": locations, "suppressions": suppressions })
+}
+
+fn sarif_level(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "note",
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +255,7 @@ mod tests {
     #[test]
     fn sarif_contains_rule_descriptors_and_fingerprints() {
         let mut diagnostic = Diagnostic::new("ARCH-003", "Layer violation");
+        diagnostic.severity = Severity::Warning;
         diagnostic.refresh_fingerprint();
         let analysis = Analysis {
             schema_version: 1,
@@ -248,8 +266,30 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&sarif(&analysis).unwrap()).unwrap();
         assert_eq!(value["runs"][0]["invocations"][0]["executionSuccessful"], true);
         assert_eq!(value["runs"][0]["tool"]["driver"]["rules"][0]["id"], "ARCH-003");
+        assert_eq!(
+            value["runs"][0]["tool"]["driver"]["rules"][0]["defaultConfiguration"]["level"],
+            "warning"
+        );
         assert!(
             value["runs"][0]["results"][0]["partialFingerprints"]["waeViolationId"].is_string()
         );
+    }
+
+    #[test]
+    fn json_exposes_the_shared_fail_level_count() {
+        let mut info = Diagnostic::new("ARCH-003", "informational");
+        info.severity = Severity::Info;
+        let mut suppressed = Diagnostic::new("ARCH-004", "suppressed");
+        suppressed.suppressed = true;
+        let analysis = Analysis {
+            schema_version: 1,
+            project: Default::default(),
+            graph: Default::default(),
+            diagnostics: vec![Diagnostic::new("ARCH-001", "failure"), info, suppressed],
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&json_report(&analysis).unwrap()).unwrap();
+        assert_eq!(value["failureCount"], 1);
+        assert_eq!(value["diagnostics"].as_array().unwrap().len(), 3);
     }
 }

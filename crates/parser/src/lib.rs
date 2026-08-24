@@ -3,9 +3,12 @@ use wae_core::domain::{
     Import, ImportKind, ModuleId, ModulePath, ParseError, ParseErrorKind, SourceLocation,
 };
 
+mod dependency_classifier;
+use dependency_classifier::{classify_export, classify_import};
+
 /// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
 /// persist this value so parser upgrades can never reuse stale import IR.
-pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v2");
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v3");
 
 pub trait ParserAdapter: Send + Sync {
     fn parse_imports(
@@ -100,19 +103,20 @@ fn collect_dependencies(
     match node.kind() {
         "import_statement" => {
             if let Some(specifier) = node.child_by_field_name("source") {
-                let prefix = &source[node.start_byte()..specifier.start_byte()];
-                let kind = if prefix.split_whitespace().take(2).eq(["import", "type"]) {
-                    ImportKind::TypeOnly
-                } else {
-                    ImportKind::Static
-                };
+                let kind = classify_import(node, source);
                 push_string_import(output, module_path, source, specifier, kind);
             }
             return;
         }
         "export_statement" => {
             if let Some(specifier) = node.child_by_field_name("source") {
-                push_string_import(output, module_path, source, specifier, ImportKind::ReExport);
+                push_string_import(
+                    output,
+                    module_path,
+                    source,
+                    specifier,
+                    classify_export(node, source),
+                );
             }
             return;
         }
@@ -223,6 +227,29 @@ const legacy = require('./legacy');
         );
         assert_eq!(imports[1].kind, ImportKind::TypeOnly);
         assert_eq!(imports[2].kind, ImportKind::ReExport);
+    }
+
+    #[test]
+    fn classifies_type_only_import_and_export_forms_without_erasing_mixed_runtime_edges() {
+        let source = r#"
+export type { User } from "./export-type";
+export { type Account } from "./export-inline-type";
+export { type Role, runtimeValue } from "./export-mixed";
+import { type Session } from "./import-inline-type";
+import { type Token, runtimeClient } from "./import-mixed";
+import defaultValue, { type Options } from "./import-default-mixed";
+"#;
+        let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
+        let kinds = imports
+            .iter()
+            .map(|import| (import.specifier.as_str(), import.kind.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(kinds["./export-type"], ImportKind::TypeOnly);
+        assert_eq!(kinds["./export-inline-type"], ImportKind::TypeOnly);
+        assert_eq!(kinds["./export-mixed"], ImportKind::ReExport);
+        assert_eq!(kinds["./import-inline-type"], ImportKind::TypeOnly);
+        assert_eq!(kinds["./import-mixed"], ImportKind::Static);
+        assert_eq!(kinds["./import-default-mixed"], ImportKind::Static);
     }
 
     #[test]

@@ -69,6 +69,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -118,6 +128,12 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "libc"
+version = "0.2.189"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libyaml-rs"
@@ -303,7 +319,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "wae-cli"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -315,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "wae-config"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "globset",
  "serde",
@@ -325,15 +341,16 @@ dependencies = [
 
 [[package]]
 name = "wae-core"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "wae-engine"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
+ "fs2",
  "globset",
  "ignore",
  "serde",
@@ -348,14 +365,14 @@ dependencies = [
 
 [[package]]
 name = "wae-graph"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "wae-core",
 ]
 
 [[package]]
 name = "wae-parser"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "serde_json",
  "tree-sitter",
@@ -365,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "wae-reporters"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "serde_json",
  "wae-config",
@@ -375,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "wae-resolver"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "globset",
  "ignore",
@@ -388,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "wae-rules"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "globset",
  "wae-config",
@@ -407,6 +424,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -414,6 +447,12 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys",
 ]
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-link"

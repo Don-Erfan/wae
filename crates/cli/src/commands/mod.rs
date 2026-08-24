@@ -6,9 +6,10 @@ use std::process::Command;
 
 use serde_json::json;
 use wae_config::{CONFIG_FILE, Config};
-use wae_core::domain::{Diagnostic, ModuleKind, Severity};
+use wae_core::domain::{Diagnostic, ModuleKind};
 use wae_engine::{
-    Analysis, AnalysisError, AnalyzeRequest, ChangeSet, Engine, ImpactAnalyzer, VcsPort,
+    Analysis, AnalysisError, AnalyzeRequest, ChangeSet, Engine, FailurePolicy, ImpactAnalyzer,
+    VcsPort,
 };
 use wae_reporters::{Format, render};
 
@@ -96,10 +97,7 @@ pub fn check(
             Err(error) => return CliOutput::project_error(error),
         },
     };
-    let has_failures = analysis
-        .diagnostics
-        .iter()
-        .any(|d| !d.suppressed && matches!(d.severity, Severity::Error | Severity::Warning));
+    let has_failures = FailurePolicy::count(&analysis.diagnostics) > 0;
     match render(&analysis, format) {
         Ok(output) if has_failures => CliOutput::violations(output),
         Ok(output) => CliOutput::success(output),

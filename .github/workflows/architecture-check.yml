@@ -10,6 +10,7 @@ concurrency:
 
 jobs:
   architecture-check:
+    name: Architecture Check
     runs-on: ubuntu-latest
     env:
       RUSTUP_TOOLCHAIN: stable
@@ -47,12 +48,14 @@ jobs:
           result = json.loads(result_path.read_text()) if result_path.exists() and result_path.stat().st_size else {"modules": 0, "diagnostics": []}
           baseline = json.loads(Path(".wae/baseline.json").read_text())
           diagnostics = result.get("diagnostics", [])
+          failure_count = result.get("failureCount", 0)
           lines = [
               "### WAE Architecture Check", "",
               f"Modules analyzed: {result.get('modules', 0)}",
               f"Baseline violations: {len(baseline.get('entries', baseline.get('fingerprints', [])))}",
-              f"New affected violations: {len(diagnostics)}", "",
-              "✅ No architecture regression." if not diagnostics else "❌ Architecture regression detected.",
+              f"Diagnostics reported: {len(diagnostics)}",
+              f"New affected fail-level violations: {failure_count}", "",
+              "✅ No architecture regression." if failure_count == 0 else "❌ Architecture regression detected.",
           ]
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
               stream.write("\n".join(lines) + "\n")

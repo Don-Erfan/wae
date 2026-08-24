@@ -1,0 +1,24 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+  categories:
+    - title: Breaking changes
+      labels:
+        - breaking-change
+    - title: Architecture engine
+      labels:
+        - engine
+        - resolver
+        - parser
+        - rules
+    - title: Security and supply chain
+      labels:
+        - security
+        - dependencies
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"

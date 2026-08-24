@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::{Diagnostic, Severity};
+use wae_engine::FailurePolicy;
 
 const BASELINE_SCHEMA_VERSION: u32 = 2;
 
@@ -63,10 +64,7 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
         .count();
     let mut sorted = diagnostics
         .iter()
-        .filter(|diagnostic| {
-            !diagnostic.suppressed
-                && matches!(diagnostic.severity, Severity::Error | Severity::Warning)
-        })
+        .filter(|diagnostic| FailurePolicy::is_failure(diagnostic))
         .collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
     sorted.dedup_by(|left, right| left.fingerprint == right.fingerprint);

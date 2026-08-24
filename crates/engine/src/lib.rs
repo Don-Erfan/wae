@@ -2,26 +2,31 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
-use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::{
-    Dependency, DependencyTarget, Diagnostic, FeatureId, FrameworkMetadata, LayerId, Module,
-    ModuleId, ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime,
-    Severity, SourceLocation,
+    Dependency, DependencyTarget, Diagnostic, FrameworkMetadata, LayerId, Module, ModuleId,
+    ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime, Severity,
+    SourceLocation,
 };
 use wae_graph::ModuleGraph;
-use wae_parser::{JsTsParser, PARSER_CACHE_VERSION, ParserAdapter};
+use wae_parser::{JsTsParser, ParserAdapter};
 use wae_resolver::{
-    ModuleFormat, ModuleResolver, Resolution, ResolutionKind, ResolutionRequest, ResolverPipeline,
-    TsConfigIndex, WorkspacePackage, WorkspaceResolver,
+    ModuleFormat, ModuleResolver, PackageScopeIndex, Resolution, ResolutionKind, ResolutionRequest,
+    ResolverPipeline, TsConfigIndex, WorkspacePackage, WorkspacePackageIndex,
 };
 use wae_rules::{CompiledRulePolicies, RuleContext, RuleSet};
 
+mod architecture_index;
+mod cache;
+mod diagnostic_arbitrator;
+mod discovery;
 mod resolution_context;
 mod suppression;
-use resolution_context::module_format;
+use architecture_index::CompiledArchitectureModel;
+use cache::{AnalysisCache, stable_hash};
+use diagnostic_arbitrator::DiagnosticArbitrator;
+use discovery::discover_modules;
+use resolution_context::ModuleFormatResolver;
 
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
@@ -41,6 +46,19 @@ pub struct Analysis {
     pub project: Project,
     pub graph: ModuleGraph,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Single failure policy shared by exit codes and machine-readable reporting.
+pub struct FailurePolicy;
+
+impl FailurePolicy {
+    pub fn is_failure(diagnostic: &Diagnostic) -> bool {
+        !diagnostic.suppressed && matches!(diagnostic.severity, Severity::Error | Severity::Warning)
+    }
+
+    pub fn count(diagnostics: &[Diagnostic]) -> usize {
+        diagnostics.iter().filter(|diagnostic| Self::is_failure(diagnostic)).count()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -147,9 +165,10 @@ impl<P: ParserAdapter> Engine<P> {
         let files = discover_modules(&root, &config)?;
         let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_resolver =
-            WorkspaceResolver::discover(&root).map_err(AnalysisError::Project)?;
+            WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
+        let package_scopes = PackageScopeIndex::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_packages = workspace_resolver.packages().to_vec();
-        let package_contexts = workspace_resolver.clone();
+        let module_formats = ModuleFormatResolver::new(&package_scopes);
         let resolver = ResolverPipeline::indexed_node_with_workspaces(
             tsconfigs,
             workspace_resolver,
@@ -231,7 +250,7 @@ impl<P: ParserAdapter> Engine<P> {
                         import.module_id = module_id.clone();
                         import.location.file = module_id.0.clone();
                         let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
-                        let importer_format = module_format(&module_path, &package_contexts);
+                        let importer_format = module_formats.resolve(&module_path);
                         let resolution_kind = match candidate.kind {
                             wae_core::domain::DependencyKind::Dynamic => ResolutionKind::Import,
                             wae_core::domain::DependencyKind::Require => ResolutionKind::Require,
@@ -434,277 +453,13 @@ impl<P: ParserAdapter> Engine<P> {
         };
         let mut diagnostics = project.diagnostics.clone();
         diagnostics.extend(self.rules.evaluate(&context).map_err(AnalysisError::Internal)?);
+        diagnostics = DiagnosticArbitrator::arbitrate(diagnostics);
         suppression::apply(&mut diagnostics, &mut suppressions, config.suppressions.report_unused);
         diagnostics.sort_by(|a, b| diagnostic_key(a).cmp(&diagnostic_key(b)));
         Ok(Analysis { schema_version: OUTPUT_SCHEMA_VERSION, project, graph, diagnostics })
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CachedImports {
-    hash: u64,
-    imports: Vec<wae_core::domain::Import>,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct CacheFile {
-    schema_version: u32,
-    #[serde(default)]
-    parser_version: String,
-    files: std::collections::BTreeMap<String, CachedImports>,
-}
-
-struct AnalysisCache {
-    enabled: bool,
-    path: PathBuf,
-    file: CacheFile,
-}
-
-impl AnalysisCache {
-    fn load(root: &Path, config: &Config) -> Result<Self, AnalysisError> {
-        let path = root.join(&config.cache.directory).join("imports-v1.json");
-        let file = if config.cache.enabled && path.exists() {
-            fs::read_to_string(&path)
-                .ok()
-                .and_then(|source| serde_json::from_str::<CacheFile>(&source).ok())
-                .filter(|cache| {
-                    cache.schema_version == 1 && cache.parser_version == PARSER_CACHE_VERSION
-                })
-                .unwrap_or_else(|| CacheFile {
-                    schema_version: 1,
-                    parser_version: PARSER_CACHE_VERSION.into(),
-                    ..CacheFile::default()
-                })
-        } else {
-            CacheFile {
-                schema_version: 1,
-                parser_version: PARSER_CACHE_VERSION.into(),
-                ..CacheFile::default()
-            }
-        };
-        Ok(Self { enabled: config.cache.enabled, path, file })
-    }
-
-    fn get(&self, module: &str, hash: u64) -> Option<Vec<wae_core::domain::Import>> {
-        self.enabled
-            .then(|| self.file.files.get(module))
-            .flatten()
-            .filter(|cached| cached.hash == hash)
-            .map(|cached| cached.imports.clone())
-    }
-
-    fn insert(&mut self, module: String, hash: u64, imports: Vec<wae_core::domain::Import>) {
-        if self.enabled {
-            self.file.files.insert(module, CachedImports { hash, imports });
-        }
-    }
-
-    fn save(&self) -> Result<(), AnalysisError> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| AnalysisError::Project("cache path has no parent directory".into()))?;
-        fs::create_dir_all(parent).map_err(|error| {
-            AnalysisError::Project(format!("cannot create cache directory: {error}"))
-        })?;
-        let _lock = CacheWriteLock::acquire(&self.path)?;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
-        let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.path.with_extension(format!("tmp-{}-{write_id}", std::process::id()));
-        let contents = serde_json::to_vec(&self.file)
-            .map_err(|error| AnalysisError::Internal(error.to_string()))?;
-        fs::write(&temporary, contents)
-            .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            if self.path.exists() {
-                fs::remove_file(&self.path).map_err(|remove_error| {
-                    AnalysisError::Project(format!("cannot replace cache: {remove_error}"))
-                })?;
-                fs::rename(&temporary, &self.path).map_err(|rename_error| {
-                    AnalysisError::Project(format!("cannot install cache: {rename_error}"))
-                })?;
-            } else {
-                return Err(AnalysisError::Project(format!("cannot install cache: {error}")));
-            }
-        }
-        Ok(())
-    }
-}
-
-struct CacheWriteLock {
-    path: PathBuf,
-}
-
-impl CacheWriteLock {
-    fn acquire(cache_path: &Path) -> Result<Self, AnalysisError> {
-        let path = cache_path.with_extension("lock");
-        for _ in 0..500 {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => {
-                    return Err(AnalysisError::Project(format!(
-                        "cannot acquire cache write lock: {error}"
-                    )));
-                }
-            }
-        }
-        Err(AnalysisError::Project(format!(
-            "timed out waiting for cache write lock `{}`",
-            path.display()
-        )))
-    }
-}
-
-impl Drop for CacheWriteLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-fn discover_modules(root: &Path, config: &Config) -> Result<Vec<PathBuf>, AnalysisError> {
-    let include = build_globs(&config.project.include)?;
-    let exclude = build_globs(&config.project.exclude)?;
-    let mut files = Vec::new();
-    for configured_root in &config.project.roots {
-        let scan_root = root.join(configured_root).canonicalize().map_err(|error| {
-            AnalysisError::Project(format!(
-                "cannot open configured project root `{configured_root}`: {error}"
-            ))
-        })?;
-        if !scan_root.starts_with(root) {
-            return Err(AnalysisError::Project(format!(
-                "configured project root `{configured_root}` escapes the project"
-            )));
-        }
-        let mut builder = WalkBuilder::new(&scan_root);
-        builder
-            .follow_links(config.project.follow_symlinks)
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true);
-        for entry in builder.build() {
-            let entry = entry.map_err(|e| AnalysisError::Project(e.to_string()))?;
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                continue;
-            }
-            let relative = relative_path(root, entry.path());
-            if !include.is_match(&relative) || exclude.is_match(&relative) {
-                continue;
-            }
-            let length = entry.metadata().map_err(|e| AnalysisError::Project(e.to_string()))?.len();
-            if length > config.project.max_file_size_kb.saturating_mul(1024) {
-                continue;
-            }
-            files.push(entry.into_path());
-        }
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn build_globs(patterns: &[String]) -> Result<GlobSet, AnalysisError> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(GlobBuilder::new(pattern).literal_separator(true).build().map_err(|e| {
-            AnalysisError::Config(wae_core::domain::ConfigError {
-                kind: wae_core::domain::ConfigErrorKind::InvalidPattern,
-                message: e.to_string(),
-                path: Some(pattern.clone()),
-            })
-        })?);
-    }
-    builder.build().map_err(|e| AnalysisError::Internal(e.to_string()))
-}
-
-struct CompiledArchitectureModel {
-    layers: Vec<(String, GlobSet)>,
-    feature_roots: Vec<String>,
-}
-
-impl CompiledArchitectureModel {
-    fn compile(config: &Config) -> Result<Self, AnalysisError> {
-        let layers = config
-            .architecture
-            .layers
-            .iter()
-            .map(|(name, layer)| Ok((name.clone(), build_globs(&layer.patterns)?)))
-            .collect::<Result<Vec<_>, AnalysisError>>()?;
-        Ok(Self {
-            layers,
-            feature_roots: config
-                .architecture
-                .features
-                .effective_roots()
-                .into_iter()
-                .map(|root| root.replace('\\', "/").trim_matches('/').to_string())
-                .collect(),
-        })
-    }
-
-    fn layer(&self, path: &str) -> Result<Option<String>, AnalysisError> {
-        let matches = self
-            .layers
-            .iter()
-            .filter(|(_, matcher)| matcher.is_match(path))
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        if matches.len() > 1 {
-            return Err(AnalysisError::Config(wae_core::domain::ConfigError {
-                kind: wae_core::domain::ConfigErrorKind::ConflictingConfig,
-                message: format!(
-                    "module `{path}` matches multiple architecture layers: {}",
-                    matches.join(", ")
-                ),
-                path: Some("architecture.layers".into()),
-            }));
-        }
-        Ok(matches.into_iter().next())
-    }
-
-    fn feature(
-        &self,
-        path: &str,
-        package: &Package,
-        package_root: &str,
-    ) -> Option<(FeatureId, String)> {
-        let path = path.replace('\\', "/");
-        self.feature_roots.iter().find_map(|configured_root| {
-            let feature_root = if package_root.is_empty() {
-                configured_root.clone()
-            } else {
-                format!("{}/{configured_root}", package_root.trim_matches('/'))
-            };
-            let prefix = format!("{feature_root}/");
-            path.strip_prefix(&prefix)
-                .and_then(|relative| relative.split('/').next())
-                .filter(|feature| !feature.is_empty())
-                .map(|feature| {
-                    (
-                        FeatureId { package: package.name.clone(), name: feature.to_owned() },
-                        feature_root,
-                    )
-                })
-        })
-    }
-}
 fn project_name(root: &Path) -> String {
     root.file_name().and_then(|v| v.to_str()).unwrap_or("project").to_string()
 }
@@ -793,6 +548,7 @@ fn unresolved_diagnostic(import: &wae_core::domain::Import) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wae_parser::PARSER_CACHE_VERSION;
 
     #[test]
     fn source_suppressions_require_reasons_and_report_unused_directives() {
@@ -885,6 +641,63 @@ mod tests {
         assert!(
             !analysis.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001")
         );
+        let esm_type_edges = analysis
+            .project
+            .resolved_dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency.from.0.ends_with("apps/esm/src/index.mts")
+                    && dependency.specifier == "@fixture/domain"
+                    && dependency.kind == wae_core::domain::DependencyKind::TypeOnly
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(esm_type_edges.len(), 2);
+        assert!(esm_type_edges.iter().all(|dependency| matches!(
+            &dependency.target,
+            DependencyTarget::WorkspacePackage { module, .. }
+                if module.0.ends_with("packages/domain/src/import.d.ts")
+        )));
+    }
+
+    #[test]
+    fn unnamed_root_and_nested_package_scopes_control_static_resolution_format() {
+        let root = std::env::temp_dir().join(format!("wae-engine-scopes-{}", std::process::id()));
+        let package = root.join("packages/lib");
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"private":true,"type":"module","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/nested/package.json"), r#"{"type":"commonjs"}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"pkg","exports":{".":{"import":"./src/import.js","require":"./src/require.cjs"}}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/root.ts"), "import value from 'pkg';").unwrap();
+        fs::write(root.join("src/nested/app.ts"), "import value from 'pkg';").unwrap();
+        fs::write(package.join("src/import.ts"), "export default 'esm';").unwrap();
+        fs::write(package.join("src/require.cts"), "export default 'cjs';").unwrap();
+        fs::write(root.join("wae.yaml"), "version: 1\narchitecture:\n  layers: {}\n").unwrap();
+
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let target_for = |importer: &str| {
+            analysis
+                .project
+                .resolved_dependencies
+                .iter()
+                .find(|dependency| dependency.from.0 == importer)
+                .and_then(|dependency| match &dependency.target {
+                    DependencyTarget::WorkspacePackage { module, .. } => Some(module.0.as_str()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(target_for("src/root.ts"), "packages/lib/src/import.ts");
+        assert_eq!(target_for("src/nested/app.ts"), "packages/lib/src/require.cts");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1033,6 +846,9 @@ mod tests {
         Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
         let cache = root.join(".wae/cache/imports-v1.json");
         assert!(cache.is_file());
+        let lock = root.join(".wae/cache/imports-v1.lock");
+        assert!(lock.is_file());
+        fs::write(&lock, "stale lock file content from a killed process").unwrap();
         let mut stale: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
         stale["parser_version"] = serde_json::Value::String("stale-parser".into());
