@@ -159,7 +159,7 @@ fn sarif_rule(rule_id: &str) -> serde_json::Value {
         "name": title.replace(' ', ""),
         "shortDescription": { "text": title },
         "fullDescription": { "text": description },
-        "helpUri": format!("https://github.com/Don-Erfan/wae/blob/master/docs/PRODUCT.md#{rule_id}"),
+        "helpUri": format!("https://github.com/Don-Erfan/wae/blob/master/docs/RULES.md#{}", rule_id.to_ascii_lowercase()),
         "defaultConfiguration": { "level": "error" },
         "properties": { "tags": ["architecture", category] }
     })

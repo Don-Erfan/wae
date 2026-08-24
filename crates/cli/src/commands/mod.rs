@@ -147,7 +147,7 @@ pub fn explain(rule: &str) -> CliOutput {
     let explanation = match rule {
         "ARCH-001" => "Circular dependency: detects strongly connected module components.",
         "ARCH-002" => {
-            "Forbidden dependency: enforces configured and package-to-application boundaries."
+            "Forbidden dependency: enforces configured policies and optional architecture presets."
         }
         "ARCH-003" => {
             "Layer boundary: enforces canImport while allowing imports within the same layer."
@@ -183,36 +183,20 @@ fn affected_modules(
     explicit_base: Option<&str>,
 ) -> Result<HashSet<String>, String> {
     let base = select_base(root, explicit_base)?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["diff", "--name-status", "-M", &format!("{base}...HEAD")])
-        .output()
-        .map_err(|e| format!("cannot run git diff: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git diff failed for base `{base}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
     let mut changed = HashSet::new();
     let mut deleted = HashSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let status = fields.first().copied().unwrap_or_default();
-        if status.starts_with('R') || status.starts_with('C') {
-            if let Some(old) = fields.get(1) {
-                changed.insert(old.replace('\\', "/"));
-            }
-            if let Some(new) = fields.get(2) {
-                changed.insert(new.replace('\\', "/"));
-            }
-        } else if let Some(path) = fields.get(1) {
-            let normalized = path.replace('\\', "/");
-            if status.starts_with('D') {
-                deleted.insert(normalized.clone());
-            }
-            changed.insert(normalized);
+    let committed_range = format!("{base}...HEAD");
+    for args in [
+        vec!["diff", "--name-status", "-M", committed_range.as_str()],
+        vec!["diff", "--name-status", "-M"],
+        vec!["diff", "--cached", "--name-status", "-M"],
+    ] {
+        let output = git_output(root, &args)?;
+        collect_name_status(&output, &mut changed, &mut deleted);
+    }
+    for path in git_output(root, &["ls-files", "--others", "--exclude-standard"])?.lines() {
+        if !path.trim().is_empty() {
+            changed.insert(path.replace('\\', "/"));
         }
     }
     for diagnostic in &analysis.diagnostics {
@@ -236,6 +220,27 @@ fn affected_modules(
         }
     }
     Ok(affected)
+}
+
+fn collect_name_status(output: &str, changed: &mut HashSet<String>, deleted: &mut HashSet<String>) {
+    for line in output.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let status = fields.first().copied().unwrap_or_default();
+        if status.starts_with('R') || status.starts_with('C') {
+            if let Some(old) = fields.get(1) {
+                changed.insert(old.replace('\\', "/"));
+            }
+            if let Some(new) = fields.get(2) {
+                changed.insert(new.replace('\\', "/"));
+            }
+        } else if let Some(path) = fields.get(1) {
+            let normalized = path.replace('\\', "/");
+            if status.starts_with('D') {
+                deleted.insert(normalized.clone());
+            }
+            changed.insert(normalized);
+        }
+    }
 }
 
 fn select_base(root: &Path, explicit: Option<&str>) -> Result<String, String> {
@@ -314,4 +319,45 @@ fn normalize_relative(path: &Path) -> String {
 fn diagnostic_affects(diagnostic: &Diagnostic, affected: &HashSet<String>) -> bool {
     diagnostic.primary_location.as_ref().is_some_and(|l| affected.contains(&l.file))
         || diagnostic.dependency_path.iter().any(|m| affected.contains(&m.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wae_core::domain::Project;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git").arg("-C").arg(root).args(args).status().unwrap();
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    #[test]
+    fn changed_mode_includes_unstaged_staged_and_untracked_files() {
+        let root = std::env::temp_dir().join(format!("wae-changed-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-b", "master"]);
+        git(&root, &["config", "user.email", "wae@example.invalid"]);
+        git(&root, &["config", "user.name", "WAE Test"]);
+        std::fs::write(root.join("tracked.ts"), "export const value = 1;").unwrap();
+        git(&root, &["add", "tracked.ts"]);
+        git(&root, &["commit", "-m", "initial"]);
+
+        std::fs::write(root.join("tracked.ts"), "export const value = 2;").unwrap();
+        std::fs::write(root.join("staged.ts"), "export const staged = true;").unwrap();
+        git(&root, &["add", "staged.ts"]);
+        std::fs::write(root.join("untracked.ts"), "export const fresh = true;").unwrap();
+
+        let project = Project::default();
+        let analysis = Analysis {
+            schema_version: 1,
+            graph: Default::default(),
+            project,
+            diagnostics: Vec::new(),
+        };
+        let affected = affected_modules(&root, &analysis, Some("HEAD")).unwrap();
+        assert!(affected.contains("tracked.ts"));
+        assert!(affected.contains("staged.ts"));
+        assert!(affected.contains("untracked.ts"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

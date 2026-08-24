@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use globset::{GlobBuilder, GlobMatcher};
+use serde::Deserialize;
+use wae_config::ResolutionMode;
 use wae_core::domain::ModulePath;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,20 +37,30 @@ impl ResolverPipeline {
         self
     }
     pub fn node_defaults(root: impl Into<PathBuf>, aliases: Vec<PathAlias>) -> Self {
+        Self::node_defaults_with_mode(root, aliases, ResolutionMode::NodeNext)
+    }
+
+    pub fn node_defaults_with_mode(
+        root: impl Into<PathBuf>,
+        aliases: Vec<PathAlias>,
+        mode: ResolutionMode,
+    ) -> Self {
         Self::new()
-            .with_handler(RelativeResolver)
-            .with_handler(AliasResolver { root: root.into(), aliases })
+            .with_handler(RelativeResolver { mode })
+            .with_handler(AliasResolver { root: root.into(), aliases, mode })
             .with_handler(PackageResolver)
     }
 
     pub fn node_with_workspaces(
         root: impl Into<PathBuf>,
         aliases: Vec<PathAlias>,
-        workspaces: WorkspaceResolver,
+        mut workspaces: WorkspaceResolver,
+        mode: ResolutionMode,
     ) -> Self {
+        workspaces.mode = mode;
         Self::new()
-            .with_handler(RelativeResolver)
-            .with_handler(AliasResolver { root: root.into(), aliases })
+            .with_handler(RelativeResolver { mode })
+            .with_handler(AliasResolver { root: root.into(), aliases, mode })
             .with_handler(workspaces)
             .with_handler(PackageResolver)
     }
@@ -70,7 +83,9 @@ pub struct PathAlias {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RelativeResolver;
+pub struct RelativeResolver {
+    pub mode: ResolutionMode,
+}
 impl ResolutionHandler for RelativeResolver {
     fn try_resolve(&self, importer: &Path, specifier: &str) -> Option<Resolution> {
         if !specifier.starts_with('.') && !specifier.starts_with('/') {
@@ -81,7 +96,10 @@ impl ResolutionHandler for RelativeResolver {
         } else {
             importer.parent()?.join(specifier)
         };
-        Some(resolve_file(&base).map_or(Resolution::Unresolved, Resolution::Module))
+        Some(
+            resolve_file_with_mode(&base, self.mode)
+                .map_or(Resolution::Unresolved, Resolution::Module),
+        )
     }
 }
 
@@ -89,6 +107,7 @@ impl ResolutionHandler for RelativeResolver {
 pub struct AliasResolver {
     pub root: PathBuf,
     pub aliases: Vec<PathAlias>,
+    pub mode: ResolutionMode,
 }
 impl ResolutionHandler for AliasResolver {
     fn try_resolve(&self, _importer: &Path, specifier: &str) -> Option<Resolution> {
@@ -107,7 +126,7 @@ impl ResolutionHandler for AliasResolver {
             matched = true;
             for target in &alias.targets {
                 let candidate = self.root.join(target.replace('*', capture));
-                if let Some(path) = resolve_file(&candidate) {
+                if let Some(path) = resolve_file_with_mode(&candidate, self.mode) {
                     return Some(Resolution::Module(path));
                 }
             }
@@ -305,17 +324,27 @@ impl ResolutionHandler for PackageResolver {
 pub struct WorkspacePackage {
     pub name: String,
     pub root: PathBuf,
-    entrypoints: BTreeMap<String, String>,
-    imports: BTreeMap<String, String>,
+    has_exports: bool,
+    entrypoints: BTreeMap<String, serde_json::Value>,
+    imports: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceResolver {
     packages: Vec<WorkspacePackage>,
+    mode: ResolutionMode,
+}
+
+impl Default for WorkspaceResolver {
+    fn default() -> Self {
+        Self { packages: Vec::new(), mode: ResolutionMode::NodeNext }
+    }
 }
 
 impl WorkspaceResolver {
     pub fn discover(project_root: &Path) -> Result<Self, String> {
+        let patterns = workspace_patterns(project_root)?;
+        let (includes, excludes) = compile_workspace_patterns(&patterns)?;
         let mut packages = Vec::new();
         let mut builder = ignore::WalkBuilder::new(project_root);
         builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true);
@@ -324,6 +353,15 @@ impl WorkspaceResolver {
             if entry.file_name() != "package.json"
                 || entry.path().components().any(|part| part.as_os_str() == "node_modules")
             {
+                continue;
+            }
+            let package_root = entry.path().parent().unwrap_or(project_root);
+            let relative =
+                normalize(package_root.strip_prefix(project_root).unwrap_or(package_root));
+            let is_project_root = package_root == project_root;
+            let declared = includes.iter().any(|pattern| pattern.is_match(&relative))
+                && !excludes.iter().any(|pattern| pattern.is_match(&relative));
+            if !is_project_root && !declared {
                 continue;
             }
             let source = fs::read_to_string(entry.path())
@@ -338,13 +376,14 @@ impl WorkspaceResolver {
             packages.push(WorkspacePackage {
                 name: name.into(),
                 root,
+                has_exports: manifest.get("exports").is_some(),
                 entrypoints: manifest_entrypoints(&manifest),
                 imports: manifest_imports(&manifest),
             });
         }
         packages.sort_by(|left, right| left.name.cmp(&right.name));
         packages.dedup_by(|left, right| left.name == right.name);
-        Ok(Self { packages })
+        Ok(Self { packages, mode: ResolutionMode::NodeNext })
     }
 
     pub fn packages(&self) -> &[WorkspacePackage] {
@@ -363,53 +402,67 @@ impl ResolutionHandler for WorkspaceResolver {
                 .iter()
                 .filter(|package| importer.starts_with(&package.root))
                 .max_by_key(|package| package.root.components().count())?;
-            let target = resolve_export(&package.imports, specifier)?;
-            let candidate = package.root.join(target.trim_start_matches("./"));
-            return Some(
-                resolve_file(&candidate).map_or(Resolution::Unresolved, Resolution::Module),
-            );
+            let target = resolve_export(&package.imports, specifier, self.mode);
+            return Some(resolve_package_target(package, target, self.mode));
         }
         let name = package_name(specifier);
         let package = self.packages.iter().find(|package| package.name == name)?;
         let subpath = specifier.strip_prefix(&name).unwrap_or_default().trim_start_matches('/');
         let key = if subpath.is_empty() { ".".into() } else { format!("./{subpath}") };
-        let configured = resolve_export(&package.entrypoints, &key);
-        let candidate = configured
-            .map(|target| package.root.join(target.trim_start_matches("./")))
-            .unwrap_or_else(|| {
-                if subpath.is_empty() {
-                    package.root.join("src/index")
-                } else {
-                    package.root.join(subpath)
-                }
-            });
-        Some(resolve_file(&candidate).map_or(Resolution::Unresolved, Resolution::Module))
+        let configured = resolve_export(&package.entrypoints, &key, self.mode);
+        if package.has_exports {
+            return Some(resolve_package_target(package, configured, self.mode));
+        }
+        if configured.is_some() {
+            return Some(resolve_package_target(package, configured, self.mode));
+        }
+        let candidate = if subpath.is_empty() {
+            package.root.join("src/index")
+        } else {
+            package.root.join(subpath)
+        };
+        Some(
+            resolve_file_with_mode(&candidate, self.mode)
+                .map_or(Resolution::Unresolved, Resolution::Module),
+        )
     }
 }
 
-fn manifest_imports(manifest: &serde_json::Value) -> BTreeMap<String, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PackageTarget {
+    Path(String),
+    Blocked,
+}
+
+fn manifest_imports(manifest: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
     manifest
         .get("imports")
         .and_then(|value| value.as_object())
         .into_iter()
         .flatten()
-        .filter_map(|(key, value)| export_target(value).map(|target| (key.clone(), target.into())))
+        .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
 
-fn manifest_entrypoints(manifest: &serde_json::Value) -> BTreeMap<String, String> {
+fn manifest_entrypoints(manifest: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
     let mut entries = BTreeMap::new();
     match manifest.get("exports") {
-        Some(serde_json::Value::String(target)) => {
-            entries.insert(".".into(), target.clone());
+        Some(
+            value @ (serde_json::Value::String(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Null),
+        ) => {
+            entries.insert(".".into(), value.clone());
         }
         Some(serde_json::Value::Object(exports)) => {
-            for (key, value) in exports {
-                if key.starts_with('.') {
-                    if let Some(target) = export_target(value) {
-                        entries.insert(key.clone(), target.into());
+            if exports.keys().any(|key| key.starts_with('.')) {
+                for (key, value) in exports {
+                    if key.starts_with('.') {
+                        entries.insert(key.clone(), value.clone());
                     }
                 }
+            } else {
+                entries.insert(".".into(), serde_json::Value::Object(exports.clone()));
             }
         }
         _ => {}
@@ -417,7 +470,7 @@ fn manifest_entrypoints(manifest: &serde_json::Value) -> BTreeMap<String, String
     if !entries.contains_key(".") {
         for field in ["module", "main", "types"] {
             if let Some(target) = manifest.get(field).and_then(|value| value.as_str()) {
-                entries.insert(".".into(), target.into());
+                entries.insert(".".into(), serde_json::Value::String(target.into()));
                 break;
             }
         }
@@ -425,37 +478,121 @@ fn manifest_entrypoints(manifest: &serde_json::Value) -> BTreeMap<String, String
     entries
 }
 
-fn export_target(value: &serde_json::Value) -> Option<&str> {
+fn export_target(value: &serde_json::Value, mode: ResolutionMode) -> Option<PackageTarget> {
     match value {
-        serde_json::Value::String(value) => Some(value),
-        serde_json::Value::Object(conditions) => ["import", "default", "types", "require"]
-            .into_iter()
-            .find_map(|condition| conditions.get(condition).and_then(export_target)),
+        serde_json::Value::String(value) => Some(PackageTarget::Path(value.clone())),
+        serde_json::Value::Null => Some(PackageTarget::Blocked),
+        serde_json::Value::Array(targets) => {
+            let mut blocked = false;
+            for target in targets {
+                match export_target(target, mode) {
+                    Some(path @ PackageTarget::Path(_)) => return Some(path),
+                    Some(PackageTarget::Blocked) => blocked = true,
+                    None => {}
+                }
+            }
+            blocked.then_some(PackageTarget::Blocked)
+        }
+        serde_json::Value::Object(conditions) => {
+            let active = resolution_conditions(mode);
+            conditions.iter().find_map(|(condition, value)| {
+                (condition == "default" || active.contains(&condition.as_str()))
+                    .then(|| export_target(value, mode))
+                    .flatten()
+            })
+        }
         _ => None,
     }
 }
 
-fn resolve_export(entries: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    if let Some(target) = entries.get(key) {
-        return Some(target.clone());
+fn resolution_conditions(mode: ResolutionMode) -> [&'static str; 5] {
+    match mode {
+        ResolutionMode::Node | ResolutionMode::Node16 | ResolutionMode::NodeNext => {
+            ["types", "import", "node", "require", "default"]
+        }
+        ResolutionMode::Bundler => ["types", "import", "browser", "default", "require"],
     }
-    entries.iter().find_map(|(pattern, target)| {
-        let (prefix, suffix) = pattern.split_once('*')?;
-        (key.starts_with(prefix) && key.ends_with(suffix)).then(|| {
-            let capture = &key[prefix.len()..key.len() - suffix.len()];
-            target.replace('*', capture)
+}
+
+fn resolve_export(
+    entries: &BTreeMap<String, serde_json::Value>,
+    key: &str,
+    mode: ResolutionMode,
+) -> Option<PackageTarget> {
+    if let Some(target) = entries.get(key) {
+        return export_target(target, mode);
+    }
+    entries
+        .iter()
+        .filter_map(|(pattern, target)| {
+            let (prefix, suffix) = pattern.split_once('*')?;
+            if !key.starts_with(prefix) || !key.ends_with(suffix) {
+                return None;
+            }
+            Some((prefix.len() + suffix.len(), prefix.len(), prefix, suffix, target))
         })
-    })
+        .max_by_key(|(specificity, prefix_len, ..)| (*specificity, *prefix_len))
+        .and_then(|(_, _, prefix, suffix, target)| {
+            let capture = &key[prefix.len()..key.len() - suffix.len()];
+            export_target(target, mode).map(|target| match target {
+                PackageTarget::Path(path) => PackageTarget::Path(path.replace('*', capture)),
+                PackageTarget::Blocked => PackageTarget::Blocked,
+            })
+        })
+}
+
+fn resolve_package_target(
+    package: &WorkspacePackage,
+    target: Option<PackageTarget>,
+    mode: ResolutionMode,
+) -> Resolution {
+    let Some(PackageTarget::Path(target)) = target else { return Resolution::Unresolved };
+    if !target.starts_with("./") {
+        return Resolution::Unresolved;
+    }
+    let candidate = package.root.join(target.trim_start_matches("./"));
+    if !lexically_within(&candidate, &package.root) {
+        return Resolution::Unresolved;
+    }
+    resolve_file_with_mode(&candidate, mode).map_or(Resolution::Unresolved, Resolution::Module)
 }
 
 pub fn resolve_file(base: &Path) -> Option<ModulePath> {
+    resolve_file_with_mode(base, ResolutionMode::NodeNext)
+}
+
+pub fn resolve_file_with_mode(base: &Path, mode: ResolutionMode) -> Option<ModulePath> {
     const EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
     if base.is_file() {
         return Some(ModulePath(normalize(base)));
     }
-    if base.extension().is_none() {
+
+    let source_extensions: &[&str] = match (mode, base.extension().and_then(|value| value.to_str()))
+    {
+        (
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            Some("js"),
+        ) => &["ts", "tsx", "js", "jsx"],
+        (
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            Some("mjs"),
+        ) => &["mts", "mjs"],
+        (
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            Some("cjs"),
+        ) => &["cts", "cjs"],
+        _ => &[],
+    };
+    for extension in source_extensions {
+        let candidate = base.with_extension(extension);
+        if candidate.is_file() {
+            return Some(ModulePath(normalize(&candidate)));
+        }
+    }
+
+    if source_extensions.is_empty() {
         for extension in EXTENSIONS {
-            let candidate = base.with_extension(extension);
+            let candidate = PathBuf::from(format!("{}.{}", base.to_string_lossy(), extension));
             if candidate.is_file() {
                 return Some(ModulePath(normalize(&candidate)));
             }
@@ -470,6 +607,88 @@ pub fn resolve_file(base: &Path) -> Option<ModulePath> {
         }
     }
     None
+}
+
+fn lexically_within(path: &Path, directory: &Path) -> bool {
+    let path = lexical_path(path);
+    let directory = lexical_path(directory);
+    path.starts_with(directory)
+}
+
+fn lexical_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+#[derive(Deserialize)]
+struct PnpmWorkspace {
+    #[serde(default)]
+    packages: Vec<String>,
+}
+
+fn workspace_patterns(project_root: &Path) -> Result<Vec<String>, String> {
+    let mut patterns = Vec::new();
+    let manifest_path = project_root.join("package.json");
+    if manifest_path.exists() {
+        let source = fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("cannot read `{}`: {error}", manifest_path.display()))?;
+        let manifest: serde_json::Value = serde_json::from_str(&source).map_err(|error| {
+            format!("invalid package manifest `{}`: {error}", manifest_path.display())
+        })?;
+        match manifest.get("workspaces") {
+            Some(serde_json::Value::Array(values)) => {
+                patterns.extend(values.iter().filter_map(|value| value.as_str().map(str::to_owned)))
+            }
+            Some(serde_json::Value::Object(value)) => {
+                if let Some(values) = value.get("packages").and_then(|value| value.as_array()) {
+                    patterns.extend(
+                        values.iter().filter_map(|value| value.as_str().map(str::to_owned)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let pnpm_path = project_root.join("pnpm-workspace.yaml");
+    if pnpm_path.exists() {
+        let source = fs::read_to_string(&pnpm_path)
+            .map_err(|error| format!("cannot read `{}`: {error}", pnpm_path.display()))?;
+        let workspace: PnpmWorkspace = yaml_serde::from_str(&source).map_err(|error| {
+            format!("invalid pnpm workspace `{}`: {error}", pnpm_path.display())
+        })?;
+        patterns.extend(workspace.packages);
+    }
+    Ok(patterns)
+}
+
+fn compile_workspace_patterns(
+    patterns: &[String],
+) -> Result<(Vec<GlobMatcher>, Vec<GlobMatcher>), String> {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for pattern in patterns {
+        let (target, pattern) = if let Some(pattern) = pattern.strip_prefix('!') {
+            (&mut excludes, pattern)
+        } else {
+            (&mut includes, pattern.as_str())
+        };
+        let matcher = GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| format!("invalid workspace pattern `{pattern}`: {error}"))?
+            .compile_matcher();
+        target.push(matcher);
+    }
+    Ok((includes, excludes))
 }
 
 fn normalize(path: &Path) -> String {
@@ -506,7 +725,8 @@ mod tests {
         fs::write(root.join("folder/index.ts"), "").unwrap();
         let importer = ModulePath(root.join("a.ts").to_string_lossy().into_owned());
         assert!(matches!(
-            RelativeResolver.try_resolve(Path::new(&importer.0), "./folder"),
+            RelativeResolver { mode: ResolutionMode::NodeNext }
+                .try_resolve(Path::new(&importer.0), "./folder"),
             Some(Resolution::Module(_))
         ));
         fs::remove_dir_all(root).unwrap();
@@ -520,6 +740,7 @@ mod tests {
         let resolver = AliasResolver {
             root: root.clone(),
             aliases: vec![PathAlias { pattern: "@/*".into(), targets: vec!["src/*".into()] }],
+            mode: ResolutionMode::NodeNext,
         };
         assert!(matches!(
             resolver.try_resolve(Path::new("src/a.ts"), "@/shared/util"),
@@ -559,7 +780,11 @@ mod tests {
 
         let loaded = TsConfigLoader::load(&root).unwrap();
         assert_eq!(loaded.aliases[0].pattern, "@/auth/*");
-        let resolver = AliasResolver { root: loaded.base_url, aliases: loaded.aliases };
+        let resolver = AliasResolver {
+            root: loaded.base_url,
+            aliases: loaded.aliases,
+            mode: ResolutionMode::NodeNext,
+        };
         assert!(matches!(
             resolver.try_resolve(Path::new("src/app.ts"), "@/auth/index"),
             Some(Resolution::Module(path)) if path.0.ends_with("src/features/auth/index.ts")
@@ -586,6 +811,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("wae-workspace-{}", std::process::id()));
         let package = root.join("packages/ui");
         fs::create_dir_all(package.join("src/components")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"repo","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
         fs::write(package.join("src/index.ts"), "").unwrap();
         fs::write(package.join("src/components/button.ts"), "").unwrap();
         fs::write(
@@ -613,6 +843,87 @@ mod tests {
             resolver.try_resolve(Path::new("apps/web/src/app.ts"), "@acme/ui/components/button"),
             Some(Resolution::Module(path)) if path.0.ends_with("packages/ui/src/components/button.ts")
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nodenext_maps_javascript_specifiers_and_preserves_dotted_basenames() {
+        let root = std::env::temp_dir().join(format!("wae-nodenext-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("b.ts"), "").unwrap();
+        fs::write(root.join("config.prod.ts"), "").unwrap();
+        let resolver = RelativeResolver { mode: ResolutionMode::NodeNext };
+        assert!(matches!(
+            resolver.try_resolve(&root.join("a.ts"), "./b.js"),
+            Some(Resolution::Module(path)) if path.0.ends_with("b.ts")
+        ));
+        assert!(matches!(
+            resolver.try_resolve(&root.join("a.ts"), "./config.prod"),
+            Some(Resolution::Module(path)) if path.0.ends_with("config.prod.ts")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_exports_block_unexported_and_escaping_subpaths() {
+        let root = std::env::temp_dir().join(format!("wae-exports-{}", std::process::id()));
+        let package = root.join("packages/ui");
+        fs::create_dir_all(package.join("src/internal")).unwrap();
+        fs::create_dir_all(package.join("src/special")).unwrap();
+        fs::write(root.join("outside.ts"), "").unwrap();
+        fs::write(package.join("src/index.ts"), "").unwrap();
+        fs::write(package.join("src/import.ts"), "").unwrap();
+        fs::write(package.join("src/types.ts"), "").unwrap();
+        fs::write(package.join("src/special/button.ts"), "").unwrap();
+        fs::write(package.join("src/internal/secret.ts"), "").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"repo","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"@acme/ui","exports":{".":[null,{"types":"./src/index.ts"}],"./conditional":{"import":"./src/import.ts","types":"./src/types.ts"},"./feature/*":"./src/general/*.ts","./feature/special/*":"./src/special/*.ts","./escape":"../outside.ts","./private/*":null}}"#,
+        )
+        .unwrap();
+        let resolver = WorkspaceResolver::discover(&root).unwrap();
+        assert!(matches!(
+            resolver.try_resolve(&root.join("app.ts"), "@acme/ui"),
+            Some(Resolution::Module(_))
+        ));
+        assert!(matches!(
+            resolver.try_resolve(&root.join("app.ts"), "@acme/ui/conditional"),
+            Some(Resolution::Module(path)) if path.0.ends_with("src/import.ts")
+        ));
+        assert!(matches!(
+            resolver.try_resolve(&root.join("app.ts"), "@acme/ui/feature/special/button"),
+            Some(Resolution::Module(path)) if path.0.ends_with("src/special/button.ts")
+        ));
+        for specifier in ["@acme/ui/internal/secret", "@acme/ui/escape", "@acme/ui/private/secret"]
+        {
+            assert_eq!(
+                resolver.try_resolve(&root.join("app.ts"), specifier),
+                Some(Resolution::Unresolved)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_index_ignores_packages_outside_declared_patterns() {
+        let root = std::env::temp_dir().join(format!("wae-workspace-scope-{}", std::process::id()));
+        fs::create_dir_all(root.join("packages/ui/src")).unwrap();
+        fs::create_dir_all(root.join("examples/demo/src")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"repo","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("packages/ui/package.json"), r#"{"name":"@acme/ui"}"#).unwrap();
+        fs::write(root.join("examples/demo/package.json"), r#"{"name":"@acme/demo"}"#).unwrap();
+        let resolver = WorkspaceResolver::discover(&root).unwrap();
+        assert!(resolver.packages().iter().any(|package| package.name == "@acme/ui"));
+        assert!(!resolver.packages().iter().any(|package| package.name == "@acme/demo"));
         fs::remove_dir_all(root).unwrap();
     }
 }

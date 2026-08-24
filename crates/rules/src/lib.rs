@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
-use wae_core::domain::{Diagnostic, ModuleId, Project, SourceLocation};
+use wae_core::domain::{Diagnostic, FeatureId, ModuleId, Project, SourceLocation};
 use wae_graph::ModuleGraph;
 
 pub struct RuleMetadata {
@@ -15,7 +15,8 @@ pub struct RuleContext<'a> {
     pub graph: &'a ModuleGraph,
     pub config: &'a Config,
     pub module_layers: &'a HashMap<ModuleId, String>,
-    pub module_features: &'a HashMap<ModuleId, String>,
+    pub module_features: &'a HashMap<ModuleId, FeatureId>,
+    pub module_feature_roots: &'a HashMap<ModuleId, String>,
 }
 
 pub trait DiagnosticSink {
@@ -60,6 +61,9 @@ impl RuleSet {
     pub fn evaluate(&self, context: &RuleContext<'_>) -> Result<Vec<Diagnostic>, String> {
         let mut diagnostics = Vec::new();
         for rule in &self.rules {
+            if !context.config.configured && rule.metadata().id != CIRCULAR.id {
+                continue;
+            }
             let severity =
                 context.config.rules.get(rule.metadata().id).and_then(|value| value.severity());
             let Some(severity) = severity else { continue };
@@ -125,7 +129,8 @@ impl Rule for ForbiddenDependencyRule {
             let configured = policies.iter().any(|(from_matcher, to_matcher)| {
                 from_matcher.is_match(&from) && to_matcher.is_match(&to)
             });
-            let package_to_app = (from.starts_with("packages/") || from.contains("/packages/"))
+            let package_to_app = context.config.architecture.presets.monorepo_boundaries
+                && (from.starts_with("packages/") || from.contains("/packages/"))
                 && (to.starts_with("apps/") || to.contains("/apps/"));
             if configured || package_to_app {
                 sink.emit(dependency_diagnostic(
@@ -200,18 +205,29 @@ impl Rule for FeatureBoundaryRule {
             .map(|entry| compile_matcher(entry))
             .collect::<Result<Vec<_>, _>>()?;
         for dependency in &context.project.dependencies {
-            let (Some(from), Some(to)) = (
-                context.module_features.get(&dependency.from),
-                context.module_features.get(&dependency.to),
-            ) else {
+            let Some(target_feature) = context.module_features.get(&dependency.to) else {
                 continue;
             };
-            if from != to
-                && !is_public_entrypoint(&dependency.to.0, to, context.config, &public_entries)
+            let importer_is_owner =
+                context.module_features.get(&dependency.from) == Some(target_feature);
+            if !importer_is_owner
+                && !is_public_entrypoint(
+                    &dependency.to.0,
+                    target_feature,
+                    context.module_feature_roots.get(&dependency.to),
+                    &public_entries,
+                )
             {
+                let importer = context
+                    .module_features
+                    .get(&dependency.from)
+                    .map_or("outside", |feature| feature.name.as_str());
                 sink.emit(dependency_diagnostic(
                     FEATURE.id,
-                    &format!("Feature `{from}` imports the internals of feature `{to}`"),
+                    &format!(
+                        "Importer `{importer}` accesses internals of feature `{}` in package `{}`",
+                        target_feature.name, target_feature.package.0
+                    ),
                     dependency,
                     "Import the target feature's public index entrypoint.",
                 ));
@@ -233,14 +249,7 @@ impl Rule for PrivateImportRule {
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
         for dependency in &context.project.dependencies {
-            let target = dependency.to.0.replace('\\', "/");
-            let private = context
-                .config
-                .architecture
-                .features
-                .private_segments
-                .iter()
-                .any(|segment| target.split('/').any(|part| part == segment));
+            let private = is_private_path(&dependency.to.0, context.config);
             let importer_feature = context.module_features.get(&dependency.from);
             let target_feature = context.module_features.get(&dependency.to);
             let outside_owner = match (importer_feature, target_feature) {
@@ -271,6 +280,15 @@ fn dependency_diagnostic(
     diagnostic.primary_location = Some(dependency.location.clone());
     diagnostic.dependency_path = vec![dependency.from.clone(), dependency.to.clone()];
     diagnostic.metadata.insert("dependencyKind".into(), format!("{:?}", dependency.kind));
+    diagnostic.metadata.insert(
+        "policy".into(),
+        match rule {
+            "ARCH-004" => "feature-public-boundary",
+            "ARCH-005" => "explicit-private-segment",
+            _ => "dependency-policy",
+        }
+        .into(),
+    );
     diagnostic.suggestion = Some(suggestion.into());
     diagnostic
 }
@@ -291,22 +309,32 @@ fn compile_matcher(pattern: &str) -> Result<GlobMatcher, String> {
 }
 fn is_public_entrypoint(
     path: &str,
-    feature: &str,
-    config: &Config,
+    feature: &FeatureId,
+    feature_root: Option<&String>,
     entries: &[GlobMatcher],
 ) -> bool {
     let normalized = path.replace('\\', "/");
-    let feature_root = config.architecture.features.root.trim_matches('/').replace('\\', "/");
-    let prefix = format!("{feature_root}/{feature}/");
+    let Some(feature_root) = feature_root else { return false };
+    let prefix = format!("{}/{}/", feature_root.trim_matches('/'), feature.name);
     normalized
         .strip_prefix(&prefix)
         .is_some_and(|relative| entries.iter().any(|entry| entry.is_match(relative)))
 }
 
+fn is_private_path(path: &str, config: &Config) -> bool {
+    let target = path.replace('\\', "/");
+    config
+        .architecture
+        .features
+        .private_segments
+        .iter()
+        .any(|segment| target.split('/').any(|part| part == segment))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wae_core::domain::{Dependency, DependencyKind, Project, SourceLocation};
+    use wae_core::domain::{Dependency, DependencyKind, PackageName, Project, SourceLocation};
 
     fn dependency(from: &str, to: &str) -> Dependency {
         Dependency {
@@ -321,7 +349,7 @@ mod tests {
         project: &'a Project,
         graph: &'a ModuleGraph,
         config: &'a Config,
-        features: &'a HashMap<ModuleId, String>,
+        features: &'a HashMap<ModuleId, FeatureId>,
     ) -> RuleContext<'a> {
         RuleContext {
             project,
@@ -329,6 +357,7 @@ mod tests {
             config,
             module_layers: Box::leak(Box::new(HashMap::new())),
             module_features: features,
+            module_feature_roots: Box::leak(Box::new(HashMap::new())),
         }
     }
 
@@ -338,7 +367,8 @@ mod tests {
         let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
         let graph = ModuleGraph::from_project(&project);
         let config = Config::default();
-        let features = HashMap::from([(edge.from, "user".into()), (edge.to, "user".into())]);
+        let user = FeatureId { package: PackageName("app".into()), name: "user".into() };
+        let features = HashMap::from([(edge.from, user.clone()), (edge.to, user)]);
         let mut diagnostics = Vec::new();
         PrivateImportRule
             .evaluate(&context(&project, &graph, &config, &features), &mut diagnostics)
@@ -353,7 +383,10 @@ mod tests {
         let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
         let graph = ModuleGraph::from_project(&project);
         let config = Config::default();
-        let features = HashMap::from([(edge.from, "payment".into()), (edge.to, "user".into())]);
+        let features = HashMap::from([
+            (edge.from, FeatureId { package: PackageName("app".into()), name: "payment".into() }),
+            (edge.to, FeatureId { package: PackageName("app".into()), name: "user".into() }),
+        ]);
         let mut diagnostics = Vec::new();
         PrivateImportRule
             .evaluate(&context(&project, &graph, &config, &features), &mut diagnostics)
@@ -371,13 +404,45 @@ mod tests {
             .iter()
             .map(|entry| compile_matcher(entry).unwrap())
             .collect::<Vec<_>>();
-        assert!(is_public_entrypoint("src/features/user/index.ts", "user", &config, &public,));
+        let feature = FeatureId { package: PackageName("app".into()), name: "user".into() };
+        let root = "src/features".to_string();
+        assert!(
+            is_public_entrypoint("src/features/user/index.ts", &feature, Some(&root), &public,)
+        );
         assert!(!is_public_entrypoint(
             "src/features/user/internal/index.ts",
-            "user",
-            &config,
+            &feature,
+            Some(&root),
             &public,
         ));
+    }
+
+    #[test]
+    fn importer_outside_features_cannot_access_feature_internals() {
+        let edge = dependency("src/app/page.ts", "src/features/user/model.ts");
+        let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
+        let graph = ModuleGraph::from_project(&project);
+        let config = Config::default();
+        let features = HashMap::from([(
+            edge.to.clone(),
+            FeatureId { package: PackageName("app".into()), name: "user".into() },
+        )]);
+        let roots = HashMap::from([(edge.to.clone(), "src/features".into())]);
+        let mut diagnostics = Vec::new();
+        FeatureBoundaryRule
+            .evaluate(
+                &RuleContext {
+                    project: &project,
+                    graph: &graph,
+                    config: &config,
+                    module_layers: &HashMap::new(),
+                    module_features: &features,
+                    module_feature_roots: &roots,
+                },
+                &mut diagnostics,
+            )
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]

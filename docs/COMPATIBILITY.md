@@ -25,19 +25,23 @@
 - JavaScript
 - TypeScript
 - React
-- Next.js (مسیرهای متداول App Router + Pages)
+
+تشخیص اختصاصی Next.js App Router/Pages و runtime rules فعلاً experimental است و جزو پشتیبانی رسمی نیست.
 
 ### ساختار پروژه
 
 - single package
-- workspace monorepoهای رایج (تا سطح policyهای MVP)
-- npm/yarn/pnpm-style package manifests, package `exports` and `imports`
+- npm/yarn workspaces و `pnpm-workspace.yaml` بر اساس declarationهای صریح
+- package `exports`/`imports` با encapsulation، condition، array، null و subpath pattern در سطح MVP
 
 ### module system
 
-- ESM
+- ESM و mappingهای TypeScript NodeNext (`.js` → `.ts`, `.mjs` → `.mts`, `.cjs` → `.cts`)
 - CommonJS (پوشش MVP resolver)
 - JSONC `tsconfig.json`, relative `extends`, `baseUrl`, and longest-match `paths`
+
+فایل resolve‌شده‌ای که با `project.exclude` از discovery کنار گذاشته شده، به‌صورت node صریح
+`Excluded` و opaque در مدل نگه‌داری می‌شود؛ dependencyهای transitive آن تحلیل نمی‌شوند.
 
 ## 4) ماتریس سازگاری هدف (Beta → v1)
 

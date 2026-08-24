@@ -19,6 +19,9 @@ pub struct Config {
     pub baseline: BaselineConfig,
     pub output: OutputConfig,
     pub cache: CacheConfig,
+    pub resolution: ResolutionConfig,
+    #[serde(skip)]
+    pub configured: bool,
 }
 
 impl Default for Config {
@@ -35,6 +38,8 @@ impl Default for Config {
             baseline: BaselineConfig::default(),
             output: OutputConfig::default(),
             cache: CacheConfig::default(),
+            resolution: ResolutionConfig::default(),
+            configured: false,
         }
     }
 }
@@ -79,6 +84,7 @@ pub struct ArchitectureConfig {
     pub layers: BTreeMap<String, LayerConfig>,
     pub features: FeatureConfig,
     pub forbidden_dependencies: Vec<ForbiddenDependency>,
+    pub presets: ArchitecturePresets,
 }
 
 impl Default for ArchitectureConfig {
@@ -109,8 +115,19 @@ impl Default for ArchitectureConfig {
             "shared".into(),
             LayerConfig { patterns: vec!["**/shared/**".into()], can_import: vec![] },
         );
-        Self { layers, features: FeatureConfig::default(), forbidden_dependencies: Vec::new() }
+        Self {
+            layers,
+            features: FeatureConfig::default(),
+            forbidden_dependencies: Vec::new(),
+            presets: ArchitecturePresets::default(),
+        }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArchitecturePresets {
+    pub monorepo_boundaries: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +142,7 @@ pub struct LayerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FeatureConfig {
     pub root: String,
+    pub roots: Vec<String>,
     pub public_entrypoints: Vec<String>,
     pub private_segments: Vec<String>,
 }
@@ -133,10 +151,37 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             root: "src/features".into(),
+            roots: Vec::new(),
             public_entrypoints: vec!["index.ts".into(), "index.tsx".into(), "index.js".into()],
             private_segments: vec!["internal".into(), "private".into()],
         }
     }
+}
+
+impl FeatureConfig {
+    pub fn effective_roots(&self) -> Vec<&str> {
+        if self.roots.is_empty() {
+            vec![self.root.as_str()]
+        } else {
+            self.roots.iter().map(String::as_str).collect()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolutionMode {
+    Node,
+    Node16,
+    #[default]
+    NodeNext,
+    Bundler,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResolutionConfig {
+    pub mode: ResolutionMode,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,13 +263,17 @@ impl Config {
         let source = fs::read_to_string(&path).map_err(|e| {
             config_error(ConfigErrorKind::Io, Some(path.display().to_string()), e.to_string())
         })?;
-        let config: Self = yaml_serde::from_str(&source).map_err(|e| {
+        let mut config: Self = yaml_serde::from_str(&source).map_err(|e| {
             config_error(
                 ConfigErrorKind::InvalidYaml,
                 Some(path.display().to_string()),
                 e.to_string(),
             )
         })?;
+        for (id, rule) in Self::default().rules {
+            config.rules.entry(id).or_insert(rule);
+        }
+        config.configured = true;
         config.validate()?;
         Ok(config)
     }
@@ -259,7 +308,9 @@ impl Config {
         for root in &self.project.roots {
             validate_relative_path(root, "project.roots")?;
         }
-        validate_relative_path(&self.architecture.features.root, "architecture.features.root")?;
+        for root in self.architecture.features.effective_roots() {
+            validate_relative_path(root, "architecture.features.roots")?;
+        }
         validate_relative_path(&self.cache.directory, "cache.directory")?;
         if !matches!(self.output.format.as_str(), "human" | "json" | "jsonl" | "sarif") {
             return Err(config_error(
@@ -370,5 +421,27 @@ mod tests {
         config.rules.insert("ARCH-999".into(), RuleConfig::Severity(Severity::Error));
         let error = config.validate().unwrap_err();
         assert_eq!(error.path.as_deref(), Some("rules.ARCH-999"));
+    }
+
+    #[test]
+    fn partial_rule_configuration_merges_with_defaults() {
+        let root = std::env::temp_dir().join(format!("wae-config-rules-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(CONFIG_FILE), "version: 1\nrules:\n  ARCH-001: warning\n").unwrap();
+        let config = Config::load(&root).unwrap();
+        assert_eq!(config.rules.len(), 5);
+        assert_eq!(config.rules["ARCH-001"].severity(), Some(Severity::Warning));
+        assert_eq!(config.rules["ARCH-005"].severity(), Some(Severity::Error));
+        assert!(config.configured);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_configuration_is_marked_as_neutral_defaults() {
+        let root = std::env::temp_dir().join(format!("wae-no-config-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let config = Config::load(&root).unwrap();
+        assert!(!config.configured);
+        fs::remove_dir_all(root).unwrap();
     }
 }

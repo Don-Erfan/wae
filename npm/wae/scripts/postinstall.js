@@ -10,9 +10,7 @@ const MAX_REDIRECTS = 5;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 
-function resolveTarget() {
-  const platform = os.platform();
-  const arch = os.arch();
+function resolveTarget(platform = os.platform(), arch = os.arch()) {
 
   const targets = {
     linux: {
@@ -35,16 +33,29 @@ function resolveTarget() {
   return targets[platform][arch];
 }
 
-function downloadFile(url, destination, redirects = 0) {
+function downloadFile(url, destination, options = {}) {
   return new Promise((resolve, reject) => {
+    const redirects = options.redirects || 0;
+    const client = options.client || https;
+    const maxBytes = options.maxBytes || MAX_DOWNLOAD_BYTES;
+    const timeoutMs = options.timeoutMs || DOWNLOAD_TIMEOUT_MS;
+    let stream;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      if (stream) stream.destroy();
+      fs.rmSync(destination, { force: true });
+      reject(error);
+    };
     let parsedUrl;
     try {
       parsedUrl = validateDownloadUrl(url);
     } catch (error) {
-      reject(error);
+      fail(error);
       return;
     }
-    const request = https.get(
+    const request = client.get(
       url,
       {
         headers: {
@@ -60,36 +71,36 @@ function downloadFile(url, destination, redirects = 0) {
         ) {
           response.resume();
           if (redirects >= MAX_REDIRECTS) {
-            reject(new Error(`Too many redirects while downloading ${url}`));
+            fail(new Error(`Too many redirects while downloading ${url}`));
             return;
           }
           const redirectUrl = new URL(response.headers.location, url).toString();
-          downloadFile(redirectUrl, destination, redirects + 1)
+          downloadFile(redirectUrl, destination, { ...options, redirects: redirects + 1 })
             .then(resolve)
-            .catch(reject);
+            .catch(fail);
           return;
         }
 
         if (response.statusCode !== 200) {
           response.resume();
-          reject(new Error(`Download failed (${response.statusCode}) for ${url}`));
+          fail(new Error(`Download failed (${response.statusCode}) for ${url}`));
           return;
         }
 
         const declaredSize = Number(response.headers["content-length"] || 0);
-        if (declaredSize > MAX_DOWNLOAD_BYTES) {
+        if (declaredSize > maxBytes) {
           response.resume();
-          reject(new Error(`Download exceeds ${MAX_DOWNLOAD_BYTES} bytes`));
+          fail(new Error(`Download exceeds ${maxBytes} bytes`));
           return;
         }
 
-        const stream = fs.createWriteStream(destination, { flags: "wx" });
+        stream = fs.createWriteStream(destination, { flags: "wx" });
         let received = 0;
 
         response.on("data", (chunk) => {
           received += chunk.length;
-          if (received > MAX_DOWNLOAD_BYTES) {
-            response.destroy(new Error(`Download exceeds ${MAX_DOWNLOAD_BYTES} bytes`));
+          if (received > maxBytes) {
+            response.destroy(new Error(`Download exceeds ${maxBytes} bytes`));
           }
         });
 
@@ -97,22 +108,26 @@ function downloadFile(url, destination, redirects = 0) {
 
         response.on("error", (error) => {
           stream.destroy();
-          reject(error);
+          fail(error);
         });
 
         stream.on("finish", () => {
-          stream.close(resolve);
+          stream.close(() => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          });
         });
 
         stream.on("error", (error) => {
-          reject(error);
+          fail(error);
         });
       }
     );
 
-    request.on("error", reject);
-    request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
-      request.destroy(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS}ms`));
+    request.on("error", fail);
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`Download timed out after ${timeoutMs}ms`));
     });
   });
 }
@@ -132,30 +147,33 @@ function sha256(filePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
-async function main() {
+async function installVerifiedBinary(options = {}) {
   if (process.env.WAE_SKIP_DOWNLOAD === "1") {
     console.log("Skipping WAE binary download because WAE_SKIP_DOWNLOAD=1");
     return;
   }
 
-  const packageJsonPath = path.join(__dirname, "..", "package.json");
+  const packageJsonPath = options.packageJsonPath || path.join(__dirname, "..", "package.json");
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
 
-  const repository = process.env.WAE_GITHUB_REPOSITORY || packageJson.wae?.githubRepo;
+  const repository =
+    options.repository || process.env.WAE_GITHUB_REPOSITORY || packageJson.wae?.githubRepo;
   if (!repository) {
     throw new Error(
       "`wae.githubRepo` is not configured. Set it in package.json or export WAE_GITHUB_REPOSITORY."
     );
   }
 
-  const target = resolveTarget();
+  const platform = options.platform || os.platform();
+  const arch = options.arch || os.arch();
+  const target = resolveTarget(platform, arch);
   const version = packageJson.version;
-  const extension = os.platform() === "win32" ? ".exe" : "";
+  const extension = platform === "win32" ? ".exe" : "";
   const assetName = `wae-${target}${extension}`;
   const releaseTag = `v${version}`;
 
   const downloadUrl = `https://github.com/${repository}/releases/download/${releaseTag}/${assetName}`;
-  const binDir = path.join(__dirname, "..", "bin");
+  const binDir = options.binDir || path.join(__dirname, "..", "bin");
   const binaryPath = path.join(binDir, `wae${extension}`);
   const nonce = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const temporaryBinaryPath = path.join(binDir, `.wae-${nonce}.tmp`);
@@ -165,8 +183,9 @@ async function main() {
 
   try {
     console.log(`Downloading ${assetName} from ${downloadUrl}`);
-    await downloadFile(downloadUrl, temporaryBinaryPath);
-    await downloadFile(`${downloadUrl}.sha256`, temporaryChecksumPath);
+    const download = options.download || downloadFile;
+    await download(downloadUrl, temporaryBinaryPath);
+    await download(`${downloadUrl}.sha256`, temporaryChecksumPath);
 
     const expected = fs.readFileSync(temporaryChecksumPath, "utf8").trim().split(/\s+/)[0];
     const actual = sha256(temporaryBinaryPath);
@@ -174,7 +193,7 @@ async function main() {
       throw new Error(`SHA-256 verification failed for ${assetName}`);
     }
 
-    if (os.platform() !== "win32") {
+    if (platform !== "win32") {
       fs.chmodSync(temporaryBinaryPath, 0o755);
     }
 
@@ -192,6 +211,10 @@ async function main() {
   }
 }
 
+async function main() {
+  await installVerifiedBinary();
+}
+
 if (require.main === module) {
   main().catch((error) => {
     console.error(`Could not install the verified WAE binary: ${error.message}`);
@@ -199,4 +222,10 @@ if (require.main === module) {
   });
 }
 
-module.exports = { downloadFile, resolveTarget, sha256, validateDownloadUrl };
+module.exports = {
+  downloadFile,
+  installVerifiedBinary,
+  resolveTarget,
+  sha256,
+  validateDownloadUrl,
+};

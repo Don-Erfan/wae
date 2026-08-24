@@ -7,6 +7,8 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -28,6 +30,8 @@ jobs:
           - os: windows-latest
             rust: "1.85.0"
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master

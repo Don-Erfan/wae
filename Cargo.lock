@@ -235,6 +235,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -302,7 +303,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "wae-cli"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -314,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "wae-config"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "globset",
  "serde",
@@ -324,14 +325,14 @@ dependencies = [
 
 [[package]]
 name = "wae-core"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "wae-engine"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "globset",
  "ignore",
@@ -347,14 +348,14 @@ dependencies = [
 
 [[package]]
 name = "wae-graph"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "wae-core",
 ]
 
 [[package]]
 name = "wae-parser"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde_json",
  "tree-sitter",
@@ -364,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "wae-reporters"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde_json",
  "wae-core",
@@ -373,16 +374,20 @@ dependencies = [
 
 [[package]]
 name = "wae-resolver"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
+ "globset",
  "ignore",
+ "serde",
  "serde_json",
+ "wae-config",
  "wae-core",
+ "yaml_serde",
 ]
 
 [[package]]
 name = "wae-rules"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "globset",
  "wae-config",

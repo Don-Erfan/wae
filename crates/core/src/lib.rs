@@ -20,6 +20,12 @@ pub mod domain {
     pub struct ModuleId(pub String);
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub struct FeatureId {
+        pub package: PackageName,
+        pub name: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct ModulePath(pub String);
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -239,6 +245,7 @@ pub mod domain {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum ModuleKind {
         Source,
+        Excluded,
         External,
     }
 
@@ -514,7 +521,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.6"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.7"]);
     }
 
     #[test]

@@ -7,9 +7,9 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::{
-    Dependency, DependencyTarget, Diagnostic, FrameworkMetadata, LayerId, Module, ModuleId,
-    ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime, Severity,
-    SourceLocation,
+    Dependency, DependencyTarget, Diagnostic, FeatureId, FrameworkMetadata, LayerId, Module,
+    ModuleId, ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime,
+    Severity, SourceLocation,
 };
 use wae_graph::ModuleGraph;
 use wae_parser::{JsTsParser, ParserAdapter};
@@ -79,6 +79,7 @@ impl<P: ParserAdapter> Engine<P> {
             tsconfig.base_url,
             tsconfig.aliases,
             workspace_resolver,
+            config.resolution.mode,
         );
         let default_package =
             Package { name: PackageName(project_name(&root)), root_path: normalize(&root) };
@@ -86,6 +87,7 @@ impl<P: ParserAdapter> Engine<P> {
         let mut discovered_packages = HashMap::<PackageName, Package>::new();
         let mut layers = HashMap::new();
         let mut features = HashMap::new();
+        let mut feature_roots = HashMap::new();
         let mut cache = AnalysisCache::load(&root, &config)?;
 
         for path in &files {
@@ -93,12 +95,16 @@ impl<P: ParserAdapter> Engine<P> {
             let id = ModuleId(relative.clone());
             let package = infer_package(&root, path, &workspace_packages, &default_package);
             discovered_packages.entry(package.name.clone()).or_insert_with(|| package.clone());
-            let layer_name = architecture.layer(&relative);
+            let layer_name = architecture.layer(&relative)?;
             if let Some(value) = &layer_name {
                 layers.insert(id.clone(), value.clone());
             }
-            if let Some(value) = architecture.feature(&relative) {
-                features.insert(id.clone(), value);
+            let package_root = relative_path(&root, Path::new(&package.root_path));
+            if let Some((feature, feature_root)) =
+                architecture.feature(&relative, &package, &package_root)
+            {
+                features.insert(id.clone(), feature);
+                feature_roots.insert(id.clone(), feature_root);
             }
             project.modules.push(Module {
                 id: id.clone(),
@@ -159,6 +165,43 @@ impl<P: ParserAdapter> Engine<P> {
                                             module: target_id.clone(),
                                         },
                                     );
+                                if !project.modules.iter().any(|module| module.id == target_id) {
+                                    let target_path = root.join(&target_id.0);
+                                    let package = infer_package(
+                                        &root,
+                                        &target_path,
+                                        &workspace_packages,
+                                        &default_package,
+                                    );
+                                    if !project
+                                        .packages
+                                        .iter()
+                                        .any(|known| known.name == package.name)
+                                    {
+                                        project.packages.push(package.clone());
+                                    }
+                                    let layer = architecture.layer(&target_id.0)?;
+                                    if let Some(value) = &layer {
+                                        layers.insert(target_id.clone(), value.clone());
+                                    }
+                                    let package_root =
+                                        relative_path(&root, Path::new(&package.root_path));
+                                    if let Some((feature, feature_root)) =
+                                        architecture.feature(&target_id.0, &package, &package_root)
+                                    {
+                                        features.insert(target_id.clone(), feature);
+                                        feature_roots.insert(target_id.clone(), feature_root);
+                                    }
+                                    project.modules.push(Module {
+                                        id: target_id.clone(),
+                                        path: ModulePath(target_id.0.clone()),
+                                        package: package.name,
+                                        kind: ModuleKind::Excluded,
+                                        runtime: Runtime::Unknown,
+                                        layer: layer.map(LayerId),
+                                        framework_metadata: FrameworkMetadata::default(),
+                                    });
+                                }
                                 project.resolved_dependencies.push(ResolvedDependency {
                                     from: module_id.clone(),
                                     specifier: import.specifier.clone(),
@@ -249,6 +292,7 @@ impl<P: ParserAdapter> Engine<P> {
 
         cache.save()?;
 
+        project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
         project.modules.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         project.dependencies.sort_by(|a, b| (&a.from.0, &a.to.0).cmp(&(&b.from.0, &b.to.0)));
         let graph = ModuleGraph::from_project(&project);
@@ -258,6 +302,7 @@ impl<P: ParserAdapter> Engine<P> {
             config: &config,
             module_layers: &layers,
             module_features: &features,
+            module_feature_roots: &feature_roots,
         };
         let mut diagnostics = project.diagnostics.clone();
         diagnostics.extend(self.rules.evaluate(&context).map_err(AnalysisError::Internal)?);
@@ -413,7 +458,7 @@ fn build_globs(patterns: &[String]) -> Result<GlobSet, AnalysisError> {
 
 struct CompiledArchitectureModel {
     layers: Vec<(String, GlobSet)>,
-    feature_root: String,
+    feature_roots: Vec<String>,
 }
 
 impl CompiledArchitectureModel {
@@ -426,27 +471,60 @@ impl CompiledArchitectureModel {
             .collect::<Result<Vec<_>, AnalysisError>>()?;
         Ok(Self {
             layers,
-            feature_root: config
+            feature_roots: config
                 .architecture
                 .features
-                .root
-                .replace('\\', "/")
-                .trim_matches('/')
-                .to_string(),
+                .effective_roots()
+                .into_iter()
+                .map(|root| root.replace('\\', "/").trim_matches('/').to_string())
+                .collect(),
         })
     }
 
-    fn layer(&self, path: &str) -> Option<String> {
-        self.layers.iter().find_map(|(name, matcher)| matcher.is_match(path).then(|| name.clone()))
+    fn layer(&self, path: &str) -> Result<Option<String>, AnalysisError> {
+        let matches = self
+            .layers
+            .iter()
+            .filter(|(_, matcher)| matcher.is_match(path))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(AnalysisError::Config(wae_core::domain::ConfigError {
+                kind: wae_core::domain::ConfigErrorKind::ConflictingConfig,
+                message: format!(
+                    "module `{path}` matches multiple architecture layers: {}",
+                    matches.join(", ")
+                ),
+                path: Some("architecture.layers".into()),
+            }));
+        }
+        Ok(matches.into_iter().next())
     }
 
-    fn feature(&self, path: &str) -> Option<String> {
-        let prefix = format!("{}/", self.feature_root);
-        path.replace('\\', "/")
-            .strip_prefix(&prefix)
-            .and_then(|relative| relative.split('/').next())
-            .filter(|feature| !feature.is_empty())
-            .map(str::to_owned)
+    fn feature(
+        &self,
+        path: &str,
+        package: &Package,
+        package_root: &str,
+    ) -> Option<(FeatureId, String)> {
+        let path = path.replace('\\', "/");
+        self.feature_roots.iter().find_map(|configured_root| {
+            let feature_root = if package_root.is_empty() {
+                configured_root.clone()
+            } else {
+                format!("{}/{configured_root}", package_root.trim_matches('/'))
+            };
+            let prefix = format!("{feature_root}/");
+            path.strip_prefix(&prefix)
+                .and_then(|relative| relative.split('/').next())
+                .filter(|feature| !feature.is_empty())
+                .map(|feature| {
+                    (
+                        FeatureId { package: package.name.clone(), name: feature.to_owned() },
+                        feature_root,
+                    )
+                })
+        })
     }
 }
 fn project_name(root: &Path) -> String {
@@ -541,6 +619,93 @@ mod tests {
         let resolved = "//?/D:/a/wae/wae/src/a.ts";
         assert_eq!(relative_resolved_path(root, resolved), "src/a.ts");
         assert!(normalized_path_is_within(resolved, Path::new(r"\\?\D:\a\wae\wae")));
+    }
+
+    #[test]
+    fn feature_roots_are_relative_to_each_workspace_package() {
+        let root =
+            std::env::temp_dir().join(format!("wae-feature-workspace-{}", std::process::id()));
+        let app = root.join("apps/web");
+        fs::create_dir_all(app.join("src/features/a")).unwrap();
+        fs::create_dir_all(app.join("src/features/b")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"repo","private":true,"workspaces":["apps/*"]}"#,
+        )
+        .unwrap();
+        fs::write(app.join("package.json"), r#"{"name":"@acme/web"}"#).unwrap();
+        fs::write(
+            app.join("src/features/a/service.ts"),
+            "import { value } from '../b/model'; export { value };",
+        )
+        .unwrap();
+        fs::write(app.join("src/features/b/model.ts"), "export const value = true;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\narchitecture:\n  layers: {}\n  features:\n    root: src/features\nrules:\n  ARCH-004: error\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(analysis.diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-004").count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn application_code_cannot_import_a_non_public_feature_module() {
+        let root = std::env::temp_dir().join(format!("wae-feature-owner-{}", std::process::id()));
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        fs::create_dir_all(root.join("src/features/user")).unwrap();
+        fs::write(
+            root.join("src/app/page.ts"),
+            "import { user } from '../features/user/model'; export { user };",
+        )
+        .unwrap();
+        fs::write(root.join("src/features/user/model.ts"), "export const user = true;").unwrap();
+        fs::write(root.join("wae.yaml"), "version: 1\n").unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(analysis.diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-004").count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolved_targets_outside_discovery_are_explicit_excluded_modules() {
+        let root = std::env::temp_dir().join(format!("wae-excluded-target-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.ts"), "import { value } from './excluded'; export { value };")
+            .unwrap();
+        fs::write(root.join("src/excluded.ts"), "export const value = true;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nproject:\n  include: ['**/*.ts']\n  exclude: ['**/excluded.ts']\narchitecture:\n  layers: {}\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(analysis.project.modules.len(), 2);
+        assert_eq!(analysis.graph.node_count(), 2);
+        assert!(
+            analysis
+                .project
+                .modules
+                .iter()
+                .any(|module| module.id.0 == "src/excluded.ts"
+                    && module.kind == ModuleKind::Excluded)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overlapping_layer_matches_are_configuration_errors() {
+        let root = std::env::temp_dir().join(format!("wae-layer-overlap-{}", std::process::id()));
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        fs::write(root.join("src/app/page.ts"), "export const page = true;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\narchitecture:\n  layers:\n    broad:\n      patterns: ['src/**']\n    app:\n      patterns: ['**/app/**']\n",
+        )
+        .unwrap();
+        let error = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap_err();
+        assert!(matches!(error, AnalysisError::Config(_)));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

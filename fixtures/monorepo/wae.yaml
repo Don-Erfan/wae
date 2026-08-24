@@ -1,0 +1,4 @@
+version: 1
+architecture:
+  presets:
+    monorepo_boundaries: true

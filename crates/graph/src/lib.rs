@@ -19,13 +19,16 @@ impl ModuleGraph {
 
     pub fn from_project(project: &Project) -> Self {
         let mut builder = ModuleGraphBuilder::new();
+        let known = project.modules.iter().map(|module| &module.id).collect::<HashSet<_>>();
 
         for module in &project.modules {
             builder = builder.add_node(module.id.clone());
         }
 
         for dependency in &project.dependencies {
-            builder = builder.add_edge(dependency.clone());
+            if known.contains(&dependency.from) && known.contains(&dependency.to) {
+                builder = builder.add_edge(dependency.clone());
+            }
         }
 
         builder.build()
@@ -567,7 +570,13 @@ mod tests {
 
     #[test]
     fn graph_deduplicates_edges_and_sorts_public_output() {
+        let package =
+            Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
         let project = ProjectBuilder::new()
+            .add_package(package.clone())
+            .add_module(module(&package, "A"))
+            .add_module(module(&package, "B"))
+            .add_module(module(&package, "C"))
             .add_dependency(dependency("B", "C"))
             .add_dependency(dependency("A", "B"))
             .add_dependency(dependency("A", "B"))
@@ -579,6 +588,20 @@ mod tests {
             vec!["A", "B", "C"]
         );
         assert_eq!(graph.edges()[0].from.0, "A");
+    }
+
+    #[test]
+    fn project_graph_never_invents_nodes_for_missing_module_records() {
+        let package =
+            Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
+        let project = ProjectBuilder::new()
+            .add_package(package.clone())
+            .add_module(module(&package, "A"))
+            .add_dependency(dependency("A", "excluded"))
+            .build();
+        let graph = ModuleGraph::from_project(&project);
+        assert_eq!(graph.nodes(), &[ModuleId("A".into())]);
+        assert!(graph.edges().is_empty());
     }
 
     #[test]
