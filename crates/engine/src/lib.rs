@@ -250,7 +250,7 @@ impl<P: ParserAdapter> Engine<P> {
                         import.module_id = module_id.clone();
                         import.location.file = module_id.0.clone();
                         let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
-                        let importer_format = module_formats.resolve(&module_path);
+                        let importer_format = module_formats.resolve(path);
                         let resolution_kind = match candidate.kind {
                             wae_core::domain::DependencyKind::Dynamic => ResolutionKind::Import,
                             wae_core::domain::DependencyKind::Require => ResolutionKind::Require,
