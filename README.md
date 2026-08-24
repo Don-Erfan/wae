@@ -6,7 +6,7 @@ WAE analyzes JavaScript and TypeScript dependency architecture. Its production p
 source discovery → import parsing → Node/TypeScript resolution → module graph → rules → diagnostics
 ```
 
-The current engine extracts static imports, type-only imports, re-exports, dynamic imports, and CommonJS `require` calls; resolves relative extension/index imports and `tsconfig` path aliases; and evaluates `ARCH-001` through `ARCH-005` against a shared graph.
+The current engine traverses the Tree-sitter AST for static imports, type-only imports, re-exports, literal dynamic imports, and CommonJS `require` calls. It resolves relative extension/index imports, JSONC `tsconfig` aliases and `extends`, workspace packages, `exports`, and `imports`, then evaluates `ARCH-001` through `ARCH-005` against a shared deterministic graph.
 
 ## Use from source
 
@@ -28,6 +28,7 @@ Ratchet mode never creates state implicitly. Review the current diagnostics, exp
 ```bash
 cargo run -p wae-cli -- baseline create
 WAE_BASE_REF=origin/master cargo run -p wae-cli -- check --changed
+cargo run -p wae-cli -- check --changed --base origin/main
 ```
 
 Supported reporters are `human`, `json`, `jsonl`, and `sarif`. Exit codes are stable: `0` passed, `1` violations, `2` project/config error, and `3` internal error.
@@ -39,7 +40,7 @@ npm install --save-dev @don-erfan/wae
 npx wae check
 ```
 
-The installer supports Linux x64/arm64, macOS x64/arm64, and Windows x64. It enforces redirect, timeout, and size limits and verifies the downloaded binary against the release SHA-256 asset before installation.
+The installer supports Linux x64/arm64, macOS x64/arm64, and Windows x64. It allows only HTTPS GitHub hosts, enforces redirect, timeout, and size limits, downloads to temporary files, verifies SHA-256, and atomically installs the verified binary.
 
 ## Development
 
@@ -50,3 +51,4 @@ cargo test --workspace
 ```
 
 See [Architecture](docs/ARCHITECTURE.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
+Release maintainers should also read [Releasing](docs/RELEASING.md).

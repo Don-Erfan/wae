@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+globset.workspace = true
 wae-core = { path = "../core" }
 wae-graph = { path = "../graph" }
 wae-config = { path = "../config" }

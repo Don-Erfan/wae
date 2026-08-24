@@ -1,11 +1,11 @@
 {
   "name": "@don-erfan/wae",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "WAE CLI wrapper for frontend architecture checks",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Don-Erfan/wae.git"
+    "url": "git+https://github.com/Don-Erfan/wae.git"
   },
   "homepage": "https://github.com/Don-Erfan/wae",
   "bugs": {
@@ -24,7 +24,8 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "test:installer": "node --test test/postinstall.test.js"
   },
   "wae": {
     "githubRepo": "Don-Erfan/wae"

@@ -45,7 +45,7 @@ Diagnostics / Reporters / Integrations
 
 - `Facade`: `wae-engine::Engine` تنها API سطح‌بالای pipeline برای CLI و integrationهای آینده است.
 - `Strategy / Adapter`: قرارداد `ParserAdapter` جزئیات parser را از IR و engine جدا می‌کند.
-- `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias و package را به‌ترتیب اجرا می‌کند.
+- `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias، workspace و external package را به‌ترتیب اجرا می‌کند.
 - `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.
 - `Repository`: baseline storage پشت command صریح `baseline create` قرار دارد و `check --changed` هرگز آن را ایجاد نمی‌کند.
 - `Ports & Adapters`: filesystem/Git/CLI در لبه قرار دارند؛ ruleها به command یا reporter وابسته نیستند.
@@ -68,7 +68,7 @@ Diagnostics / Reporters / Integrations
 ## 6) تصمیم‌های کارایی
 
 - `adjacency list` برای graph traversal
-- cache key مبتنی بر fingerprint فایل + resolver context
+- cache key مبتنی بر hash پایدار محتوای فایل؛ cache به‌صورت opt-in و atomic ذخیره می‌شود
 - deterministic sorting برای diagnostics
 - اجرای ruleها روی snapshot مشترک graph (بدون parse مجدد)
 - incremental invalidation بر اساس dependency impact
@@ -85,7 +85,7 @@ Diagnostics / Reporters / Integrations
 - `dependency_path`
 - `suggestion`
 - `metadata`
-- `fingerprint` پایدار و مستقل از message/severity
+- `fingerprint` semantic و مستقل از message/severity/line/column
 - `schemaVersion` در envelope خروجی machine-readable
 
 ## 8) معیار Done فاز 0

@@ -120,6 +120,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -237,19 +243,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -263,9 +256,9 @@ checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
 name = "syn"
-version = "3.0.3"
+version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -308,15 +301,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "wae-cli"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
+ "serde",
  "serde_json",
  "wae-config",
  "wae-core",
@@ -326,26 +314,28 @@ dependencies = [
 
 [[package]]
 name = "wae-config"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
+ "globset",
  "serde",
- "serde_yaml",
  "wae-core",
+ "yaml_serde",
 ]
 
 [[package]]
 name = "wae-core"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "wae-engine"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "globset",
  "ignore",
+ "serde",
  "serde_json",
  "wae-config",
  "wae-core",
@@ -357,16 +347,16 @@ dependencies = [
 
 [[package]]
 name = "wae-graph"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "wae-core",
 ]
 
 [[package]]
 name = "wae-parser"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
- "regex",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-typescript",
  "wae-core",
@@ -374,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "wae-reporters"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "serde_json",
  "wae-core",
@@ -383,15 +373,18 @@ dependencies = [
 
 [[package]]
 name = "wae-resolver"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
+ "ignore",
+ "serde_json",
  "wae-core",
 ]
 
 [[package]]
 name = "wae-rules"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
+ "globset",
  "wae-config",
  "wae-core",
  "wae-graph",
@@ -429,6 +422,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
 use wae_core::domain::{Diagnostic, ModuleId, Project, SourceLocation};
 use wae_graph::ModuleGraph;
@@ -109,13 +110,21 @@ impl Rule for ForbiddenDependencyRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
+        let policies = context
+            .config
+            .architecture
+            .forbidden_dependencies
+            .iter()
+            .map(|policy| {
+                Ok::<_, String>((compile_matcher(&policy.from)?, compile_matcher(&policy.to)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for dependency in &context.project.dependencies {
             let from = dependency.from.0.replace('\\', "/");
             let to = dependency.to.0.replace('\\', "/");
-            let configured =
-                context.config.architecture.forbidden_dependencies.iter().any(|policy| {
-                    path_matches(&from, &policy.from) && path_matches(&to, &policy.to)
-                });
+            let configured = policies.iter().any(|(from_matcher, to_matcher)| {
+                from_matcher.is_match(&from) && to_matcher.is_match(&to)
+            });
             let package_to_app = (from.starts_with("packages/") || from.contains("/packages/"))
                 && (to.starts_with("apps/") || to.contains("/apps/"));
             if configured || package_to_app {
@@ -182,6 +191,14 @@ impl Rule for FeatureBoundaryRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
+        let public_entries = context
+            .config
+            .architecture
+            .features
+            .public_entrypoints
+            .iter()
+            .map(|entry| compile_matcher(entry))
+            .collect::<Result<Vec<_>, _>>()?;
         for dependency in &context.project.dependencies {
             let (Some(from), Some(to)) = (
                 context.module_features.get(&dependency.from),
@@ -189,7 +206,9 @@ impl Rule for FeatureBoundaryRule {
             ) else {
                 continue;
             };
-            if from != to && !is_public_entrypoint(&dependency.to.0, context.config) {
+            if from != to
+                && !is_public_entrypoint(&dependency.to.0, to, context.config, &public_entries)
+            {
                 sink.emit(dependency_diagnostic(
                     FEATURE.id,
                     &format!("Feature `{from}` imports the internals of feature `{to}`"),
@@ -222,8 +241,14 @@ impl Rule for PrivateImportRule {
                 .private_segments
                 .iter()
                 .any(|segment| target.split('/').any(|part| part == segment));
-            let cross_feature = matches!((context.module_features.get(&dependency.from), context.module_features.get(&dependency.to)), (Some(from), Some(to)) if from != to);
-            if private && !cross_feature {
+            let importer_feature = context.module_features.get(&dependency.from);
+            let target_feature = context.module_features.get(&dependency.to);
+            let outside_owner = match (importer_feature, target_feature) {
+                (Some(from), Some(to)) => from != to,
+                (_, Some(_)) => true,
+                _ => false,
+            };
+            if private && outside_owner {
                 sink.emit(dependency_diagnostic(
                     PRIVATE.id,
                     "Private module imported outside its public API",
@@ -245,6 +270,7 @@ fn dependency_diagnostic(
     let mut diagnostic = Diagnostic::new(rule, message);
     diagnostic.primary_location = Some(dependency.location.clone());
     diagnostic.dependency_path = vec![dependency.from.clone(), dependency.to.clone()];
+    diagnostic.metadata.insert("dependencyKind".into(), format!("{:?}", dependency.kind));
     diagnostic.suggestion = Some(suggestion.into());
     diagnostic
 }
@@ -256,12 +282,108 @@ fn edge_location(project: &Project, from: &ModuleId, to: &ModuleId) -> Option<So
         .find(|edge| &edge.from == from && &edge.to == to)
         .map(|edge| edge.location.clone())
 }
-fn path_matches(path: &str, pattern: &str) -> bool {
-    let needle = pattern.trim_matches('*');
-    needle.is_empty() || path.contains(needle)
+fn compile_matcher(pattern: &str) -> Result<GlobMatcher, String> {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|error| error.to_string())
 }
-fn is_public_entrypoint(path: &str, config: &Config) -> bool {
+fn is_public_entrypoint(
+    path: &str,
+    feature: &str,
+    config: &Config,
+    entries: &[GlobMatcher],
+) -> bool {
     let normalized = path.replace('\\', "/");
-    let name = normalized.rsplit('/').next().unwrap_or(path);
-    config.architecture.features.public_entrypoints.iter().any(|entry| entry == name)
+    let feature_root = config.architecture.features.root.trim_matches('/').replace('\\', "/");
+    let prefix = format!("{feature_root}/{feature}/");
+    normalized
+        .strip_prefix(&prefix)
+        .is_some_and(|relative| entries.iter().any(|entry| entry.is_match(relative)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wae_core::domain::{Dependency, DependencyKind, Project, SourceLocation};
+
+    fn dependency(from: &str, to: &str) -> Dependency {
+        Dependency {
+            from: ModuleId(from.into()),
+            to: ModuleId(to.into()),
+            kind: DependencyKind::Static,
+            location: SourceLocation { file: from.into(), line: 1, column: 1 },
+        }
+    }
+
+    fn context<'a>(
+        project: &'a Project,
+        graph: &'a ModuleGraph,
+        config: &'a Config,
+        features: &'a HashMap<ModuleId, String>,
+    ) -> RuleContext<'a> {
+        RuleContext {
+            project,
+            graph,
+            config,
+            module_layers: Box::leak(Box::new(HashMap::new())),
+            module_features: features,
+        }
+    }
+
+    #[test]
+    fn private_modules_are_allowed_inside_their_own_feature() {
+        let edge = dependency("src/features/user/internal/a.ts", "src/features/user/internal/b.ts");
+        let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
+        let graph = ModuleGraph::from_project(&project);
+        let config = Config::default();
+        let features = HashMap::from([(edge.from, "user".into()), (edge.to, "user".into())]);
+        let mut diagnostics = Vec::new();
+        PrivateImportRule
+            .evaluate(&context(&project, &graph, &config, &features), &mut diagnostics)
+            .unwrap();
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn private_modules_are_rejected_outside_their_owner() {
+        let edge =
+            dependency("src/features/payment/service.ts", "src/features/user/internal/token.ts");
+        let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
+        let graph = ModuleGraph::from_project(&project);
+        let config = Config::default();
+        let features = HashMap::from([(edge.from, "payment".into()), (edge.to, "user".into())]);
+        let mut diagnostics = Vec::new();
+        PrivateImportRule
+            .evaluate(&context(&project, &graph, &config, &features), &mut diagnostics)
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn only_the_feature_root_entrypoint_is_public() {
+        let config = Config::default();
+        let public = config
+            .architecture
+            .features
+            .public_entrypoints
+            .iter()
+            .map(|entry| compile_matcher(entry).unwrap())
+            .collect::<Vec<_>>();
+        assert!(is_public_entrypoint("src/features/user/index.ts", "user", &config, &public,));
+        assert!(!is_public_entrypoint(
+            "src/features/user/internal/index.ts",
+            "user",
+            &config,
+            &public,
+        ));
+    }
+
+    #[test]
+    fn forbidden_dependency_patterns_use_real_glob_semantics() {
+        let exact = compile_matcher("src/shared/*.ts").unwrap();
+        assert!(exact.is_match("src/shared/util.ts"));
+        assert!(!exact.is_match("src/shared/deep/util.ts"));
+    }
 }

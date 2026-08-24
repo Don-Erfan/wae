@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 wae-core = { path = "../core" }
-regex.workspace = true
+serde_json.workspace = true
 tree-sitter.workspace = true
 tree-sitter-typescript.workspace = true

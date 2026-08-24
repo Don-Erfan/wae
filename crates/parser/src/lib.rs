@@ -1,6 +1,4 @@
-use std::sync::LazyLock;
-
-use regex::Regex;
+use tree_sitter::{Node, Parser, Tree};
 use wae_core::domain::{
     Import, ImportKind, ModuleId, ModulePath, ParseError, ParseErrorKind, SourceLocation,
 };
@@ -13,25 +11,9 @@ pub trait ParserAdapter: Send + Sync {
     ) -> Result<Vec<Import>, ParseError>;
 }
 
-/// A dependency-oriented JS/TS syntax adapter. It deliberately extracts only module
-/// declarations and call expressions required by the architecture IR.
+/// Dependency-oriented JS/TS adapter backed entirely by the Tree-sitter AST.
 #[derive(Debug, Default)]
 pub struct JsTsParser;
-
-static STATIC_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)\bimport\s+(type\s+)?(?:[^;'\"\n]*?\s+from\s+)?['\"]([^'\"]+)['\"]"#)
-        .expect("valid import regex")
-});
-static RE_EXPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)\bexport\s+(?:type\s+)?(?:\*|\{[^}]*\})\s+from\s+['\"]([^'\"]+)['\"]"#)
-        .expect("valid export regex")
-});
-static DYNAMIC_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bimport\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"#).expect("valid dynamic import regex")
-});
-static REQUIRE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\brequire\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"#).expect("valid require regex")
-});
 
 impl ParserAdapter for JsTsParser {
     fn parse_imports(
@@ -39,48 +21,12 @@ impl ParserAdapter for JsTsParser {
         module_path: &ModulePath,
         source: &str,
     ) -> Result<Vec<Import>, ParseError> {
-        validate_syntax(module_path, source)?;
-        let searchable = mask_comments(source)?;
+        let tree = parse_tree(module_path, source)?;
         let mut imports = Vec::new();
-
-        for captures in STATIC_IMPORT.captures_iter(&searchable) {
-            let Some(specifier) = captures.get(2) else { continue };
-            let kind =
-                if captures.get(1).is_some() { ImportKind::TypeOnly } else { ImportKind::Static };
-            imports.push(make_import(
-                module_path,
-                source,
-                specifier.as_str(),
-                specifier.start(),
-                kind,
-            ));
-        }
-        collect_calls(
-            &mut imports,
-            &DYNAMIC_IMPORT,
-            module_path,
-            source,
-            &searchable,
-            ImportKind::Dynamic,
-        );
-        collect_calls(
-            &mut imports,
-            &REQUIRE,
-            module_path,
-            source,
-            &searchable,
-            ImportKind::Require,
-        );
-        collect_calls(
-            &mut imports,
-            &RE_EXPORT,
-            module_path,
-            source,
-            &searchable,
-            ImportKind::ReExport,
-        );
-
-        imports.sort_by_key(|import| (import.location.line, import.location.column));
+        collect_dependencies(tree.root_node(), module_path, source, &mut imports);
+        imports.sort_by_key(|import| {
+            (import.location.line, import.location.column, import.specifier.clone())
+        });
         imports.dedup_by(|a, b| {
             a.specifier == b.specifier && a.location == b.location && a.kind == b.kind
         });
@@ -88,8 +34,8 @@ impl ParserAdapter for JsTsParser {
     }
 }
 
-fn validate_syntax(module_path: &ModulePath, source: &str) -> Result<(), ParseError> {
-    let mut parser = tree_sitter::Parser::new();
+fn parse_tree(module_path: &ModulePath, source: &str) -> Result<Tree, ParseError> {
+    let mut parser = Parser::new();
     let tsx = matches!(
         std::path::Path::new(&module_path.0).extension().and_then(|value| value.to_str()),
         Some("tsx" | "jsx")
@@ -109,22 +55,31 @@ fn validate_syntax(module_path: &ModulePath, source: &str) -> Result<(), ParseEr
         message: "parser did not produce a syntax tree".into(),
         location: None,
     })?;
-    if tree.root_node().has_error() {
-        let point = first_error(tree.root_node()).map(|node| node.start_position());
+    if tree.root_node().has_error() && !valid_with_import_attributes(&mut parser, source) {
+        let error_node = first_error(tree.root_node());
         return Err(ParseError {
             kind: ParseErrorKind::MalformedSource,
             message: "malformed JavaScript/TypeScript source".into(),
-            location: point.map(|point| SourceLocation {
-                file: module_path.0.clone(),
-                line: point.row + 1,
-                column: point.column + 1,
-            }),
+            location: error_node
+                .map(|node| source_location(module_path, source, node.start_byte())),
         });
     }
-    Ok(())
+    Ok(tree)
 }
 
-fn first_error(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+fn valid_with_import_attributes(parser: &mut Parser, source: &str) -> bool {
+    if !source.contains(" with {") {
+        return false;
+    }
+    // v0.23 of the upstream TypeScript grammar recognizes the legacy `assert`
+    // spelling but not its standards-track `with` replacement. This secondary
+    // parse validates the equivalent grammar while extraction still uses the
+    // original tree, preserving exact source positions.
+    let compatible = source.replace(" with {", " assert {");
+    parser.parse(&compatible, None).is_some_and(|tree| !tree.root_node().has_error())
+}
+
+fn first_error(node: Node<'_>) -> Option<Node<'_>> {
     if node.is_error() || node.is_missing() {
         return Some(node);
     }
@@ -132,117 +87,103 @@ fn first_error(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     node.children(&mut cursor).find_map(first_error)
 }
 
-fn collect_calls(
-    output: &mut Vec<Import>,
-    regex: &Regex,
-    path: &ModulePath,
+fn collect_dependencies(
+    node: Node<'_>,
+    module_path: &ModulePath,
     source: &str,
-    searchable: &str,
+    output: &mut Vec<Import>,
+) {
+    match node.kind() {
+        "import_statement" => {
+            if let Some(specifier) = node.child_by_field_name("source") {
+                let prefix = &source[node.start_byte()..specifier.start_byte()];
+                let kind = if prefix.split_whitespace().take(2).eq(["import", "type"]) {
+                    ImportKind::TypeOnly
+                } else {
+                    ImportKind::Static
+                };
+                push_string_import(output, module_path, source, specifier, kind);
+            }
+            return;
+        }
+        "export_statement" => {
+            if let Some(specifier) = node.child_by_field_name("source") {
+                push_string_import(output, module_path, source, specifier, ImportKind::ReExport);
+            }
+            return;
+        }
+        "call_expression" => collect_call(node, module_path, source, output),
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_dependencies(child, module_path, source, output);
+    }
+}
+
+fn collect_call(node: Node<'_>, module_path: &ModulePath, source: &str, output: &mut Vec<Import>) {
+    let Some(function) = node.child_by_field_name("function") else { return };
+    let kind = match function.utf8_text(source.as_bytes()).ok() {
+        Some("import") => ImportKind::Dynamic,
+        Some("require") if function.kind() == "identifier" => ImportKind::Require,
+        _ => return,
+    };
+    let Some(arguments) = node.child_by_field_name("arguments") else { return };
+    let mut cursor = arguments.walk();
+    let mut named = arguments.named_children(&mut cursor);
+    let Some(argument) = named.next() else { return };
+    // Only literal module specifiers are statically resolvable. Expressions and
+    // template substitutions intentionally do not become graph edges.
+    if named.next().is_none() && argument.kind() == "string" {
+        push_string_import(output, module_path, source, argument, kind);
+    }
+}
+
+fn push_string_import(
+    output: &mut Vec<Import>,
+    module_path: &ModulePath,
+    source: &str,
+    string_node: Node<'_>,
     kind: ImportKind,
 ) {
-    for captures in regex.captures_iter(searchable) {
-        if let Some(specifier) = captures.get(1) {
-            output.push(make_import(
-                path,
-                source,
-                specifier.as_str(),
-                specifier.start(),
-                kind.clone(),
-            ));
-        }
-    }
-}
-
-fn make_import(
-    path: &ModulePath,
-    source: &str,
-    specifier: &str,
-    byte_offset: usize,
-    kind: ImportKind,
-) -> Import {
-    let (line, column) = line_column(source, byte_offset);
-    Import {
-        module_id: ModuleId(path.0.clone()),
-        specifier: specifier.to_string(),
+    let Ok(raw) = string_node.utf8_text(source.as_bytes()) else { return };
+    let Some(specifier) = decode_string_literal(raw) else { return };
+    output.push(Import {
+        module_id: ModuleId(module_path.0.clone()),
+        specifier,
         kind,
-        location: SourceLocation { file: path.0.clone(), line, column },
-    }
+        location: source_location(module_path, source, string_node.start_byte() + 1),
+    });
 }
 
-fn line_column(source: &str, byte_offset: usize) -> (usize, usize) {
+fn source_location(module_path: &ModulePath, source: &str, byte_offset: usize) -> SourceLocation {
     let prefix = &source[..byte_offset.min(source.len())];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let column = prefix
         .rsplit_once('\n')
-        .map_or(prefix.chars().count() + 1, |(_, tail)| tail.chars().count() + 1);
-    (line, column)
+        .map_or_else(|| prefix.chars().count() + 1, |(_, tail)| tail.chars().count() + 1);
+    SourceLocation { file: module_path.0.clone(), line, column }
 }
 
-fn mask_comments(source: &str) -> Result<String, ParseError> {
-    let bytes = source.as_bytes();
-    let mut result = bytes.to_vec();
-    let mut index = 0;
-    let mut quote = None;
-    while index < bytes.len() {
-        if let Some(delimiter) = quote {
-            if bytes[index] == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
-            }
-            if bytes[index] == delimiter {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if matches!(bytes[index], b'\'' | b'"' | b'`') {
-            quote = Some(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            result[index] = b' ';
-            result[index + 1] = b' ';
-            index += 2;
-            while index < bytes.len() && bytes[index] != b'\n' {
-                result[index] = b' ';
-                index += 1;
-            }
-            continue;
-        }
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            result[index] = b' ';
-            result[index + 1] = b' ';
-            index += 2;
-            let mut closed = false;
-            while index < bytes.len() {
-                if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
-                    result[index] = b' ';
-                    result[index + 1] = b' ';
-                    index += 2;
-                    closed = true;
-                    break;
-                }
-                if bytes[index] != b'\n' {
-                    result[index] = b' ';
-                }
-                index += 1;
-            }
-            if !closed {
-                return Err(parse_error("unterminated block comment"));
-            }
-            continue;
-        }
-        index += 1;
+fn decode_string_literal(raw: &str) -> Option<String> {
+    let quote = raw.as_bytes().first().copied()?;
+    if raw.as_bytes().last().copied()? != quote || !matches!(quote, b'\'' | b'"') {
+        return None;
     }
-    if quote.is_some() {
-        return Err(parse_error("unterminated string literal"));
+    let content = &raw[1..raw.len() - 1];
+    if quote == b'"' {
+        serde_json::from_str(raw).ok()
+    } else {
+        Some(
+            content
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t"),
+        )
     }
-    String::from_utf8(result).map_err(|_| parse_error("source is not valid UTF-8"))
-}
-
-fn parse_error(message: &str) -> ParseError {
-    ParseError { kind: ParseErrorKind::MalformedSource, message: message.into(), location: None }
 }
 
 #[cfg(test)]
@@ -250,11 +191,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_all_supported_dependency_forms_and_ignores_comments() {
+    fn extracts_supported_dependency_nodes_from_the_ast() {
         let source = r#"
 import value from './static';
 import type { T } from "./types";
 export * from './reexport';
+export { value as other } from "./named";
+import data from "./data.json" assert { type: "json" };
+import modern from "./modern.json" with { type: "json" };
 const lazy = import('./lazy');
 const legacy = require('./legacy');
 // import nope from './comment';
@@ -262,10 +206,49 @@ const legacy = require('./legacy');
         let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
         assert_eq!(
             imports.iter().map(|i| i.specifier.as_str()).collect::<Vec<_>>(),
-            vec!["./static", "./types", "./reexport", "./lazy", "./legacy"]
+            vec![
+                "./static",
+                "./types",
+                "./reexport",
+                "./named",
+                "./data.json",
+                "./modern.json",
+                "./lazy",
+                "./legacy",
+            ]
         );
         assert_eq!(imports[1].kind, ImportKind::TypeOnly);
         assert_eq!(imports[2].kind, ImportKind::ReExport);
+    }
+
+    #[test]
+    fn ignores_dependency_text_in_strings_templates_regex_and_member_calls() {
+        let source = r#"
+const text = "import value from './fake-string'";
+const template = `require('./fake-template') ${value}`;
+const regex = /import.*fake-regex/;
+loader.require('./fake-member');
+const expression = import(`./locale/${locale}`);
+"#;
+        let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
+        assert!(imports.is_empty());
+    }
+
+    #[test]
+    fn handles_multiline_tsx_and_literal_dynamic_imports() {
+        let source = r#"
+import {
+  Button,
+} from './button';
+const view = <Button />;
+const page = import(
+  "./page"
+);
+"#;
+        let imports = JsTsParser.parse_imports(&ModulePath("src/view.tsx".into()), source).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].specifier, "./button");
+        assert_eq!(imports[1].specifier, "./page");
     }
 
     #[test]
@@ -275,5 +258,13 @@ const legacy = require('./legacy');
             .unwrap_err();
         assert_eq!(error.kind, ParseErrorKind::MalformedSource);
         assert_eq!(error.location.unwrap().line, 1);
+    }
+
+    #[test]
+    fn reports_unicode_columns_in_characters_not_utf8_bytes() {
+        let source = "const label = 'سلام'; const page = import('./page');";
+        let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
+        let byte = source.find("./page").unwrap();
+        assert_eq!(imports[0].location.column, source[..byte].chars().count() + 1);
     }
 }

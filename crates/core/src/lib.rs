@@ -168,15 +168,9 @@ pub mod domain {
         pub next: Option<NextMetadata>,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum Layer {
-        App,
-        Features,
-        Entities,
-        Shared,
-        Infrastructure,
-        Unknown,
-    }
+    /// Open layer identity; configured layer names remain first-class in the IR.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub struct LayerId(pub String);
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct LayerPolicy {
@@ -248,7 +242,7 @@ pub mod domain {
         External,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub enum DependencyKind {
         Static,
         Dynamic,
@@ -293,7 +287,7 @@ pub mod domain {
         pub package: PackageName,
         pub kind: ModuleKind,
         pub runtime: Runtime,
-        pub layer: Layer,
+        pub layer: Option<LayerId>,
         pub framework_metadata: FrameworkMetadata,
     }
 
@@ -348,6 +342,23 @@ pub mod domain {
         pub location: SourceLocation,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DependencyTarget {
+        Internal(ModuleId),
+        WorkspacePackage { package: PackageName, module: ModuleId },
+        ExternalPackage(PackageName),
+        Unresolved { specifier: String, reason: String },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ResolvedDependency {
+        pub from: ModuleId,
+        pub specifier: String,
+        pub kind: DependencyKind,
+        pub target: DependencyTarget,
+        pub location: SourceLocation,
+    }
+
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Project {
         pub workspace: Option<Workspace>,
@@ -357,6 +368,7 @@ pub mod domain {
         pub exports: Vec<Export>,
         pub dependency_candidates: Vec<DependencyCandidate>,
         pub dependencies: Vec<Dependency>,
+        pub resolved_dependencies: Vec<ResolvedDependency>,
         pub diagnostics: Vec<Diagnostic>,
     }
 
@@ -369,6 +381,7 @@ pub mod domain {
         exports: Vec<Export>,
         dependency_candidates: Vec<DependencyCandidate>,
         dependencies: Vec<Dependency>,
+        resolved_dependencies: Vec<ResolvedDependency>,
         diagnostics: Vec<Diagnostic>,
     }
 
@@ -416,6 +429,11 @@ pub mod domain {
             self
         }
 
+        pub fn add_resolved_dependency(mut self, dependency: ResolvedDependency) -> Self {
+            self.resolved_dependencies.push(dependency);
+            self
+        }
+
         pub fn add_diagnostic(mut self, diagnostic: Diagnostic) -> Self {
             self.diagnostics.push(diagnostic);
             self
@@ -430,6 +448,7 @@ pub mod domain {
                 exports: self.exports,
                 dependency_candidates: self.dependency_candidates,
                 dependencies: self.dependencies,
+                resolved_dependencies: self.resolved_dependencies,
                 diagnostics: self.diagnostics,
             }
         }
@@ -437,7 +456,7 @@ pub mod domain {
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Diagnostic {
-        /// Stable identity derived from the rule and canonical involved locations.
+        /// Stable semantic identity derived from the rule and involved modules.
         pub fingerprint: String,
         pub rule_id: RuleId,
         pub severity: Severity,
@@ -458,17 +477,21 @@ pub mod domain {
         /// across processes and Rust releases, which makes baseline files portable.
         pub fn refresh_fingerprint(&mut self) {
             let mut identity = self.rule_id.0.clone();
-            if let Some(location) = &self.primary_location {
-                identity.push('|');
-                identity.push_str(&location.file.replace('\\', "/"));
-                identity.push(':');
-                identity.push_str(&location.line.to_string());
-                identity.push(':');
-                identity.push_str(&location.column.to_string());
+            if self.dependency_path.is_empty() {
+                if let Some(location) = &self.primary_location {
+                    identity.push('|');
+                    identity.push_str(&location.file.replace('\\', "/"));
+                }
             }
             for module in &self.dependency_path {
                 identity.push('|');
                 identity.push_str(&module.0.replace('\\', "/"));
+            }
+            for (key, value) in &self.metadata {
+                identity.push('|');
+                identity.push_str(key);
+                identity.push('=');
+                identity.push_str(value);
             }
 
             let mut hash = 0xcbf29ce484222325_u64;
@@ -481,33 +504,17 @@ pub mod domain {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AnalyzeRequest {
-    pub project_root: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AnalyzeOutput {
-    pub schema_version: u32,
-    pub module_count: usize,
-    pub diagnostics: Vec<domain::Diagnostic>,
-}
-
-pub trait Analyzer {
-    fn analyze(&self, request: &AnalyzeRequest) -> AnalyzeOutput;
-}
-
 #[cfg(test)]
 mod tests {
     use super::banner_lines;
     use crate::domain::{
-        ArchitectureModel, Dependency, DependencyKind, FrameworkMetadata, Layer, LayerPolicy,
+        ArchitectureModel, Dependency, DependencyKind, FrameworkMetadata, LayerId, LayerPolicy,
         Module, ModuleId, ModuleKind, ModulePath, Package, PackageName, ProjectBuilder, Runtime,
     };
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.5"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.6"]);
     }
 
     #[test]
@@ -521,7 +528,7 @@ mod tests {
             package: package.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::Features,
+            layer: Some(LayerId("features".into())),
             framework_metadata: FrameworkMetadata::default(),
         };
 
@@ -531,7 +538,7 @@ mod tests {
             package: package.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::Features,
+            layer: Some(LayerId("features".into())),
             framework_metadata: FrameworkMetadata::default(),
         };
 
@@ -541,7 +548,7 @@ mod tests {
             package: package.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::Features,
+            layer: Some(LayerId("features".into())),
             framework_metadata: FrameworkMetadata::default(),
         };
 
@@ -601,5 +608,20 @@ mod tests {
         assert!(model.can_import("entities", "shared"));
         assert!(model.can_import("shared", "shared"));
         assert!(!model.can_import("shared", "entities"));
+    }
+
+    #[test]
+    fn diagnostic_fingerprint_does_not_change_when_lines_move() {
+        use crate::domain::{Diagnostic, ModuleId, SourceLocation};
+        let mut first = Diagnostic::new("ARCH-003", "Layer violation");
+        first.primary_location =
+            Some(SourceLocation { file: "src/app.ts".into(), line: 10, column: 3 });
+        first.dependency_path =
+            vec![ModuleId("src/app.ts".into()), ModuleId("src/shared.ts".into())];
+        first.refresh_fingerprint();
+        let mut moved = first.clone();
+        moved.primary_location.as_mut().unwrap().line = 200;
+        moved.refresh_fingerprint();
+        assert_eq!(first.fingerprint, moved.fingerprint);
     }
 }

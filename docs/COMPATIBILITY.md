@@ -14,6 +14,7 @@
 
 - `Config schema`: versioned (`version: 1`)
 - `JSON output schema`: versioned (`schemaVersion: 1`)
+- `Baseline schema`: writer uses version 2; readers migrate version 1
 - `Rule IDs`: پایدار در minor/patch؛ تغییر breaking فقط در major
 - `CLI exit codes`: پایدار و contract-based
 
@@ -30,11 +31,13 @@
 
 - single package
 - workspace monorepoهای رایج (تا سطح policyهای MVP)
+- npm/yarn/pnpm-style package manifests, package `exports` and `imports`
 
 ### module system
 
 - ESM
 - CommonJS (پوشش MVP resolver)
+- JSONC `tsconfig.json`, relative `extends`, `baseUrl`, and longest-match `paths`
 
 ## 4) ماتریس سازگاری هدف (Beta → v1)
 

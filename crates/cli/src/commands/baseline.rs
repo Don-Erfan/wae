@@ -1,27 +1,80 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::Diagnostic;
 
+const BASELINE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaselineFile<'a> {
+    schema_version: u32,
+    created_at_unix: u64,
+    entries: Vec<BaselineEntry<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BaselineEntry<'a> {
+    fingerprint: &'a str,
+    rule_id: &'a str,
+    source: Option<&'a str>,
+    target: Option<&'a str>,
+    reason: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredBaseline {
+    schema_version: u32,
+    #[serde(default)]
+    fingerprints: Vec<String>,
+    #[serde(default)]
+    entries: Vec<StoredEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredEntry {
+    fingerprint: String,
+}
+
 pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<PathBuf, String> {
-    let config = Config::load(root).map_err(|e| e.message)?;
+    let config = Config::load(root).map_err(|error| error.message)?;
     let path = root.join(config.baseline.file);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let fingerprints = diagnostics.iter().map(|d| d.fingerprint.as_str()).collect::<BTreeSet<_>>();
-    let contents =
-        serde_json::to_string_pretty(&json!({ "schemaVersion": 1, "fingerprints": fingerprints }))
-            .map_err(|e| e.to_string())?;
-    fs::write(&path, contents).map_err(|e| e.to_string())?;
+    let mut sorted = diagnostics.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
+    sorted.dedup_by(|left, right| left.fingerprint == right.fingerprint);
+    let entries = sorted
+        .into_iter()
+        .map(|diagnostic| BaselineEntry {
+            fingerprint: &diagnostic.fingerprint,
+            rule_id: &diagnostic.rule_id.0,
+            source: diagnostic.dependency_path.first().map(|module| module.0.as_str()),
+            target: diagnostic.dependency_path.get(1).map(|module| module.0.as_str()),
+            reason: None,
+        })
+        .collect();
+    let created_at_unix =
+        SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs();
+    let contents = serde_json::to_string_pretty(&BaselineFile {
+        schema_version: BASELINE_SCHEMA_VERSION,
+        created_at_unix,
+        entries,
+    })
+    .map_err(|error| error.to_string())?;
+    fs::write(&path, format!("{contents}\n")).map_err(|error| error.to_string())?;
     Ok(path)
 }
 
 pub fn load(root: &Path) -> Result<HashSet<String>, String> {
-    let config = Config::load(root).map_err(|e| e.message)?;
+    let config = Config::load(root).map_err(|error| error.message)?;
     let path = root.join(config.baseline.file);
     if !path.exists() {
         return Err(format!(
@@ -29,16 +82,52 @@ pub fn load(root: &Path) -> Result<HashSet<String>, String> {
             path.display()
         ));
     }
-    let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let value: serde_json::Value =
-        serde_json::from_str(&source).map_err(|e| format!("invalid baseline: {e}"))?;
-    if value["schemaVersion"].as_u64() != Some(1) {
-        return Err("unsupported baseline schema version".into());
+    let source = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let stored: StoredBaseline =
+        serde_json::from_str(&source).map_err(|error| format!("invalid baseline: {error}"))?;
+    match stored.schema_version {
+        1 => Ok(stored.fingerprints.into_iter().collect()),
+        BASELINE_SCHEMA_VERSION => {
+            Ok(stored.entries.into_iter().map(|entry| entry.fingerprint).collect())
+        }
+        version => Err(format!("unsupported baseline schema version `{version}`")),
     }
-    Ok(value["fingerprints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wae_core::domain::{ModuleId, SourceLocation};
+
+    #[test]
+    fn saves_auditable_v2_entries_and_loads_them() {
+        let root = std::env::temp_dir().join(format!("wae-baseline-v2-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut diagnostic = Diagnostic::new("ARCH-003", "layer");
+        diagnostic.primary_location =
+            Some(SourceLocation { file: "src/app.ts".into(), line: 1, column: 1 });
+        diagnostic.dependency_path =
+            vec![ModuleId("src/app.ts".into()), ModuleId("src/shared.ts".into())];
+        diagnostic.refresh_fingerprint();
+        save(&root, &[diagnostic.clone()]).unwrap();
+        let source = fs::read_to_string(root.join(".wae/baseline.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&source).unwrap();
+        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["entries"][0]["ruleId"], "ARCH-003");
+        assert!(load(&root).unwrap().contains(&diagnostic.fingerprint));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_v1_fingerprint_arrays_on_read() {
+        let root = std::env::temp_dir().join(format!("wae-baseline-v1-{}", std::process::id()));
+        fs::create_dir_all(root.join(".wae")).unwrap();
+        fs::write(
+            root.join(".wae/baseline.json"),
+            r#"{"schemaVersion":1,"fingerprints":["legacy"]}"#,
+        )
+        .unwrap();
+        assert!(load(&root).unwrap().contains("legacy"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

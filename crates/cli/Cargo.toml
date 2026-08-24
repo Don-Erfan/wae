@@ -10,3 +10,4 @@ wae-config = { path = "../config" }
 wae-engine = { path = "../engine" }
 wae-reporters = { path = "../reporters" }
 serde_json.workspace = true
+serde.workspace = true

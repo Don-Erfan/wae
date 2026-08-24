@@ -2,16 +2,21 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::{
-    Dependency, Diagnostic, FrameworkMetadata, Layer, Module, ModuleId, ModuleKind, ModulePath,
-    Package, PackageName, Project, Runtime, Severity, SourceLocation,
+    Dependency, DependencyTarget, Diagnostic, FrameworkMetadata, LayerId, Module, ModuleId,
+    ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime, Severity,
+    SourceLocation,
 };
 use wae_graph::ModuleGraph;
 use wae_parser::{JsTsParser, ParserAdapter};
-use wae_resolver::{ModuleResolver, PathAlias, Resolution, ResolverPipeline};
+use wae_resolver::{
+    ModuleResolver, Resolution, ResolverPipeline, TsConfigLoader, WorkspacePackage,
+    WorkspaceResolver,
+};
 use wae_rules::{RuleContext, RuleSet};
 
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
@@ -64,26 +69,35 @@ impl<P: ParserAdapter> Engine<P> {
             .canonicalize()
             .map_err(|e| AnalysisError::Project(format!("cannot open project root: {e}")))?;
         let config = Config::load(&root).map_err(AnalysisError::Config)?;
+        let architecture = CompiledArchitectureModel::compile(&config)?;
         let files = discover_modules(&root, &config)?;
-        let aliases = load_aliases(&root);
-        let resolver = ResolverPipeline::node_defaults(aliases.0, aliases.1);
+        let tsconfig = TsConfigLoader::load(&root).map_err(AnalysisError::Project)?;
+        let workspace_resolver =
+            WorkspaceResolver::discover(&root).map_err(AnalysisError::Project)?;
+        let workspace_packages = workspace_resolver.packages().to_vec();
+        let resolver = ResolverPipeline::node_with_workspaces(
+            tsconfig.base_url,
+            tsconfig.aliases,
+            workspace_resolver,
+        );
         let default_package =
             Package { name: PackageName(project_name(&root)), root_path: normalize(&root) };
         let mut project = Project::default();
         let mut discovered_packages = HashMap::<PackageName, Package>::new();
         let mut layers = HashMap::new();
         let mut features = HashMap::new();
+        let mut cache = AnalysisCache::load(&root, &config)?;
 
         for path in &files {
             let relative = relative_path(&root, path);
             let id = ModuleId(relative.clone());
-            let package = infer_package(&root, &relative, &default_package);
+            let package = infer_package(&root, path, &workspace_packages, &default_package);
             discovered_packages.entry(package.name.clone()).or_insert_with(|| package.clone());
-            let layer_name = infer_layer(&relative, &config);
+            let layer_name = architecture.layer(&relative);
             if let Some(value) = &layer_name {
                 layers.insert(id.clone(), value.clone());
             }
-            if let Some(value) = infer_feature(&relative) {
+            if let Some(value) = architecture.feature(&relative) {
                 features.insert(id.clone(), value);
             }
             project.modules.push(Module {
@@ -92,7 +106,7 @@ impl<P: ParserAdapter> Engine<P> {
                 package: package.name.clone(),
                 kind: ModuleKind::Source,
                 runtime: Runtime::Universal,
-                layer: compatibility_layer(layer_name.as_deref()),
+                layer: layer_name.map(LayerId),
                 framework_metadata: FrameworkMetadata::default(),
             });
         }
@@ -114,7 +128,15 @@ impl<P: ParserAdapter> Engine<P> {
                     continue;
                 }
             };
-            match self.parser.parse_imports(&module_path, &source) {
+            let source_hash = stable_hash(source.as_bytes());
+            let parsed = cache
+                .get(&module_id.0, source_hash)
+                .map(Ok)
+                .unwrap_or_else(|| self.parser.parse_imports(&module_path, &source));
+            if let Ok(imports) = &parsed {
+                cache.insert(module_id.0.clone(), source_hash, imports.clone());
+            }
+            match parsed {
                 Ok(imports) => {
                     for mut import in imports {
                         import.module_id = module_id.clone();
@@ -123,9 +145,31 @@ impl<P: ParserAdapter> Engine<P> {
                             Resolution::Module(target) => {
                                 let candidate =
                                     wae_core::domain::DependencyCandidate::from(import.clone());
+                                let target_id =
+                                    ModuleId(relative_path(&root, Path::new(&target.0)));
+                                let target_kind = workspace_packages
+                                    .iter()
+                                    .filter(|package| {
+                                        Path::new(&target.0).starts_with(&package.root)
+                                    })
+                                    .max_by_key(|package| package.root.components().count())
+                                    .map_or_else(
+                                        || DependencyTarget::Internal(target_id.clone()),
+                                        |package| DependencyTarget::WorkspacePackage {
+                                            package: PackageName(package.name.clone()),
+                                            module: target_id.clone(),
+                                        },
+                                    );
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind.clone(),
+                                    target: target_kind,
+                                    location: import.location.clone(),
+                                });
                                 project.dependencies.push(Dependency {
                                     from: module_id.clone(),
-                                    to: ModuleId(relative_path(&root, Path::new(&target.0))),
+                                    to: target_id,
                                     kind: candidate.kind,
                                     location: import.location.clone(),
                                 });
@@ -140,7 +184,7 @@ impl<P: ParserAdapter> Engine<P> {
                                         package: external_package.clone(),
                                         kind: ModuleKind::External,
                                         runtime: Runtime::Unknown,
-                                        layer: Layer::Unknown,
+                                        layer: None,
                                         framework_metadata: FrameworkMetadata::default(),
                                     });
                                     if !project
@@ -156,6 +200,13 @@ impl<P: ParserAdapter> Engine<P> {
                                 }
                                 let candidate =
                                     wae_core::domain::DependencyCandidate::from(import.clone());
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind.clone(),
+                                    target: DependencyTarget::ExternalPackage(PackageName(name)),
+                                    location: import.location.clone(),
+                                });
                                 project.dependencies.push(Dependency {
                                     from: module_id.clone(),
                                     to: external_id,
@@ -164,6 +215,20 @@ impl<P: ParserAdapter> Engine<P> {
                                 });
                             }
                             Resolution::Unresolved => {
+                                let candidate =
+                                    wae_core::domain::DependencyCandidate::from(import.clone());
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind,
+                                    target: DependencyTarget::Unresolved {
+                                        specifier: import.specifier.clone(),
+                                        reason:
+                                            "no resolver in the configured chain produced a module"
+                                                .into(),
+                                    },
+                                    location: import.location.clone(),
+                                });
                                 project.diagnostics.push(unresolved_diagnostic(&import))
                             }
                         }
@@ -183,6 +248,8 @@ impl<P: ParserAdapter> Engine<P> {
             }
         }
 
+        cache.save()?;
+
         project.modules.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         project.dependencies.sort_by(|a, b| (&a.from.0, &a.to.0).cmp(&(&b.from.0, &b.to.0)));
         let graph = ModuleGraph::from_project(&project);
@@ -200,40 +267,141 @@ impl<P: ParserAdapter> Engine<P> {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedImports {
+    hash: u64,
+    imports: Vec<wae_core::domain::Import>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct CacheFile {
+    schema_version: u32,
+    files: std::collections::BTreeMap<String, CachedImports>,
+}
+
+struct AnalysisCache {
+    enabled: bool,
+    path: PathBuf,
+    file: CacheFile,
+}
+
+impl AnalysisCache {
+    fn load(root: &Path, config: &Config) -> Result<Self, AnalysisError> {
+        let path = root.join(&config.cache.directory).join("imports-v1.json");
+        let file = if config.cache.enabled && path.exists() {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|source| serde_json::from_str::<CacheFile>(&source).ok())
+                .filter(|cache| cache.schema_version == 1)
+                .unwrap_or_else(|| CacheFile { schema_version: 1, ..CacheFile::default() })
+        } else {
+            CacheFile { schema_version: 1, ..CacheFile::default() }
+        };
+        Ok(Self { enabled: config.cache.enabled, path, file })
+    }
+
+    fn get(&self, module: &str, hash: u64) -> Option<Vec<wae_core::domain::Import>> {
+        self.enabled
+            .then(|| self.file.files.get(module))
+            .flatten()
+            .filter(|cached| cached.hash == hash)
+            .map(|cached| cached.imports.clone())
+    }
+
+    fn insert(&mut self, module: String, hash: u64, imports: Vec<wae_core::domain::Import>) {
+        if self.enabled {
+            self.file.files.insert(module, CachedImports { hash, imports });
+        }
+    }
+
+    fn save(&self) -> Result<(), AnalysisError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| AnalysisError::Project("cache path has no parent directory".into()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            AnalysisError::Project(format!("cannot create cache directory: {error}"))
+        })?;
+        let temporary = self.path.with_extension(format!("tmp-{}", std::process::id()));
+        let contents = serde_json::to_vec(&self.file)
+            .map_err(|error| AnalysisError::Internal(error.to_string()))?;
+        fs::write(&temporary, contents)
+            .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            if self.path.exists() {
+                fs::remove_file(&self.path).map_err(|remove_error| {
+                    AnalysisError::Project(format!("cannot replace cache: {remove_error}"))
+                })?;
+                fs::rename(&temporary, &self.path).map_err(|rename_error| {
+                    AnalysisError::Project(format!("cannot install cache: {rename_error}"))
+                })?;
+            } else {
+                return Err(AnalysisError::Project(format!("cannot install cache: {error}")));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn discover_modules(root: &Path, config: &Config) -> Result<Vec<PathBuf>, AnalysisError> {
     let include = build_globs(&config.project.include)?;
     let exclude = build_globs(&config.project.exclude)?;
     let mut files = Vec::new();
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .follow_links(config.project.follow_symlinks)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true);
-    for entry in builder.build() {
-        let entry = entry.map_err(|e| AnalysisError::Project(e.to_string()))?;
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
+    for configured_root in &config.project.roots {
+        let scan_root = root.join(configured_root).canonicalize().map_err(|error| {
+            AnalysisError::Project(format!(
+                "cannot open configured project root `{configured_root}`: {error}"
+            ))
+        })?;
+        if !scan_root.starts_with(root) {
+            return Err(AnalysisError::Project(format!(
+                "configured project root `{configured_root}` escapes the project"
+            )));
         }
-        let relative = relative_path(root, entry.path());
-        if !include.is_match(&relative) || exclude.is_match(&relative) {
-            continue;
+        let mut builder = WalkBuilder::new(&scan_root);
+        builder
+            .follow_links(config.project.follow_symlinks)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+        for entry in builder.build() {
+            let entry = entry.map_err(|e| AnalysisError::Project(e.to_string()))?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let relative = relative_path(root, entry.path());
+            if !include.is_match(&relative) || exclude.is_match(&relative) {
+                continue;
+            }
+            let length = entry.metadata().map_err(|e| AnalysisError::Project(e.to_string()))?.len();
+            if length > config.project.max_file_size_kb.saturating_mul(1024) {
+                continue;
+            }
+            files.push(entry.into_path());
         }
-        let length = entry.metadata().map_err(|e| AnalysisError::Project(e.to_string()))?.len();
-        if length > config.project.max_file_size_kb.saturating_mul(1024) {
-            continue;
-        }
-        files.push(entry.into_path());
     }
     files.sort();
+    files.dedup();
     Ok(files)
 }
 
 fn build_globs(patterns: &[String]) -> Result<GlobSet, AnalysisError> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern).map_err(|e| {
+        builder.add(GlobBuilder::new(pattern).literal_separator(true).build().map_err(|e| {
             AnalysisError::Config(wae_core::domain::ConfigError {
                 kind: wae_core::domain::ConfigErrorKind::InvalidPattern,
                 message: e.to_string(),
@@ -244,62 +412,64 @@ fn build_globs(patterns: &[String]) -> Result<GlobSet, AnalysisError> {
     builder.build().map_err(|e| AnalysisError::Internal(e.to_string()))
 }
 
-fn load_aliases(root: &Path) -> (PathBuf, Vec<PathAlias>) {
-    let path = root.join("tsconfig.json");
-    let Ok(source) = fs::read_to_string(path) else { return (root.to_path_buf(), Vec::new()) };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&source) else {
-        return (root.to_path_buf(), Vec::new());
-    };
-    let compiler = &json["compilerOptions"];
-    let base =
-        compiler["baseUrl"].as_str().map_or_else(|| root.to_path_buf(), |value| root.join(value));
-    let aliases = compiler["paths"]
-        .as_object()
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|(pattern, targets)| PathAlias {
-                    pattern: pattern.clone(),
-                    targets: targets
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    (base, aliases)
+struct CompiledArchitectureModel {
+    layers: Vec<(String, GlobSet)>,
+    feature_root: String,
 }
 
-fn infer_layer(path: &str, config: &Config) -> Option<String> {
-    config.architecture.layers.iter().find_map(|(name, layer)| {
-        build_globs(&layer.patterns).ok().filter(|set| set.is_match(path)).map(|_| name.clone())
-    })
-}
-fn infer_feature(path: &str) -> Option<String> {
-    path.split('/')
-        .collect::<Vec<_>>()
-        .windows(2)
-        .rev()
-        .find(|pair| pair[0] == "features")
-        .map(|pair| pair[1].to_string())
-}
-fn compatibility_layer(layer: Option<&str>) -> Layer {
-    match layer {
-        Some("app") => Layer::App,
-        Some("features") => Layer::Features,
-        Some("entities") => Layer::Entities,
-        Some("shared") => Layer::Shared,
-        Some("infrastructure") => Layer::Infrastructure,
-        _ => Layer::Unknown,
+impl CompiledArchitectureModel {
+    fn compile(config: &Config) -> Result<Self, AnalysisError> {
+        let layers = config
+            .architecture
+            .layers
+            .iter()
+            .map(|(name, layer)| Ok((name.clone(), build_globs(&layer.patterns)?)))
+            .collect::<Result<Vec<_>, AnalysisError>>()?;
+        Ok(Self {
+            layers,
+            feature_root: config
+                .architecture
+                .features
+                .root
+                .replace('\\', "/")
+                .trim_matches('/')
+                .to_string(),
+        })
+    }
+
+    fn layer(&self, path: &str) -> Option<String> {
+        self.layers.iter().find_map(|(name, matcher)| matcher.is_match(path).then(|| name.clone()))
+    }
+
+    fn feature(&self, path: &str) -> Option<String> {
+        let prefix = format!("{}/", self.feature_root);
+        path.replace('\\', "/")
+            .strip_prefix(&prefix)
+            .and_then(|relative| relative.split('/').next())
+            .filter(|feature| !feature.is_empty())
+            .map(str::to_owned)
     }
 }
 fn project_name(root: &Path) -> String {
     root.file_name().and_then(|v| v.to_str()).unwrap_or("project").to_string()
 }
-fn infer_package(root: &Path, relative: &str, fallback: &Package) -> Package {
+fn infer_package(
+    root: &Path,
+    path: &Path,
+    packages: &[WorkspacePackage],
+    fallback: &Package,
+) -> Package {
+    if let Some(package) = packages
+        .iter()
+        .filter(|package| path.starts_with(&package.root))
+        .max_by_key(|package| package.root.components().count())
+    {
+        return Package {
+            name: PackageName(package.name.clone()),
+            root_path: normalize(&package.root),
+        };
+    }
+    let relative = relative_path(root, path);
     let parts = relative.split('/').collect::<Vec<_>>();
     if parts.len() >= 2 && matches!(parts[0], "apps" | "packages") {
         let name = format!("{}/{}", parts[0], parts[1]);
@@ -337,6 +507,7 @@ fn unresolved_diagnostic(import: &wae_core::domain::Import) -> Diagnostic {
     diagnostic.severity = Severity::Error;
     diagnostic.primary_location = Some(import.location.clone());
     diagnostic.dependency_path = vec![import.module_id.clone()];
+    diagnostic.metadata.insert("specifier".into(), import.specifier.clone());
     diagnostic.refresh_fingerprint();
     diagnostic
 }
@@ -370,5 +541,40 @@ mod tests {
             };
             assert_eq!(actual, violations, "fixture `{name}` did not match {rule}");
         }
+    }
+
+    #[test]
+    fn configured_roots_limit_discovery() {
+        let root = std::env::temp_dir().join(format!("wae-roots-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::write(root.join("src/good.ts"), "export const good = true;").unwrap();
+        fs::write(root.join("ignored/broken.ts"), "export const broken = ;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nproject:\n  roots: [src]\n  include: ['**/*.ts']\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(analysis.project.modules.len(), 1);
+        assert!(analysis.diagnostics.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enabled_cache_is_persisted_and_reusable() {
+        let root = std::env::temp_dir().join(format!("wae-cache-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.ts"), "export const value = 1;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\ncache:\n  enabled: true\n  directory: .wae/cache\n",
+        )
+        .unwrap();
+        Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let cache = root.join(".wae/cache/imports-v1.json");
+        assert!(cache.is_file());
+        Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

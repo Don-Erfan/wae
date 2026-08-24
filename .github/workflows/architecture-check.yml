@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
@@ -43,7 +43,7 @@ jobs:
           lines = [
               "### WAE Architecture Check", "",
               f"Modules analyzed: {result.get('modules', 0)}",
-              f"Baseline violations: {len(baseline.get('fingerprints', []))}",
+              f"Baseline violations: {len(baseline.get('entries', baseline.get('fingerprints', [])))}",
               f"New affected violations: {len(diagnostics)}", "",
               "✅ No architecture regression." if not diagnostics else "❌ Architecture regression detected.",
           ]

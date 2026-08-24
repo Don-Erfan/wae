@@ -37,6 +37,13 @@ function resolveTarget() {
 
 function downloadFile(url, destination, redirects = 0) {
   return new Promise((resolve, reject) => {
+    let parsedUrl;
+    try {
+      parsedUrl = validateDownloadUrl(url);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const request = https.get(
       url,
       {
@@ -56,7 +63,8 @@ function downloadFile(url, destination, redirects = 0) {
             reject(new Error(`Too many redirects while downloading ${url}`));
             return;
           }
-          downloadFile(response.headers.location, destination, redirects + 1)
+          const redirectUrl = new URL(response.headers.location, url).toString();
+          downloadFile(redirectUrl, destination, redirects + 1)
             .then(resolve)
             .catch(reject);
           return;
@@ -75,8 +83,7 @@ function downloadFile(url, destination, redirects = 0) {
           return;
         }
 
-        const tempPath = `${destination}.tmp`;
-        const stream = fs.createWriteStream(tempPath);
+        const stream = fs.createWriteStream(destination, { flags: "wx" });
         let received = 0;
 
         response.on("data", (chunk) => {
@@ -88,20 +95,16 @@ function downloadFile(url, destination, redirects = 0) {
 
         response.pipe(stream);
 
+        response.on("error", (error) => {
+          stream.destroy();
+          reject(error);
+        });
+
         stream.on("finish", () => {
-          stream.close(() => {
-            fs.rename(tempPath, destination, (error) => {
-              if (error) {
-                reject(error);
-                return;
-              }
-              resolve();
-            });
-          });
+          stream.close(resolve);
         });
 
         stream.on("error", (error) => {
-          fs.rmSync(tempPath, { force: true });
           reject(error);
         });
       }
@@ -112,6 +115,17 @@ function downloadFile(url, destination, redirects = 0) {
       request.destroy(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS}ms`));
     });
   });
+}
+
+function validateDownloadUrl(url) {
+  const parsedUrl = new URL(url);
+  const allowedHost =
+    parsedUrl.hostname === "github.com" ||
+    parsedUrl.hostname.endsWith(".githubusercontent.com");
+  if (parsedUrl.protocol !== "https:" || !allowedHost) {
+    throw new Error(`Refusing download from untrusted URL host: ${parsedUrl.hostname}`);
+  }
+  return parsedUrl;
 }
 
 function sha256(filePath) {
@@ -143,30 +157,46 @@ async function main() {
   const downloadUrl = `https://github.com/${repository}/releases/download/${releaseTag}/${assetName}`;
   const binDir = path.join(__dirname, "..", "bin");
   const binaryPath = path.join(binDir, `wae${extension}`);
-  const checksumPath = `${binaryPath}.sha256`;
+  const nonce = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+  const temporaryBinaryPath = path.join(binDir, `.wae-${nonce}.tmp`);
+  const temporaryChecksumPath = path.join(binDir, `.wae-${nonce}.sha256.tmp`);
 
   fs.mkdirSync(binDir, { recursive: true });
 
-  console.log(`Downloading ${assetName} from ${downloadUrl}`);
-  await downloadFile(downloadUrl, binaryPath);
-  await downloadFile(`${downloadUrl}.sha256`, checksumPath);
+  try {
+    console.log(`Downloading ${assetName} from ${downloadUrl}`);
+    await downloadFile(downloadUrl, temporaryBinaryPath);
+    await downloadFile(`${downloadUrl}.sha256`, temporaryChecksumPath);
 
-  const expected = fs.readFileSync(checksumPath, "utf8").trim().split(/\s+/)[0];
-  const actual = sha256(binaryPath);
-  fs.rmSync(checksumPath, { force: true });
-  if (!/^[a-f0-9]{64}$/i.test(expected) || actual !== expected.toLowerCase()) {
-    fs.rmSync(binaryPath, { force: true });
-    throw new Error(`SHA-256 verification failed for ${assetName}`);
+    const expected = fs.readFileSync(temporaryChecksumPath, "utf8").trim().split(/\s+/)[0];
+    const actual = sha256(temporaryBinaryPath);
+    if (!/^[a-f0-9]{64}$/i.test(expected) || actual !== expected.toLowerCase()) {
+      throw new Error(`SHA-256 verification failed for ${assetName}`);
+    }
+
+    if (os.platform() !== "win32") {
+      fs.chmodSync(temporaryBinaryPath, 0o755);
+    }
+
+    try {
+      fs.renameSync(temporaryBinaryPath, binaryPath);
+    } catch (error) {
+      if (!['EEXIST', 'EPERM'].includes(error.code)) throw error;
+      fs.rmSync(binaryPath, { force: true });
+      fs.renameSync(temporaryBinaryPath, binaryPath);
+    }
+    console.log(`WAE binary installed at ${binaryPath}`);
+  } finally {
+    fs.rmSync(temporaryBinaryPath, { force: true });
+    fs.rmSync(temporaryChecksumPath, { force: true });
   }
-
-  if (os.platform() !== "win32") {
-    fs.chmodSync(binaryPath, 0o755);
-  }
-
-  console.log(`WAE binary installed at ${binaryPath}`);
 }
 
-main().catch((error) => {
-  console.error(`Could not install the verified WAE binary: ${error.message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`Could not install the verified WAE binary: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { downloadFile, resolveTarget, sha256, validateDownloadUrl };

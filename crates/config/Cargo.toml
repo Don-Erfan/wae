@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+globset.workspace = true
 wae-core = { path = "../core" }
 serde.workspace = true
-serde_yaml.workspace = true
+yaml_serde.workspace = true

@@ -1,3 +1,3 @@
-import { web } from "../../../apps/web/src/index";
+import { web } from "@fixture/web";
 
 export const uiButton = web;

@@ -9,6 +9,7 @@ pub struct ModuleGraph {
     edges: Vec<Dependency>,
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
+    edge_keys: HashSet<(ModuleId, ModuleId, wae_core::domain::DependencyKind)>,
 }
 
 impl ModuleGraph {
@@ -313,6 +314,10 @@ impl ModuleGraph {
     }
 
     fn add_edge_internal(&mut self, edge: Dependency) {
+        let key = (edge.from.clone(), edge.to.clone(), edge.kind.clone());
+        if !self.edge_keys.insert(key) {
+            return;
+        }
         let from_index = self.add_node_internal(edge.from.clone());
         let to_index = self.add_node_internal(edge.to.clone());
 
@@ -343,7 +348,34 @@ impl ModuleGraphBuilder {
     }
 
     pub fn build(self) -> ModuleGraph {
-        self.graph
+        let mut nodes = self.graph.nodes;
+        nodes.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut edges = self.graph.edges;
+        edges.sort_by(|left, right| {
+            (&left.from.0, &left.to.0, dependency_kind_rank(&left.kind)).cmp(&(
+                &right.from.0,
+                &right.to.0,
+                dependency_kind_rank(&right.kind),
+            ))
+        });
+        let mut graph = ModuleGraph::new();
+        for node in nodes {
+            graph.add_node_internal(node);
+        }
+        for edge in edges {
+            graph.add_edge_internal(edge);
+        }
+        graph
+    }
+}
+
+fn dependency_kind_rank(kind: &wae_core::domain::DependencyKind) -> u8 {
+    match kind {
+        wae_core::domain::DependencyKind::Static => 0,
+        wae_core::domain::DependencyKind::Dynamic => 1,
+        wae_core::domain::DependencyKind::TypeOnly => 2,
+        wae_core::domain::DependencyKind::ReExport => 3,
+        wae_core::domain::DependencyKind::Require => 4,
     }
 }
 
@@ -401,7 +433,10 @@ impl PackageGraph {
 
             graph.add_edge(PackageDependency { from: from_package, to: to_package });
         }
-
+        graph.nodes.sort_by(|left, right| left.0.cmp(&right.0));
+        graph
+            .edges
+            .sort_by(|left, right| (&left.from.0, &left.to.0).cmp(&(&right.from.0, &right.to.0)));
         graph
     }
 
@@ -464,7 +499,7 @@ impl PackageGraph {
 #[cfg(test)]
 mod tests {
     use wae_core::domain::{
-        Dependency, DependencyKind, FrameworkMetadata, Layer, Module, ModuleId, ModuleKind,
+        Dependency, DependencyKind, FrameworkMetadata, LayerId, Module, ModuleId, ModuleKind,
         ModulePath, Package, PackageName, ProjectBuilder, Runtime, SourceLocation,
     };
 
@@ -477,7 +512,7 @@ mod tests {
             package: package.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::Features,
+            layer: Some(LayerId("features".into())),
             framework_metadata: FrameworkMetadata::default(),
         }
     }
@@ -531,6 +566,22 @@ mod tests {
     }
 
     #[test]
+    fn graph_deduplicates_edges_and_sorts_public_output() {
+        let project = ProjectBuilder::new()
+            .add_dependency(dependency("B", "C"))
+            .add_dependency(dependency("A", "B"))
+            .add_dependency(dependency("A", "B"))
+            .build();
+        let graph = ModuleGraph::from_project(&project);
+        assert_eq!(graph.edge_count(), 2);
+        assert_eq!(
+            graph.nodes().iter().map(|node| node.0.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+        assert_eq!(graph.edges()[0].from.0, "A");
+    }
+
+    #[test]
     fn graph_detects_scc_and_cycle_path() {
         let package =
             Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
@@ -555,7 +606,7 @@ mod tests {
         assert_eq!(cycles.len(), 1);
         assert_eq!(
             cycles[0].iter().map(|node| node.0.as_str()).collect::<Vec<_>>(),
-            vec!["user", "payment", "checkout", "user"]
+            vec!["checkout", "user", "payment", "checkout"]
         );
     }
 
@@ -606,7 +657,7 @@ mod tests {
             package: web.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::App,
+            layer: Some(LayerId("app".into())),
             framework_metadata: FrameworkMetadata::default(),
         };
         let ui_module = Module {
@@ -615,7 +666,7 @@ mod tests {
             package: ui.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::Shared,
+            layer: Some(LayerId("shared".into())),
             framework_metadata: FrameworkMetadata::default(),
         };
         let auth_module = Module {
@@ -624,7 +675,7 @@ mod tests {
             package: auth.name.clone(),
             kind: ModuleKind::Source,
             runtime: Runtime::Universal,
-            layer: Layer::Shared,
+            layer: Some(LayerId("shared".into())),
             framework_metadata: FrameworkMetadata::default(),
         };
 

@@ -33,7 +33,7 @@ impl CliOutput {
 enum Command {
     Init,
     Scan,
-    Check { changed: bool, format: Format },
+    Check { changed: bool, format: Option<Format>, base: Option<String> },
     BaselineCreate,
     Graph,
     Doctor,
@@ -49,7 +49,7 @@ pub fn run(args: &[String], cwd: &Path) -> CliOutput {
     match command {
         Command::Init => commands::init(cwd),
         Command::Scan => commands::scan(cwd),
-        Command::Check { changed, format } => commands::check(cwd, changed, format),
+        Command::Check { changed, format, base } => commands::check(cwd, changed, format, base),
         Command::BaselineCreate => commands::baseline_create(cwd),
         Command::Graph => commands::graph(cwd),
         Command::Doctor => commands::doctor(cwd),
@@ -77,7 +77,8 @@ fn parse(args: &[String]) -> Result<Command, String> {
 
 fn parse_check(args: &[String]) -> Result<Command, String> {
     let mut changed = false;
-    let mut format = Format::Human;
+    let mut format = None;
+    let mut base = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -85,18 +86,23 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
             "--format" => {
                 index += 1;
                 let value = args.get(index).ok_or("--format requires a value")?;
-                format =
-                    Format::parse(value).ok_or_else(|| format!("unsupported format `{value}`"))?;
+                format = Some(
+                    Format::parse(value).ok_or_else(|| format!("unsupported format `{value}`"))?,
+                );
+            }
+            "--base" => {
+                index += 1;
+                base = Some(args.get(index).ok_or("--base requires a value")?.clone());
             }
             value => return Err(format!("unknown check option `{value}`")),
         }
         index += 1;
     }
-    Ok(Command::Check { changed, format })
+    Ok(Command::Check { changed, format, base })
 }
 
 fn usage() -> &'static str {
-    "Usage: wae <COMMAND>\n\nCommands:\n  init                         Create wae.yaml\n  scan                         Analyze and report module count\n  check [--changed] [--format human|json|jsonl|sarif]\n  baseline create              Explicitly record current violations\n  graph                        Print the real dependency graph as JSON\n  doctor                       Validate project/config/tooling\n  explain <RULE_ID>            Explain an architecture rule\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error"
+    "Usage: wae <COMMAND>\n\nCommands:\n  init                         Create wae.yaml\n  scan                         Analyze and report module count\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n  baseline create              Explicitly record current violations\n  graph                        Print the real dependency graph as JSON\n  doctor                       Validate project/config/tooling\n  explain <RULE_ID>            Explain an architecture rule\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error"
 }
 
 #[cfg(test)]
@@ -133,5 +139,28 @@ mod tests {
         assert_eq!(output.exit_code, EXIT_PROJECT);
         assert!(output.stderr.contains("baseline is missing"));
         assert!(!root.join(".wae/baseline.json").exists());
+    }
+
+    #[test]
+    fn check_uses_the_configured_output_format_by_default() {
+        let root = std::env::temp_dir().join(format!("wae-output-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "export const value = 1;").unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\noutput:\n  format: json\n").unwrap();
+        let output = run(&["check".into()], &root);
+        assert_eq!(output.exit_code, EXIT_PASSED);
+        assert!(output.stdout.contains("\"schemaVersion\""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_check_accepts_an_explicit_base() {
+        let command =
+            parse(&["check".into(), "--changed".into(), "--base".into(), "origin/main".into()])
+                .unwrap();
+        assert!(matches!(
+            command,
+            Command::Check { changed: true, base: Some(base), .. } if base == "origin/main"
+        ));
     }
 }

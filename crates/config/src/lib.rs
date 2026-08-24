@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use wae_core::domain::{ConfigError, ConfigErrorKind, LayerPolicy, Severity};
 
@@ -204,7 +205,7 @@ pub struct CacheConfig {
 }
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { enabled: true, directory: ".wae/cache".into() }
+        Self { enabled: false, directory: ".wae/cache".into() }
     }
 }
 
@@ -217,7 +218,7 @@ impl Config {
         let source = fs::read_to_string(&path).map_err(|e| {
             config_error(ConfigErrorKind::Io, Some(path.display().to_string()), e.to_string())
         })?;
-        let config: Self = serde_yaml::from_str(&source).map_err(|e| {
+        let config: Self = yaml_serde::from_str(&source).map_err(|e| {
             config_error(
                 ConfigErrorKind::InvalidYaml,
                 Some(path.display().to_string()),
@@ -248,7 +249,27 @@ impl Config {
                 format!("unknown rule `{rule}`"),
             ));
         }
+        if self.project.roots.is_empty() {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some("project.roots".into()),
+                "at least one project root is required".into(),
+            ));
+        }
+        for root in &self.project.roots {
+            validate_relative_path(root, "project.roots")?;
+        }
+        validate_relative_path(&self.architecture.features.root, "architecture.features.root")?;
+        validate_relative_path(&self.cache.directory, "cache.directory")?;
+        if !matches!(self.output.format.as_str(), "human" | "json" | "jsonl" | "sarif") {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some("output.format".into()),
+                format!("unsupported output format `{}`", self.output.format),
+            ));
+        }
         for (name, layer) in &self.architecture.layers {
+            validate_patterns(&layer.patterns, &format!("architecture.layers.{name}.patterns"))?;
             for target in &layer.can_import {
                 if target != name && !self.architecture.layers.contains_key(target) {
                     return Err(config_error(
@@ -258,6 +279,22 @@ impl Config {
                     ));
                 }
             }
+        }
+        validate_patterns(&self.project.include, "project.include")?;
+        validate_patterns(&self.project.exclude, "project.exclude")?;
+        validate_patterns(
+            &self.architecture.features.public_entrypoints,
+            "architecture.features.public_entrypoints",
+        )?;
+        for (index, policy) in self.architecture.forbidden_dependencies.iter().enumerate() {
+            validate_patterns(
+                std::slice::from_ref(&policy.from),
+                &format!("architecture.forbidden_dependencies.{index}.from"),
+            )?;
+            validate_patterns(
+                std::slice::from_ref(&policy.to),
+                &format!("architecture.forbidden_dependencies.{index}.to"),
+            )?;
         }
         Ok(())
     }
@@ -274,9 +311,39 @@ impl Config {
             .collect()
     }
     pub fn to_yaml(&self) -> Result<String, ConfigError> {
-        serde_yaml::to_string(self)
+        yaml_serde::to_string(self)
             .map_err(|e| config_error(ConfigErrorKind::InvalidYaml, None, e.to_string()))
     }
+}
+
+fn validate_patterns(patterns: &[String], path: &str) -> Result<(), ConfigError> {
+    for pattern in patterns {
+        GlobBuilder::new(pattern).literal_separator(true).build().map_err(|error| {
+            config_error(
+                ConfigErrorKind::InvalidPattern,
+                Some(path.into()),
+                format!("invalid glob `{pattern}`: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_relative_path(value: &str, path: &str) -> Result<(), ConfigError> {
+    let candidate = Path::new(value);
+    if value.trim().is_empty()
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(config_error(
+            ConfigErrorKind::ConflictingConfig,
+            Some(path.into()),
+            format!("`{value}` must be a non-empty relative path inside the project"),
+        ));
+    }
+    Ok(())
 }
 
 fn config_error(kind: ConfigErrorKind, path: Option<String>, message: String) -> ConfigError {
@@ -290,7 +357,7 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(
-            serde_yaml::from_str::<Config>("version: 1\nunknown: true\n")
+            yaml_serde::from_str::<Config>("version: 1\nunknown: true\n")
                 .unwrap_err()
                 .to_string()
                 .contains("unknown field")

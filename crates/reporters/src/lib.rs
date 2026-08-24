@@ -75,20 +75,94 @@ fn json_report(analysis: &Analysis) -> Result<String, serde_json::Error> {
 }
 
 fn jsonl(analysis: &Analysis) -> Result<String, serde_json::Error> {
-    analysis
-        .diagnostics
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .map(|lines| lines.join("\n"))
+    let mut events = vec![serde_json::to_string(&json!({
+        "schemaVersion": analysis.schema_version,
+        "type": "analysis",
+        "modules": analysis.project.modules.len(),
+    }))?];
+    for diagnostic in &analysis.diagnostics {
+        events.push(serde_json::to_string(&json!({
+            "schemaVersion": analysis.schema_version,
+            "type": "diagnostic",
+            "diagnostic": diagnostic,
+        }))?);
+    }
+    Ok(events.join("\n"))
 }
 
 fn sarif(analysis: &Analysis) -> Result<String, serde_json::Error> {
     let results = analysis.diagnostics.iter().map(sarif_result).collect::<Vec<_>>();
+    let mut rule_ids = analysis
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.rule_id.0.as_str())
+        .collect::<Vec<_>>();
+    rule_ids.sort_unstable();
+    rule_ids.dedup();
+    let rules = rule_ids.into_iter().map(sarif_rule).collect::<Vec<_>>();
+    let successful =
+        !analysis.diagnostics.iter().any(|diagnostic| diagnostic.severity == Severity::Error);
     serde_json::to_string_pretty(&json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
-        "runs": [{ "tool": { "driver": { "name": "WAE", "informationUri": "https://github.com/Don-Erfan/wae" } }, "results": results }]
+        "runs": [{
+            "tool": { "driver": {
+                "name": "WAE",
+                "semanticVersion": env!("CARGO_PKG_VERSION"),
+                "informationUri": "https://github.com/Don-Erfan/wae",
+                "rules": rules
+            } },
+            "invocations": [{ "executionSuccessful": successful }],
+            "results": results
+        }]
     }))
+}
+
+fn sarif_rule(rule_id: &str) -> serde_json::Value {
+    let (title, description, category) = match rule_id {
+        "ARCH-001" => (
+            "Circular dependency",
+            "Reports strongly connected module components.",
+            "dependency-graph",
+        ),
+        "ARCH-002" => (
+            "Forbidden dependency",
+            "Reports dependencies forbidden by architecture policy.",
+            "architecture",
+        ),
+        "ARCH-003" => (
+            "Layer boundary",
+            "Reports imports that violate configured layer direction.",
+            "architecture",
+        ),
+        "ARCH-004" => (
+            "Feature boundary",
+            "Reports cross-feature imports that bypass the public API.",
+            "architecture",
+        ),
+        "ARCH-005" => (
+            "Private import",
+            "Reports access to private modules from outside their owner.",
+            "architecture",
+        ),
+        "PARSE-001" => {
+            ("Parse failure", "Reports malformed or unreadable source files.", "correctness")
+        }
+        "RESOLVE-001" => (
+            "Unresolved import",
+            "Reports relative or aliased imports that cannot be resolved.",
+            "correctness",
+        ),
+        _ => ("WAE diagnostic", "Reports a Web Architecture Engine diagnostic.", "architecture"),
+    };
+    json!({
+        "id": rule_id,
+        "name": title.replace(' ', ""),
+        "shortDescription": { "text": title },
+        "fullDescription": { "text": description },
+        "helpUri": format!("https://github.com/Don-Erfan/wae/blob/master/docs/PRODUCT.md#{rule_id}"),
+        "defaultConfiguration": { "level": "error" },
+        "properties": { "tags": ["architecture", category] }
+    })
 }
 
 fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {
@@ -126,5 +200,37 @@ mod tests {
         let output = sarif(&analysis).unwrap();
         assert!(output.contains("2.1.0"));
         assert!(output.contains("\"name\": \"WAE\""));
+    }
+
+    #[test]
+    fn jsonl_events_are_individually_versioned() {
+        let analysis = Analysis {
+            schema_version: 1,
+            project: Default::default(),
+            graph: Default::default(),
+            diagnostics: vec![Diagnostic::new("ARCH-001", "cycle")],
+        };
+        let output = jsonl(&analysis).unwrap();
+        for line in output.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["schemaVersion"], 1);
+        }
+    }
+
+    #[test]
+    fn sarif_contains_rule_descriptors_and_fingerprints() {
+        let mut diagnostic = Diagnostic::new("ARCH-003", "Layer violation");
+        diagnostic.refresh_fingerprint();
+        let analysis = Analysis {
+            schema_version: 1,
+            project: Default::default(),
+            graph: Default::default(),
+            diagnostics: vec![diagnostic],
+        };
+        let value: serde_json::Value = serde_json::from_str(&sarif(&analysis).unwrap()).unwrap();
+        assert_eq!(value["runs"][0]["tool"]["driver"]["rules"][0]["id"], "ARCH-003");
+        assert!(
+            value["runs"][0]["results"][0]["partialFingerprints"]["waeViolationId"].is_string()
+        );
     }
 }
