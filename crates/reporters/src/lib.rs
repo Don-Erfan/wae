@@ -32,16 +32,27 @@ pub fn render(analysis: &Analysis, format: Format) -> Result<String, serde_json:
 }
 
 fn human(analysis: &Analysis) -> String {
-    let errors = analysis.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-    let warnings = analysis.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+    let errors = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Error)
+        .count();
+    let warnings = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| !d.suppressed && d.severity == Severity::Warning)
+        .count();
     let mut output = format!(
         "Analyzing {} modules...\n\nArchitecture\n\n✖ {errors} errors\n⚠ {warnings} warnings\n",
         analysis.project.modules.len()
     );
     for diagnostic in &analysis.diagnostics {
         output.push_str(&format!(
-            "\n{} [{}]\n{}",
-            diagnostic.rule_id.0, diagnostic.fingerprint, diagnostic.message
+            "\n{}{} [{}]\n{}",
+            diagnostic.rule_id.0,
+            if diagnostic.suppressed { " (suppressed)" } else { "" },
+            diagnostic.fingerprint,
+            diagnostic.message
         ));
         if let Some(location) = &diagnostic.primary_location {
             output.push_str(&format!("\n{}:{}:{}", location.file, location.line, location.column));
@@ -59,6 +70,9 @@ fn human(analysis: &Analysis) -> String {
         }
         if let Some(suggestion) = &diagnostic.suggestion {
             output.push_str(&format!("\nSuggestion: {suggestion}"));
+        }
+        if let Some(reason) = &diagnostic.suppression_reason {
+            output.push_str(&format!("\nSuppression reason: {reason}"));
         }
         output.push('\n');
     }
@@ -100,8 +114,10 @@ fn sarif(analysis: &Analysis) -> Result<String, serde_json::Error> {
     rule_ids.sort_unstable();
     rule_ids.dedup();
     let rules = rule_ids.into_iter().map(sarif_rule).collect::<Vec<_>>();
-    let successful =
-        !analysis.diagnostics.iter().any(|diagnostic| diagnostic.severity == Severity::Error);
+    let successful = !analysis
+        .diagnostics
+        .iter()
+        .any(|diagnostic| !diagnostic.suppressed && diagnostic.severity == Severity::Error);
     serde_json::to_string_pretty(&json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
         "runs": [{
@@ -118,42 +134,11 @@ fn sarif(analysis: &Analysis) -> Result<String, serde_json::Error> {
 }
 
 fn sarif_rule(rule_id: &str) -> serde_json::Value {
-    let (title, description, category) = match rule_id {
-        "ARCH-001" => (
-            "Circular dependency",
-            "Reports strongly connected module components.",
-            "dependency-graph",
-        ),
-        "ARCH-002" => (
-            "Forbidden dependency",
-            "Reports dependencies forbidden by architecture policy.",
-            "architecture",
-        ),
-        "ARCH-003" => (
-            "Layer boundary",
-            "Reports imports that violate configured layer direction.",
-            "architecture",
-        ),
-        "ARCH-004" => (
-            "Feature boundary",
-            "Reports cross-feature imports that bypass the public API.",
-            "architecture",
-        ),
-        "ARCH-005" => (
-            "Private import",
-            "Reports access to private modules from outside their owner.",
-            "architecture",
-        ),
-        "PARSE-001" => {
-            ("Parse failure", "Reports malformed or unreadable source files.", "correctness")
-        }
-        "RESOLVE-001" => (
-            "Unresolved import",
-            "Reports relative or aliased imports that cannot be resolved.",
-            "correctness",
-        ),
-        _ => ("WAE diagnostic", "Reports a Web Architecture Engine diagnostic.", "architecture"),
-    };
+    let descriptor = wae_core::rule_registry::descriptor(rule_id);
+    let title = descriptor.map_or("WAE diagnostic", |rule| rule.title);
+    let description =
+        descriptor.map_or("Reports a Web Architecture Engine diagnostic.", |rule| rule.description);
+    let category = descriptor.map_or("architecture", |rule| rule.category);
     json!({
         "id": rule_id,
         "name": title.replace(' ', ""),
@@ -172,7 +157,11 @@ fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {
         Severity::Info => "note",
     };
     let locations = diagnostic.primary_location.as_ref().map(|location| vec![json!({ "physicalLocation": { "artifactLocation": { "uri": location.file }, "region": { "startLine": location.line.max(1), "startColumn": location.column.max(1) } } })]).unwrap_or_default();
-    json!({ "ruleId": diagnostic.rule_id.0, "level": level, "message": { "text": diagnostic.message }, "partialFingerprints": { "waeViolationId": diagnostic.fingerprint }, "locations": locations })
+    let suppressions = diagnostic.suppressed.then(|| vec![json!({
+        "kind": "inSource", "status": "accepted",
+        "justification": diagnostic.suppression_reason.as_deref().unwrap_or("WAE source suppression")
+    })]).unwrap_or_default();
+    json!({ "ruleId": diagnostic.rule_id.0, "level": level, "message": { "text": diagnostic.message }, "partialFingerprints": { "waeViolationId": diagnostic.fingerprint }, "locations": locations, "suppressions": suppressions })
 }
 
 #[cfg(test)]

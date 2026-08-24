@@ -48,7 +48,7 @@ Diagnostics / Reporters / Integrations
 - `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias، workspace و external package را به‌ترتیب اجرا می‌کند.
 - `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.
 - `Repository`: baseline storage پشت command صریح `baseline create` قرار دارد و `check --changed` هرگز آن را ایجاد نمی‌کند.
-- `Ports & Adapters`: filesystem/Git/CLI در لبه قرار دارند؛ ruleها به command یا reporter وابسته نیستند.
+- `Ports & Adapters`: قرارداد `VcsPort` و `ChangeSet` در engine قرار دارد و Git/CLI در لبه می‌مانند؛ ruleها به command یا reporter وابسته نیستند.
 
 این انتخاب‌ها با تعریف‌های Refactoring.Guru هم‌راستا هستند: Facade سطح ساده‌ای روی subsystem می‌دهد، Strategy الگوریتم‌های قابل‌تعویض را جدا می‌کند، Chain درخواست را در handlerهای مرتب عبور می‌دهد، و Composite مجموعه‌ای از اجزا را پشت قرارداد مشترک قرار می‌دهد.
 
@@ -72,6 +72,8 @@ Diagnostics / Reporters / Integrations
 - deterministic sorting برای diagnostics
 - اجرای ruleها روی snapshot مشترک graph (بدون parse مجدد)
 - incremental invalidation بر اساس dependency impact
+- `ProjectIndex` مبتنی بر hash set برای lookupهای O(1) هنگام ساخت graph
+- `TsConfigIndex` با انتخاب نزدیک‌ترین config والد برای monorepoها
 
 ## 7) قرارداد Diagnostic (نسخه پایه)
 

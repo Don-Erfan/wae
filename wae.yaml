@@ -19,6 +19,10 @@ project:
   follow_symlinks: false
   max_file_size_kb: 2048
 
+resolution:
+  mode: nodenext
+  custom_conditions: []
+
 architecture:
   layers:
     app:
@@ -50,3 +54,7 @@ output:
 cache:
   enabled: true
   directory: ".wae/cache"
+
+suppressions:
+  require_reason: true
+  report_unused: true

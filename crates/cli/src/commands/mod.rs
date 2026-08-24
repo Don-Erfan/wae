@@ -1,13 +1,15 @@
 mod baseline;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use serde_json::json;
 use wae_config::{CONFIG_FILE, Config};
 use wae_core::domain::{Diagnostic, Severity};
-use wae_engine::{Analysis, AnalysisError, AnalyzeRequest, Engine};
+use wae_engine::{
+    Analysis, AnalysisError, AnalyzeRequest, ChangeSet, Engine, ImpactAnalyzer, VcsPort,
+};
 use wae_reporters::{Format, render};
 
 use crate::CliOutput;
@@ -78,7 +80,7 @@ pub fn check(
     let has_failures = analysis
         .diagnostics
         .iter()
-        .any(|d| matches!(d.severity, Severity::Error | Severity::Warning));
+        .any(|d| !d.suppressed && matches!(d.severity, Severity::Error | Severity::Warning));
     match render(&analysis, format) {
         Ok(output) if has_failures => CliOutput::violations(output),
         Ok(output) => CliOutput::success(output),
@@ -144,19 +146,13 @@ pub fn doctor(root: &Path) -> CliOutput {
 }
 
 pub fn explain(rule: &str) -> CliOutput {
-    let explanation = match rule {
-        "ARCH-001" => "Circular dependency: detects strongly connected module components.",
-        "ARCH-002" => {
-            "Forbidden dependency: enforces configured policies and optional architecture presets."
-        }
-        "ARCH-003" => {
-            "Layer boundary: enforces canImport while allowing imports within the same layer."
-        }
-        "ARCH-004" => "Feature boundary: cross-feature dependencies must use public entrypoints.",
-        "ARCH-005" => "Private import: internal/private segments cannot be consumed directly.",
-        _ => return CliOutput::project_error(format!("Unknown rule id: {rule}")),
+    let Some(descriptor) = wae_core::rule_registry::descriptor(rule) else {
+        return CliOutput::project_error(format!("Unknown rule id: {rule}"));
     };
-    CliOutput::success(format!("{rule}\n{explanation}"))
+    CliOutput::success(format!(
+        "{}\n{}: {}",
+        descriptor.id, descriptor.title, descriptor.description
+    ))
 }
 
 fn analyze(root: &Path) -> Result<Analysis, CliOutput> {
@@ -182,44 +178,55 @@ fn affected_modules(
     analysis: &Analysis,
     explicit_base: Option<&str>,
 ) -> Result<HashSet<String>, String> {
-    let base = select_base(root, explicit_base)?;
-    let mut changed = HashSet::new();
-    let mut deleted = HashSet::new();
-    let committed_range = format!("{base}...HEAD");
-    for args in [
-        vec!["diff", "--name-status", "-M", committed_range.as_str()],
-        vec!["diff", "--name-status", "-M"],
-        vec!["diff", "--cached", "--name-status", "-M"],
-    ] {
-        let output = git_output(root, &args)?;
-        collect_name_status(&output, &mut changed, &mut deleted);
-    }
-    for path in git_output(root, &["ls-files", "--others", "--exclude-standard"])?.lines() {
-        if !path.trim().is_empty() {
-            changed.insert(path.replace('\\', "/"));
-        }
-    }
+    let mut changes = GitVcsAdapter { root }.changes(explicit_base)?;
     for diagnostic in &analysis.diagnostics {
         if diagnostic.rule_id.0 == "RESOLVE-001" {
             if let (Some(location), Some(specifier)) =
                 (diagnostic.primary_location.as_ref(), diagnostic.metadata.get("specifier"))
             {
-                if unresolved_target_was_deleted(&location.file, specifier, &deleted) {
-                    changed.insert(location.file.clone());
+                let candidate_deleted = diagnostic
+                    .metadata
+                    .get("candidatePaths")
+                    .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                    .is_some_and(|candidates| {
+                        candidates.iter().any(|candidate| changes.deleted.contains(candidate))
+                    });
+                if candidate_deleted
+                    || unresolved_target_was_deleted(&location.file, specifier, &changes.deleted)
+                {
+                    changes.changed.insert(location.file.clone());
                 }
             }
         }
     }
-    let mut affected = changed.clone();
-    let mut queue = VecDeque::from_iter(changed);
-    while let Some(module) = queue.pop_front() {
-        for importer in analysis.graph.incoming(&wae_core::domain::ModuleId(module)) {
-            if affected.insert(importer.0.clone()) {
-                queue.push_back(importer.0);
+    Ok(ImpactAnalyzer::affected(analysis, &changes))
+}
+
+struct GitVcsAdapter<'a> {
+    root: &'a Path,
+}
+
+impl VcsPort for GitVcsAdapter<'_> {
+    fn changes(&self, explicit_base: Option<&str>) -> Result<ChangeSet, String> {
+        let base = select_base(self.root, explicit_base)?;
+        let mut changes = ChangeSet::default();
+        let committed_range = format!("{base}...HEAD");
+        for args in [
+            vec!["diff", "--name-status", "-M", committed_range.as_str()],
+            vec!["diff", "--name-status", "-M"],
+            vec!["diff", "--cached", "--name-status", "-M"],
+        ] {
+            let output = git_output(self.root, &args)?;
+            collect_name_status(&output, &mut changes.changed, &mut changes.deleted);
+        }
+        for path in git_output(self.root, &["ls-files", "--others", "--exclude-standard"])?.lines()
+        {
+            if !path.trim().is_empty() {
+                changes.changed.insert(path.replace('\\', "/"));
             }
         }
+        Ok(changes)
     }
-    Ok(affected)
 }
 
 fn collect_name_status(output: &str, changed: &mut HashSet<String>, deleted: &mut HashSet<String>) {

@@ -5,23 +5,10 @@ use std::path::{Component, Path, PathBuf};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::Deserialize;
 use wae_config::ResolutionMode;
-use wae_core::domain::ModulePath;
+use wae_core::domain::{DependencyKind, ModulePath};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Resolution {
-    Module(ModulePath),
-    External(String),
-    Unresolved,
-}
-
-pub trait ModuleResolver: Send + Sync {
-    fn resolve(&self, importer: &ModulePath, specifier: &str) -> Resolution;
-}
-
-/// A resolution handler is one link in the Node/TypeScript resolution chain.
-pub trait ResolutionHandler: Send + Sync {
-    fn try_resolve(&self, importer: &Path, specifier: &str) -> Option<Resolution>;
-}
+mod request;
+pub use request::{ModuleResolver, Resolution, ResolutionHandler, ResolutionRequest};
 
 #[derive(Default)]
 pub struct ResolverPipeline {
@@ -35,6 +22,17 @@ impl ResolverPipeline {
     pub fn with_handler<H: ResolutionHandler + 'static>(mut self, handler: H) -> Self {
         self.handlers.push(Box::new(handler));
         self
+    }
+
+    pub fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
+        let mut candidates = self
+            .handlers
+            .iter()
+            .flat_map(|handler| handler.candidate_paths(request))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup();
+        candidates
     }
     pub fn node_defaults(root: impl Into<PathBuf>, aliases: Vec<PathAlias>) -> Self {
         Self::node_defaults_with_mode(root, aliases, ResolutionMode::NodeNext)
@@ -64,15 +62,48 @@ impl ResolverPipeline {
             .with_handler(workspaces)
             .with_handler(PackageResolver)
     }
+
+    pub fn indexed_node_with_workspaces(
+        tsconfigs: TsConfigIndex,
+        mut workspaces: WorkspaceResolver,
+        mode: ResolutionMode,
+    ) -> Self {
+        workspaces.mode = mode;
+        Self::new()
+            .with_handler(RelativeResolver { mode })
+            .with_handler(IndexedAliasResolver::new(tsconfigs))
+            .with_handler(workspaces)
+            .with_handler(PackageResolver)
+    }
 }
 
 impl ModuleResolver for ResolverPipeline {
-    fn resolve(&self, importer: &ModulePath, specifier: &str) -> Resolution {
-        let importer = Path::new(&importer.0);
-        self.handlers
-            .iter()
-            .find_map(|handler| handler.try_resolve(importer, specifier))
-            .unwrap_or(Resolution::Unresolved)
+    fn resolve(&self, request: &ResolutionRequest<'_>) -> Resolution {
+        let mut specifier = request.specifier.to_string();
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(specifier.clone()) {
+                return Resolution::Invalid(format!(
+                    "package resolution redirect loop at `{specifier}`"
+                ));
+            }
+            let redirected = ResolutionRequest {
+                importer: request.importer,
+                specifier: &specifier,
+                dependency_kind: request.dependency_kind.clone(),
+                mode: request.mode,
+                custom_conditions: request.custom_conditions,
+            };
+            let result = self
+                .handlers
+                .iter()
+                .find_map(|handler| handler.try_resolve(&redirected))
+                .unwrap_or(Resolution::Unresolved);
+            match result {
+                Resolution::Redirect(target) => specifier = target,
+                result => return result,
+            }
+        }
     }
 }
 
@@ -87,19 +118,32 @@ pub struct RelativeResolver {
     pub mode: ResolutionMode,
 }
 impl ResolutionHandler for RelativeResolver {
-    fn try_resolve(&self, importer: &Path, specifier: &str) -> Option<Resolution> {
+    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
+        let importer = Path::new(&request.importer.0);
+        let specifier = request.specifier;
         if !specifier.starts_with('.') && !specifier.starts_with('/') {
             return None;
         }
-        let base = if specifier.starts_with('/') {
-            PathBuf::from(specifier)
-        } else {
-            importer.parent()?.join(specifier)
-        };
+        if specifier.starts_with('/') {
+            return Some(Resolution::Invalid(
+                "absolute module specifiers are outside the project analysis boundary".into(),
+            ));
+        }
+        let base = importer.parent()?.join(specifier);
         Some(
-            resolve_file_with_mode(&base, self.mode)
+            resolve_file_with_mode(&base, request.mode)
                 .map_or(Resolution::Unresolved, Resolution::Module),
         )
+    }
+
+    fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
+        if !request.specifier.starts_with('.') {
+            return Vec::new();
+        }
+        Path::new(&request.importer.0)
+            .parent()
+            .map(|parent| resolution_candidates(&parent.join(request.specifier), request.mode))
+            .unwrap_or_default()
     }
 }
 
@@ -110,7 +154,8 @@ pub struct AliasResolver {
     pub mode: ResolutionMode,
 }
 impl ResolutionHandler for AliasResolver {
-    fn try_resolve(&self, _importer: &Path, specifier: &str) -> Option<Resolution> {
+    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
+        let specifier = request.specifier;
         let mut matched = false;
         for alias in &self.aliases {
             let capture = match alias.pattern.split_once('*') {
@@ -126,12 +171,37 @@ impl ResolutionHandler for AliasResolver {
             matched = true;
             for target in &alias.targets {
                 let candidate = self.root.join(target.replace('*', capture));
-                if let Some(path) = resolve_file_with_mode(&candidate, self.mode) {
+                if let Some(path) = resolve_file_with_mode(&candidate, request.mode) {
                     return Some(Resolution::Module(path));
                 }
             }
         }
         matched.then_some(Resolution::Unresolved)
+    }
+
+    fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
+        let mut candidates = Vec::new();
+        for alias in &self.aliases {
+            let capture = match alias.pattern.split_once('*') {
+                Some((prefix, suffix))
+                    if request.specifier.starts_with(prefix)
+                        && request.specifier.ends_with(suffix) =>
+                {
+                    Some(&request.specifier[prefix.len()..request.specifier.len() - suffix.len()])
+                }
+                None if alias.pattern == request.specifier => Some(""),
+                _ => None,
+            };
+            if let Some(capture) = capture {
+                for target in &alias.targets {
+                    candidates.extend(resolution_candidates(
+                        &self.root.join(target.replace('*', capture)),
+                        request.mode,
+                    ));
+                }
+            }
+        }
+        candidates
     }
 }
 
@@ -160,6 +230,99 @@ impl TsConfigLoader {
             alias_specificity(&right.pattern).cmp(&alias_specificity(&left.pattern))
         });
         Ok(TsConfigPaths { base_url: PathBuf::new(), aliases })
+    }
+}
+
+/// Immutable index of TypeScript project configurations. The nearest ancestor
+/// configuration owns an importer, matching TypeScript's configured-project model.
+#[derive(Clone, Debug, Default)]
+pub struct TsConfigIndex {
+    configs: Vec<ScopedTsConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct ScopedTsConfig {
+    directory: PathBuf,
+    paths: TsConfigPaths,
+}
+
+impl TsConfigIndex {
+    pub fn discover(project_root: &Path) -> Result<Self, String> {
+        let mut configs = Vec::new();
+        let mut builder = ignore::WalkBuilder::new(project_root);
+        builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true);
+        builder.filter_entry(|entry| entry.file_name() != "node_modules");
+        for entry in builder.build() {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && entry.file_name() == "tsconfig.json"
+            {
+                let directory = entry.path().parent().unwrap_or(project_root).to_path_buf();
+                configs
+                    .push(ScopedTsConfig { paths: TsConfigLoader::load(&directory)?, directory });
+            }
+        }
+        if configs.is_empty() {
+            configs.push(ScopedTsConfig {
+                directory: project_root.to_path_buf(),
+                paths: TsConfigPaths { base_url: project_root.to_path_buf(), aliases: Vec::new() },
+            });
+        }
+        configs.sort_by(|left, right| {
+            right
+                .directory
+                .components()
+                .count()
+                .cmp(&left.directory.components().count())
+                .then_with(|| left.directory.cmp(&right.directory))
+        });
+        Ok(Self { configs })
+    }
+
+    pub fn single(directory: PathBuf, paths: TsConfigPaths) -> Self {
+        Self { configs: vec![ScopedTsConfig { directory, paths }] }
+    }
+
+    fn paths_for(&self, importer: &Path) -> Option<&TsConfigPaths> {
+        self.configs
+            .iter()
+            .find(|config| importer.starts_with(&config.directory))
+            .map(|config| &config.paths)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexedAliasResolver {
+    index: TsConfigIndex,
+}
+
+impl IndexedAliasResolver {
+    pub fn new(index: TsConfigIndex) -> Self {
+        Self { index }
+    }
+}
+
+impl ResolutionHandler for IndexedAliasResolver {
+    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
+        let importer = Path::new(&request.importer.0);
+        let paths = self.index.paths_for(importer)?;
+        AliasResolver {
+            root: paths.base_url.clone(),
+            aliases: paths.aliases.clone(),
+            mode: request.mode,
+        }
+        .try_resolve(request)
+    }
+
+    fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
+        let importer = Path::new(&request.importer.0);
+        let Some(paths) = self.index.paths_for(importer) else { return Vec::new() };
+        AliasResolver {
+            root: paths.base_url.clone(),
+            aliases: paths.aliases.clone(),
+            mode: request.mode,
+        }
+        .candidate_paths(request)
     }
 }
 
@@ -314,7 +477,8 @@ fn remove_trailing_commas(source: String) -> String {
 #[derive(Clone, Copy, Debug)]
 pub struct PackageResolver;
 impl ResolutionHandler for PackageResolver {
-    fn try_resolve(&self, _importer: &Path, specifier: &str) -> Option<Resolution> {
+    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
+        let specifier = request.specifier;
         (!specifier.starts_with('.') && !specifier.starts_with('/'))
             .then(|| Resolution::External(package_name(specifier)))
     }
@@ -324,9 +488,25 @@ impl ResolutionHandler for PackageResolver {
 pub struct WorkspacePackage {
     pub name: String,
     pub root: PathBuf,
+    pub module_type: PackageModuleType,
     has_exports: bool,
     entrypoints: BTreeMap<String, serde_json::Value>,
     imports: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PackageModuleType {
+    Module,
+    CommonJs,
+    #[default]
+    Unspecified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageContext {
+    pub name: String,
+    pub root: PathBuf,
+    pub module_type: PackageModuleType,
 }
 
 #[derive(Clone, Debug)]
@@ -376,23 +556,51 @@ impl WorkspaceResolver {
             packages.push(WorkspacePackage {
                 name: name.into(),
                 root,
+                module_type: match manifest.get("type").and_then(|value| value.as_str()) {
+                    Some("module") => PackageModuleType::Module,
+                    Some("commonjs") => PackageModuleType::CommonJs,
+                    _ => PackageModuleType::Unspecified,
+                },
                 has_exports: manifest.get("exports").is_some(),
                 entrypoints: manifest_entrypoints(&manifest),
                 imports: manifest_imports(&manifest),
             });
         }
         packages.sort_by(|left, right| left.name.cmp(&right.name));
-        packages.dedup_by(|left, right| left.name == right.name);
+        for duplicate in packages.windows(2) {
+            if duplicate[0].name == duplicate[1].name {
+                return Err(format!(
+                    "duplicate workspace package name `{}` in `{}` and `{}`",
+                    duplicate[0].name,
+                    duplicate[0].root.display(),
+                    duplicate[1].root.display()
+                ));
+            }
+        }
         Ok(Self { packages, mode: ResolutionMode::NodeNext })
     }
 
     pub fn packages(&self) -> &[WorkspacePackage] {
         &self.packages
     }
+
+    pub fn package_context(&self, importer: &Path) -> Option<PackageContext> {
+        self.packages
+            .iter()
+            .filter(|package| importer.starts_with(&package.root))
+            .max_by_key(|package| package.root.components().count())
+            .map(|package| PackageContext {
+                name: package.name.clone(),
+                root: package.root.clone(),
+                module_type: package.module_type,
+            })
+    }
 }
 
 impl ResolutionHandler for WorkspaceResolver {
-    fn try_resolve(&self, importer: &Path, specifier: &str) -> Option<Resolution> {
+    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
+        let importer = Path::new(&request.importer.0);
+        let specifier = request.specifier;
         if specifier.starts_with('.') || specifier.starts_with('/') {
             return None;
         }
@@ -402,19 +610,19 @@ impl ResolutionHandler for WorkspaceResolver {
                 .iter()
                 .filter(|package| importer.starts_with(&package.root))
                 .max_by_key(|package| package.root.components().count())?;
-            let target = resolve_export(&package.imports, specifier, self.mode);
-            return Some(resolve_package_target(package, target, self.mode));
+            let target = resolve_export(&package.imports, specifier, request);
+            return Some(resolve_package_target(package, target, request.mode, true));
         }
         let name = package_name(specifier);
         let package = self.packages.iter().find(|package| package.name == name)?;
         let subpath = specifier.strip_prefix(&name).unwrap_or_default().trim_start_matches('/');
         let key = if subpath.is_empty() { ".".into() } else { format!("./{subpath}") };
-        let configured = resolve_export(&package.entrypoints, &key, self.mode);
+        let configured = resolve_export(&package.entrypoints, &key, request);
         if package.has_exports {
-            return Some(resolve_package_target(package, configured, self.mode));
+            return Some(resolve_package_target(package, configured, request.mode, false));
         }
         if configured.is_some() {
-            return Some(resolve_package_target(package, configured, self.mode));
+            return Some(resolve_package_target(package, configured, request.mode, false));
         }
         let candidate = if subpath.is_empty() {
             package.root.join("src/index")
@@ -422,15 +630,58 @@ impl ResolutionHandler for WorkspaceResolver {
             package.root.join(subpath)
         };
         Some(
-            resolve_file_with_mode(&candidate, self.mode)
+            resolve_file_with_mode(&candidate, request.mode)
                 .map_or(Resolution::Unresolved, Resolution::Module),
         )
+    }
+
+    fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
+        let importer = Path::new(&request.importer.0);
+        let (package, target) = if request.specifier.starts_with('#') {
+            let Some(package) = self
+                .packages
+                .iter()
+                .filter(|package| importer.starts_with(&package.root))
+                .max_by_key(|package| package.root.components().count())
+            else {
+                return Vec::new();
+            };
+            (package, resolve_export(&package.imports, request.specifier, request))
+        } else {
+            let name = package_name(request.specifier);
+            let Some(package) = self.packages.iter().find(|package| package.name == name) else {
+                return Vec::new();
+            };
+            let subpath =
+                request.specifier.strip_prefix(&name).unwrap_or_default().trim_start_matches('/');
+            let key = if subpath.is_empty() { ".".into() } else { format!("./{subpath}") };
+            let target = resolve_export(&package.entrypoints, &key, request).or_else(|| {
+                (!package.has_exports).then(|| {
+                    PackageTarget::InternalPath(if subpath.is_empty() {
+                        "./src/index".into()
+                    } else {
+                        format!("./{subpath}")
+                    })
+                })
+            });
+            (package, target)
+        };
+        match target {
+            Some(PackageTarget::InternalPath(target)) => {
+                let candidate = package.root.join(target.trim_start_matches("./"));
+                lexically_within(&candidate, &package.root)
+                    .then(|| resolution_candidates(&candidate, request.mode))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PackageTarget {
-    Path(String),
+    InternalPath(String),
+    ExternalSpecifier(String),
     Blocked,
 }
 
@@ -478,15 +729,24 @@ fn manifest_entrypoints(manifest: &serde_json::Value) -> BTreeMap<String, serde_
     entries
 }
 
-fn export_target(value: &serde_json::Value, mode: ResolutionMode) -> Option<PackageTarget> {
+fn export_target(
+    value: &serde_json::Value,
+    request: &ResolutionRequest<'_>,
+) -> Option<PackageTarget> {
     match value {
-        serde_json::Value::String(value) => Some(PackageTarget::Path(value.clone())),
+        serde_json::Value::String(value) if value.starts_with("./") => {
+            Some(PackageTarget::InternalPath(value.clone()))
+        }
+        serde_json::Value::String(value) => Some(PackageTarget::ExternalSpecifier(value.clone())),
         serde_json::Value::Null => Some(PackageTarget::Blocked),
         serde_json::Value::Array(targets) => {
             let mut blocked = false;
             for target in targets {
-                match export_target(target, mode) {
-                    Some(path @ PackageTarget::Path(_)) => return Some(path),
+                match export_target(target, request) {
+                    Some(
+                        path @ (PackageTarget::InternalPath(_)
+                        | PackageTarget::ExternalSpecifier(_)),
+                    ) => return Some(path),
                     Some(PackageTarget::Blocked) => blocked = true,
                     None => {}
                 }
@@ -494,10 +754,9 @@ fn export_target(value: &serde_json::Value, mode: ResolutionMode) -> Option<Pack
             blocked.then_some(PackageTarget::Blocked)
         }
         serde_json::Value::Object(conditions) => {
-            let active = resolution_conditions(mode);
             conditions.iter().find_map(|(condition, value)| {
-                (condition == "default" || active.contains(&condition.as_str()))
-                    .then(|| export_target(value, mode))
+                condition_is_active(condition, request)
+                    .then(|| export_target(value, request))
                     .flatten()
             })
         }
@@ -505,22 +764,32 @@ fn export_target(value: &serde_json::Value, mode: ResolutionMode) -> Option<Pack
     }
 }
 
-fn resolution_conditions(mode: ResolutionMode) -> [&'static str; 5] {
-    match mode {
-        ResolutionMode::Node | ResolutionMode::Node16 | ResolutionMode::NodeNext => {
-            ["types", "import", "node", "require", "default"]
-        }
-        ResolutionMode::Bundler => ["types", "import", "browser", "default", "require"],
+fn condition_is_active(condition: &str, request: &ResolutionRequest<'_>) -> bool {
+    if condition == "default" || request.custom_conditions.iter().any(|custom| custom == condition)
+    {
+        return true;
     }
+    let dependency_condition = match request.dependency_kind {
+        DependencyKind::Require => "require",
+        DependencyKind::TypeOnly => "types",
+        DependencyKind::Static | DependencyKind::Dynamic | DependencyKind::ReExport => "import",
+    };
+    condition == dependency_condition
+        || match request.mode {
+            ResolutionMode::Node | ResolutionMode::Node16 | ResolutionMode::NodeNext => {
+                condition == "node"
+            }
+            ResolutionMode::Bundler => condition == "browser",
+        }
 }
 
 fn resolve_export(
     entries: &BTreeMap<String, serde_json::Value>,
     key: &str,
-    mode: ResolutionMode,
+    request: &ResolutionRequest<'_>,
 ) -> Option<PackageTarget> {
     if let Some(target) = entries.get(key) {
-        return export_target(target, mode);
+        return export_target(target, request);
     }
     entries
         .iter()
@@ -534,8 +803,13 @@ fn resolve_export(
         .max_by_key(|(specificity, prefix_len, ..)| (*specificity, *prefix_len))
         .and_then(|(_, _, prefix, suffix, target)| {
             let capture = &key[prefix.len()..key.len() - suffix.len()];
-            export_target(target, mode).map(|target| match target {
-                PackageTarget::Path(path) => PackageTarget::Path(path.replace('*', capture)),
+            export_target(target, request).map(|target| match target {
+                PackageTarget::InternalPath(path) => {
+                    PackageTarget::InternalPath(path.replace('*', capture))
+                }
+                PackageTarget::ExternalSpecifier(path) => {
+                    PackageTarget::ExternalSpecifier(path.replace('*', capture))
+                }
                 PackageTarget::Blocked => PackageTarget::Blocked,
             })
         })
@@ -545,11 +819,18 @@ fn resolve_package_target(
     package: &WorkspacePackage,
     target: Option<PackageTarget>,
     mode: ResolutionMode,
+    allow_external: bool,
 ) -> Resolution {
-    let Some(PackageTarget::Path(target)) = target else { return Resolution::Unresolved };
-    if !target.starts_with("./") {
-        return Resolution::Unresolved;
-    }
+    let Some(target) = target else { return Resolution::Unresolved };
+    let target = match target {
+        PackageTarget::InternalPath(target) => target,
+        PackageTarget::ExternalSpecifier(target) if allow_external => {
+            return Resolution::Redirect(target);
+        }
+        PackageTarget::ExternalSpecifier(_) | PackageTarget::Blocked => {
+            return Resolution::Unresolved;
+        }
+    };
     let candidate = package.root.join(target.trim_start_matches("./"));
     if !lexically_within(&candidate, &package.root) {
         return Resolution::Unresolved;
@@ -607,6 +888,30 @@ pub fn resolve_file_with_mode(base: &Path, mode: ResolutionMode) -> Option<Modul
         }
     }
     None
+}
+
+fn resolution_candidates(base: &Path, mode: ResolutionMode) -> Vec<ModulePath> {
+    let mut candidates = vec![ModulePath(normalize(base))];
+    let extensions: &[&str] = match (mode, base.extension().and_then(|value| value.to_str())) {
+        (
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            Some("js"),
+        ) => &["ts", "tsx", "js", "jsx"],
+        (
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            Some("mjs"),
+        ) => &["mts", "mjs"],
+        (
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            Some("cjs"),
+        ) => &["cts", "cjs"],
+        _ => &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"],
+    };
+    for extension in extensions {
+        candidates.push(ModulePath(normalize(&base.with_extension(extension))));
+        candidates.push(ModulePath(normalize(&base.join(format!("index.{extension}")))));
+    }
+    candidates
 }
 
 fn lexically_within(path: &Path, directory: &Path) -> bool {
@@ -718,6 +1023,30 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn resolve_with(
+        resolver: &dyn ResolutionHandler,
+        importer: &Path,
+        specifier: &str,
+    ) -> Option<Resolution> {
+        resolve_kind_with(resolver, importer, specifier, DependencyKind::Static)
+    }
+
+    fn resolve_kind_with(
+        resolver: &dyn ResolutionHandler,
+        importer: &Path,
+        specifier: &str,
+        dependency_kind: DependencyKind,
+    ) -> Option<Resolution> {
+        let importer = ModulePath(importer.to_string_lossy().into_owned());
+        resolver.try_resolve(&ResolutionRequest {
+            importer: &importer,
+            specifier,
+            dependency_kind,
+            mode: ResolutionMode::NodeNext,
+            custom_conditions: &[],
+        })
+    }
+
     #[test]
     fn resolves_extensions_and_index_modules() {
         let root = std::env::temp_dir().join(format!("wae-resolver-{}", std::process::id()));
@@ -725,8 +1054,11 @@ mod tests {
         fs::write(root.join("folder/index.ts"), "").unwrap();
         let importer = ModulePath(root.join("a.ts").to_string_lossy().into_owned());
         assert!(matches!(
-            RelativeResolver { mode: ResolutionMode::NodeNext }
-                .try_resolve(Path::new(&importer.0), "./folder"),
+            resolve_with(
+                &RelativeResolver { mode: ResolutionMode::NodeNext },
+                Path::new(&importer.0),
+                "./folder"
+            ),
             Some(Resolution::Module(_))
         ));
         fs::remove_dir_all(root).unwrap();
@@ -743,7 +1075,7 @@ mod tests {
             mode: ResolutionMode::NodeNext,
         };
         assert!(matches!(
-            resolver.try_resolve(Path::new("src/a.ts"), "@/shared/util"),
+            resolve_with(&resolver, Path::new("src/a.ts"), "@/shared/util"),
             Some(Resolution::Module(_))
         ));
         fs::remove_dir_all(root).unwrap();
@@ -786,11 +1118,11 @@ mod tests {
             mode: ResolutionMode::NodeNext,
         };
         assert!(matches!(
-            resolver.try_resolve(Path::new("src/app.ts"), "@/auth/index"),
+            resolve_with(&resolver, Path::new("src/app.ts"), "@/auth/index"),
             Some(Resolution::Module(path)) if path.0.ends_with("src/features/auth/index.ts")
         ));
         assert!(matches!(
-            resolver.try_resolve(Path::new("src/app.ts"), "@/shared/auth"),
+            resolve_with(&resolver, Path::new("src/app.ts"), "@/shared/auth"),
             Some(Resolution::Module(path)) if path.0.ends_with("src/shared/auth.ts")
         ));
         fs::remove_dir_all(root).unwrap();
@@ -832,15 +1164,15 @@ mod tests {
         .unwrap();
         let resolver = WorkspaceResolver::discover(&root).unwrap();
         assert!(matches!(
-            resolver.try_resolve(Path::new("apps/web/src/app.ts"), "@acme/ui"),
+            resolve_with(&resolver, Path::new("apps/web/src/app.ts"), "@acme/ui"),
             Some(Resolution::Module(path)) if path.0.ends_with("packages/ui/src/index.ts")
         ));
         assert!(matches!(
-            resolver.try_resolve(&package.join("src/index.ts"), "#internal/button"),
+            resolve_with(&resolver, &package.join("src/index.ts"), "#internal/button"),
             Some(Resolution::Module(path)) if path.0.ends_with("packages/ui/src/components/button.ts")
         ));
         assert!(matches!(
-            resolver.try_resolve(Path::new("apps/web/src/app.ts"), "@acme/ui/components/button"),
+            resolve_with(&resolver, Path::new("apps/web/src/app.ts"), "@acme/ui/components/button"),
             Some(Resolution::Module(path)) if path.0.ends_with("packages/ui/src/components/button.ts")
         ));
         fs::remove_dir_all(root).unwrap();
@@ -854,11 +1186,11 @@ mod tests {
         fs::write(root.join("config.prod.ts"), "").unwrap();
         let resolver = RelativeResolver { mode: ResolutionMode::NodeNext };
         assert!(matches!(
-            resolver.try_resolve(&root.join("a.ts"), "./b.js"),
+            resolve_with(&resolver, &root.join("a.ts"), "./b.js"),
             Some(Resolution::Module(path)) if path.0.ends_with("b.ts")
         ));
         assert!(matches!(
-            resolver.try_resolve(&root.join("a.ts"), "./config.prod"),
+            resolve_with(&resolver, &root.join("a.ts"), "./config.prod"),
             Some(Resolution::Module(path)) if path.0.ends_with("config.prod.ts")
         ));
         fs::remove_dir_all(root).unwrap();
@@ -888,21 +1220,26 @@ mod tests {
         .unwrap();
         let resolver = WorkspaceResolver::discover(&root).unwrap();
         assert!(matches!(
-            resolver.try_resolve(&root.join("app.ts"), "@acme/ui"),
+            resolve_kind_with(
+                &resolver,
+                &root.join("app.ts"),
+                "@acme/ui",
+                DependencyKind::TypeOnly
+            ),
             Some(Resolution::Module(_))
         ));
         assert!(matches!(
-            resolver.try_resolve(&root.join("app.ts"), "@acme/ui/conditional"),
+            resolve_with(&resolver, &root.join("app.ts"), "@acme/ui/conditional"),
             Some(Resolution::Module(path)) if path.0.ends_with("src/import.ts")
         ));
         assert!(matches!(
-            resolver.try_resolve(&root.join("app.ts"), "@acme/ui/feature/special/button"),
+            resolve_with(&resolver, &root.join("app.ts"), "@acme/ui/feature/special/button"),
             Some(Resolution::Module(path)) if path.0.ends_with("src/special/button.ts")
         ));
         for specifier in ["@acme/ui/internal/secret", "@acme/ui/escape", "@acme/ui/private/secret"]
         {
             assert_eq!(
-                resolver.try_resolve(&root.join("app.ts"), specifier),
+                resolve_with(&resolver, &root.join("app.ts"), specifier),
                 Some(Resolution::Unresolved)
             );
         }
@@ -924,6 +1261,160 @@ mod tests {
         let resolver = WorkspaceResolver::discover(&root).unwrap();
         assert!(resolver.packages().iter().any(|package| package.name == "@acme/ui"));
         assert!(!resolver.packages().iter().any(|package| package.name == "@acme/demo"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_kind_selects_only_the_matching_package_condition() {
+        let root = std::env::temp_dir().join(format!("wae-conditions-{}", std::process::id()));
+        let package = root.join("packages/lib");
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"repo","workspaces":["packages/*"]}"#)
+            .unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"pkg","exports":{".":{"types":"./src/types.ts","import":"./src/import.ts","require":"./src/require.ts"}}}"#,
+        )
+        .unwrap();
+        for file in ["types.ts", "import.ts", "require.ts"] {
+            fs::write(package.join("src").join(file), "").unwrap();
+        }
+        let resolver = WorkspaceResolver::discover(&root).unwrap();
+        for (kind, suffix) in [
+            (DependencyKind::TypeOnly, "types.ts"),
+            (DependencyKind::Static, "import.ts"),
+            (DependencyKind::Require, "require.ts"),
+        ] {
+            assert!(matches!(
+                resolve_kind_with(&resolver, &root.join("app.ts"), "pkg", kind),
+                Some(Resolution::Module(path)) if path.0.ends_with(suffix)
+            ));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_imports_can_redirect_to_external_packages_and_detect_loops() {
+        let root = std::env::temp_dir().join(format!("wae-import-map-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r##"{"name":"repo","imports":{"#dep":"dep-node-native","#a":"#b","#b":"#a"}}"##,
+        )
+        .unwrap();
+        let workspaces = WorkspaceResolver::discover(&root).unwrap();
+        let pipeline =
+            ResolverPipeline::new().with_handler(workspaces).with_handler(PackageResolver);
+        let importer = ModulePath(normalize(&root.join("src/app.ts")));
+        let request = |specifier| ResolutionRequest {
+            importer: &importer,
+            specifier,
+            dependency_kind: DependencyKind::Static,
+            mode: ResolutionMode::NodeNext,
+            custom_conditions: &[],
+        };
+        assert_eq!(
+            pipeline.resolve(&request("#dep")),
+            Resolution::External("dep-node-native".into())
+        );
+        assert!(
+            matches!(pipeline.resolve(&request("#a")), Resolution::Invalid(message) if message.contains("loop"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nearest_tsconfig_owns_each_workspace_importer() {
+        let root = std::env::temp_dir().join(format!("wae-ts-index-{}", std::process::id()));
+        for package in ["web", "admin"] {
+            fs::create_dir_all(root.join("apps").join(package).join("src")).unwrap();
+            fs::write(
+                root.join("apps").join(package).join("tsconfig.json"),
+                format!(r#"{{"compilerOptions":{{"baseUrl":".","paths":{{"@local/*":["src/{package}/*"]}}}}}}"#),
+            )
+            .unwrap();
+            fs::create_dir_all(root.join("apps").join(package).join("src").join(package)).unwrap();
+            fs::write(
+                root.join("apps").join(package).join("src").join(package).join("value.ts"),
+                "",
+            )
+            .unwrap();
+        }
+        let resolver = IndexedAliasResolver::new(TsConfigIndex::discover(&root).unwrap());
+        for package in ["web", "admin"] {
+            let importer = root.join("apps").join(package).join("src/app.ts");
+            assert!(matches!(
+                resolve_with(&resolver, &importer, "@local/value"),
+                Some(Resolution::Module(path)) if path.0.contains(&format!("/{package}/src/{package}/value.ts"))
+            ));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_workspace_names_are_configuration_errors() {
+        let root = std::env::temp_dir().join(format!("wae-workspace-dupe-{}", std::process::id()));
+        for package in ["a", "b"] {
+            fs::create_dir_all(root.join("packages").join(package)).unwrap();
+            fs::write(
+                root.join("packages").join(package).join("package.json"),
+                r#"{"name":"same"}"#,
+            )
+            .unwrap();
+        }
+        fs::write(root.join("package.json"), r#"{"name":"repo","workspaces":["packages/*"]}"#)
+            .unwrap();
+        let error = WorkspaceResolver::discover(&root).unwrap_err();
+        assert!(error.contains("duplicate workspace package name `same`"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absolute_module_specifiers_are_rejected() {
+        let importer = ModulePath("/project/src/app.ts".into());
+        let request = ResolutionRequest {
+            importer: &importer,
+            specifier: "/outside/secret.ts",
+            dependency_kind: DependencyKind::Static,
+            mode: ResolutionMode::NodeNext,
+            custom_conditions: &[],
+        };
+        assert!(matches!(
+            RelativeResolver { mode: ResolutionMode::NodeNext }.try_resolve(&request),
+            Some(Resolution::Invalid(message)) if message.contains("outside")
+        ));
+    }
+
+    #[test]
+    fn workspace_index_models_package_module_type_and_scales_across_packages() {
+        let root =
+            std::env::temp_dir().join(format!("wae-workspace-matrix-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"repo","workspaces":["packages/*"]}"#)
+            .unwrap();
+        for index in 0..12 {
+            let package = root.join(format!("packages/p{index}"));
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(package.join("src/index.ts"), "").unwrap();
+            fs::write(
+                package.join("package.json"),
+                format!(
+                    r#"{{"name":"@matrix/p{index}","type":"{}","exports":"./src/index.ts"}}"#,
+                    if index % 2 == 0 { "module" } else { "commonjs" }
+                ),
+            )
+            .unwrap();
+        }
+        let resolver = WorkspaceResolver::discover(&root).unwrap();
+        assert_eq!(resolver.packages().len(), 13); // project root plus twelve workspaces
+        let context = resolver.package_context(&root.join("packages/p0/src/app.ts")).unwrap();
+        assert_eq!(context.module_type, PackageModuleType::Module);
+        for index in 0..12 {
+            assert!(matches!(
+                resolve_with(&resolver, &root.join("app.ts"), &format!("@matrix/p{index}")),
+                Some(Resolution::Module(path)) if path.0.ends_with(&format!("packages/p{index}/src/index.ts"))
+            ));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

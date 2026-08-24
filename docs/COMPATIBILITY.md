@@ -32,13 +32,15 @@
 
 - single package
 - npm/yarn workspaces و `pnpm-workspace.yaml` بر اساس declarationهای صریح
-- package `exports`/`imports` با encapsulation، condition، array، null و subpath pattern در سطح MVP
+- package `exports`/`imports` با encapsulation، condition، array، null، subpath pattern و external `imports` targets
 
 ### module system
 
 - ESM و mappingهای TypeScript NodeNext (`.js` → `.ts`, `.mjs` → `.mts`, `.cjs` → `.cts`)
-- CommonJS (پوشش MVP resolver)
-- JSONC `tsconfig.json`, relative `extends`, `baseUrl`, and longest-match `paths`
+- CommonJS با condition مجزای `require` (متقابلاً انحصاری با `import`)
+- type-only resolution با condition اختصاصی `types`
+- JSONC `tsconfig.json`, relative `extends`, `baseUrl`, longest-match `paths` و انتخاب نزدیک‌ترین config والد در monorepo
+- package context شامل نزدیک‌ترین workspace و `package.json#type`
 
 فایل resolve‌شده‌ای که با `project.exclude` از discovery کنار گذاشته شده، به‌صورت node صریح
 `Excluded` و opaque در مدل نگه‌داری می‌شود؛ dependencyهای transitive آن تحلیل نمی‌شوند.

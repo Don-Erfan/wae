@@ -473,6 +473,10 @@ pub mod domain {
         pub dependency_path: Vec<ModuleId>,
         pub suggestion: Option<String>,
         pub metadata: BTreeMap<String, String>,
+        #[serde(default)]
+        pub suppressed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub suppression_reason: Option<String>,
     }
 
     impl Diagnostic {
@@ -511,6 +515,91 @@ pub mod domain {
     }
 }
 
+pub mod rule_registry {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RuleDescriptor {
+        pub id: &'static str,
+        pub title: &'static str,
+        pub description: &'static str,
+        pub category: &'static str,
+        pub configurable: bool,
+    }
+
+    pub static RULES: &[RuleDescriptor] = &[
+        RuleDescriptor {
+            id: "ARCH-001",
+            title: "Circular dependency",
+            description: "Detects strongly connected module components.",
+            category: "dependency-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-002",
+            title: "Forbidden dependency",
+            description: "Enforces configured dependency policies and architecture presets.",
+            category: "architecture",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-003",
+            title: "Layer boundary",
+            description: "Enforces configured layer import direction while allowing same-layer imports.",
+            category: "architecture",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-004",
+            title: "Feature boundary",
+            description: "Requires cross-feature dependencies to use public entrypoints.",
+            category: "architecture",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-005",
+            title: "Private import",
+            description: "Prevents access to private modules from outside their owner.",
+            category: "architecture",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "PARSE-001",
+            title: "Parse failure",
+            description: "Reports malformed or unreadable source files.",
+            category: "correctness",
+            configurable: false,
+        },
+        RuleDescriptor {
+            id: "RESOLVE-001",
+            title: "Unresolved import",
+            description: "Reports relative or aliased imports that cannot be resolved.",
+            category: "correctness",
+            configurable: false,
+        },
+        RuleDescriptor {
+            id: "RESOLVE-002",
+            title: "Invalid module specifier",
+            description: "Reports module specifiers that violate the analysis boundary.",
+            category: "correctness",
+            configurable: false,
+        },
+        RuleDescriptor {
+            id: "SUPPRESS-001",
+            title: "Unused suppression",
+            description: "Reports suppression directives that did not match a diagnostic.",
+            category: "maintainability",
+            configurable: false,
+        },
+    ];
+
+    pub fn descriptor(id: &str) -> Option<&'static RuleDescriptor> {
+        RULES.iter().find(|rule| rule.id == id)
+    }
+
+    pub fn configurable_ids() -> impl Iterator<Item = &'static str> {
+        RULES.iter().filter(|rule| rule.configurable).map(|rule| rule.id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::banner_lines;
@@ -521,7 +610,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.7"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.8"]);
     }
 
     #[test]

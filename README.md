@@ -50,5 +50,5 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-See [Architecture](docs/ARCHITECTURE.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
+See [Configuration](docs/CONFIGURATION.md), [Architecture](docs/ARCHITECTURE.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
 Release maintainers should also read [Releasing](docs/RELEASING.md).

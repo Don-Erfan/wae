@@ -4,7 +4,10 @@ use std::path::Path;
 
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
-use wae_core::domain::{ConfigError, ConfigErrorKind, LayerPolicy, Severity};
+use wae_core::{
+    domain::{ConfigError, ConfigErrorKind, LayerPolicy, Severity},
+    rule_registry,
+};
 
 pub const CONFIG_FILE: &str = "wae.yaml";
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
@@ -20,6 +23,7 @@ pub struct Config {
     pub output: OutputConfig,
     pub cache: CacheConfig,
     pub resolution: ResolutionConfig,
+    pub suppressions: SuppressionConfig,
     #[serde(skip)]
     pub configured: bool,
 }
@@ -39,6 +43,7 @@ impl Default for Config {
             output: OutputConfig::default(),
             cache: CacheConfig::default(),
             resolution: ResolutionConfig::default(),
+            suppressions: SuppressionConfig::default(),
             configured: false,
         }
     }
@@ -182,6 +187,20 @@ pub enum ResolutionMode {
 #[serde(default, deny_unknown_fields)]
 pub struct ResolutionConfig {
     pub mode: ResolutionMode,
+    pub custom_conditions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuppressionConfig {
+    pub require_reason: bool,
+    pub report_unused: bool,
+}
+
+impl Default for SuppressionConfig {
+    fn default() -> Self {
+        Self { require_reason: true, report_unused: true }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,8 +308,7 @@ impl Config {
                 ),
             ));
         }
-        let known: BTreeSet<_> =
-            ["ARCH-001", "ARCH-002", "ARCH-003", "ARCH-004", "ARCH-005"].into_iter().collect();
+        let known: BTreeSet<_> = rule_registry::configurable_ids().collect();
         if let Some(rule) = self.rules.keys().find(|rule| !known.contains(rule.as_str())) {
             return Err(config_error(
                 ConfigErrorKind::UnknownRule,
@@ -333,6 +351,15 @@ impl Config {
         }
         validate_patterns(&self.project.include, "project.include")?;
         validate_patterns(&self.project.exclude, "project.exclude")?;
+        for (index, condition) in self.resolution.custom_conditions.iter().enumerate() {
+            if condition.trim().is_empty() {
+                return Err(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("resolution.custom_conditions.{index}")),
+                    "custom resolution conditions cannot be empty".into(),
+                ));
+            }
+        }
         validate_patterns(
             &self.architecture.features.public_entrypoints,
             "architecture.features.public_entrypoints",

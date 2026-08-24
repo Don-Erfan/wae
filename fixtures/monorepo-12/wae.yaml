@@ -1,0 +1,6 @@
+version: 1
+project:
+  include: ["**/*.ts"]
+  exclude: ["**/node_modules/**"]
+architecture:
+  layers: {}

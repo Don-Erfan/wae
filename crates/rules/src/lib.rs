@@ -1,14 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
 use wae_core::domain::{Diagnostic, FeatureId, ModuleId, Project, SourceLocation};
+use wae_core::rule_registry::{self, RuleDescriptor};
 use wae_graph::ModuleGraph;
-
-pub struct RuleMetadata {
-    pub id: &'static str,
-    pub title: &'static str,
-}
 
 pub struct RuleContext<'a> {
     pub project: &'a Project,
@@ -17,6 +13,34 @@ pub struct RuleContext<'a> {
     pub module_layers: &'a HashMap<ModuleId, String>,
     pub module_features: &'a HashMap<ModuleId, FeatureId>,
     pub module_feature_roots: &'a HashMap<ModuleId, String>,
+    pub policies: &'a CompiledRulePolicies,
+}
+
+pub struct CompiledRulePolicies {
+    forbidden_dependencies: Vec<(GlobMatcher, GlobMatcher)>,
+    public_entrypoints: Vec<GlobMatcher>,
+}
+
+impl CompiledRulePolicies {
+    pub fn compile(config: &Config) -> Result<Self, String> {
+        Ok(Self {
+            forbidden_dependencies: config
+                .architecture
+                .forbidden_dependencies
+                .iter()
+                .map(|policy| {
+                    Ok::<_, String>((compile_matcher(&policy.from)?, compile_matcher(&policy.to)?))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            public_entrypoints: config
+                .architecture
+                .features
+                .public_entrypoints
+                .iter()
+                .map(|entry| compile_matcher(entry))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
 }
 
 pub trait DiagnosticSink {
@@ -29,7 +53,7 @@ impl DiagnosticSink for Vec<Diagnostic> {
 }
 
 pub trait Rule: Send + Sync {
-    fn metadata(&self) -> &'static RuleMetadata;
+    fn metadata(&self) -> &'static RuleDescriptor;
     fn evaluate(
         &self,
         context: &RuleContext<'_>,
@@ -61,7 +85,7 @@ impl RuleSet {
     pub fn evaluate(&self, context: &RuleContext<'_>) -> Result<Vec<Diagnostic>, String> {
         let mut diagnostics = Vec::new();
         for rule in &self.rules {
-            if !context.config.configured && rule.metadata().id != CIRCULAR.id {
+            if !context.config.configured && rule.metadata().id != "ARCH-001" {
                 continue;
             }
             let severity =
@@ -74,15 +98,23 @@ impl RuleSet {
                 diagnostic.refresh_fingerprint();
             }
         }
+        let feature_edges = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.rule_id.0 == "ARCH-004")
+            .map(|diagnostic| diagnostic.dependency_path.clone())
+            .collect::<HashSet<_>>();
+        diagnostics.retain(|diagnostic| {
+            diagnostic.rule_id.0 != "ARCH-005"
+                || !feature_edges.contains(&diagnostic.dependency_path)
+        });
         Ok(diagnostics)
     }
 }
 
-static CIRCULAR: RuleMetadata = RuleMetadata { id: "ARCH-001", title: "Circular dependency" };
 pub struct CircularDependencyRule;
 impl Rule for CircularDependencyRule {
-    fn metadata(&self) -> &'static RuleMetadata {
-        &CIRCULAR
+    fn metadata(&self) -> &'static RuleDescriptor {
+        rule_registry::descriptor("ARCH-001").expect("registered built-in rule")
     }
     fn evaluate(
         &self,
@@ -91,7 +123,7 @@ impl Rule for CircularDependencyRule {
     ) -> Result<(), String> {
         for cycle in context.graph.cycles() {
             let primary = edge_location(context.project, &cycle[0], &cycle[1]);
-            let mut diagnostic = Diagnostic::new(CIRCULAR.id, "Circular dependency detected");
+            let mut diagnostic = Diagnostic::new("ARCH-001", "Circular dependency detected");
             diagnostic.primary_location = primary;
             diagnostic.dependency_path = cycle;
             diagnostic.suggestion = Some(
@@ -103,38 +135,29 @@ impl Rule for CircularDependencyRule {
     }
 }
 
-static FORBIDDEN: RuleMetadata = RuleMetadata { id: "ARCH-002", title: "Forbidden dependency" };
 pub struct ForbiddenDependencyRule;
 impl Rule for ForbiddenDependencyRule {
-    fn metadata(&self) -> &'static RuleMetadata {
-        &FORBIDDEN
+    fn metadata(&self) -> &'static RuleDescriptor {
+        rule_registry::descriptor("ARCH-002").expect("registered built-in rule")
     }
     fn evaluate(
         &self,
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        let policies = context
-            .config
-            .architecture
-            .forbidden_dependencies
-            .iter()
-            .map(|policy| {
-                Ok::<_, String>((compile_matcher(&policy.from)?, compile_matcher(&policy.to)?))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         for dependency in &context.project.dependencies {
             let from = dependency.from.0.replace('\\', "/");
             let to = dependency.to.0.replace('\\', "/");
-            let configured = policies.iter().any(|(from_matcher, to_matcher)| {
-                from_matcher.is_match(&from) && to_matcher.is_match(&to)
-            });
+            let configured =
+                context.policies.forbidden_dependencies.iter().any(|(from_matcher, to_matcher)| {
+                    from_matcher.is_match(&from) && to_matcher.is_match(&to)
+                });
             let package_to_app = context.config.architecture.presets.monorepo_boundaries
                 && (from.starts_with("packages/") || from.contains("/packages/"))
                 && (to.starts_with("apps/") || to.contains("/apps/"));
             if configured || package_to_app {
                 sink.emit(dependency_diagnostic(
-                    FORBIDDEN.id,
+                    "ARCH-002",
                     "Dependency is forbidden by architecture policy",
                     dependency,
                     "Remove the dependency or explicitly revise the policy.",
@@ -145,11 +168,10 @@ impl Rule for ForbiddenDependencyRule {
     }
 }
 
-static LAYER: RuleMetadata = RuleMetadata { id: "ARCH-003", title: "Layer boundary violation" };
 pub struct LayerBoundaryRule;
 impl Rule for LayerBoundaryRule {
-    fn metadata(&self) -> &'static RuleMetadata {
-        &LAYER
+    fn metadata(&self) -> &'static RuleDescriptor {
+        rule_registry::descriptor("ARCH-003").expect("registered built-in rule")
     }
     fn evaluate(
         &self,
@@ -174,7 +196,7 @@ impl Rule for LayerBoundaryRule {
                 .is_none_or(|layer| layer.can_import.contains(to));
             if !allowed {
                 sink.emit(dependency_diagnostic(
-                    LAYER.id,
+                    "ARCH-003",
                     &format!("Layer `{from}` cannot import `{to}`"),
                     dependency,
                     "Depend on an allowed lower layer or introduce an application facade.",
@@ -185,25 +207,16 @@ impl Rule for LayerBoundaryRule {
     }
 }
 
-static FEATURE: RuleMetadata = RuleMetadata { id: "ARCH-004", title: "Feature boundary violation" };
 pub struct FeatureBoundaryRule;
 impl Rule for FeatureBoundaryRule {
-    fn metadata(&self) -> &'static RuleMetadata {
-        &FEATURE
+    fn metadata(&self) -> &'static RuleDescriptor {
+        rule_registry::descriptor("ARCH-004").expect("registered built-in rule")
     }
     fn evaluate(
         &self,
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        let public_entries = context
-            .config
-            .architecture
-            .features
-            .public_entrypoints
-            .iter()
-            .map(|entry| compile_matcher(entry))
-            .collect::<Result<Vec<_>, _>>()?;
         for dependency in &context.project.dependencies {
             let Some(target_feature) = context.module_features.get(&dependency.to) else {
                 continue;
@@ -215,7 +228,7 @@ impl Rule for FeatureBoundaryRule {
                     &dependency.to.0,
                     target_feature,
                     context.module_feature_roots.get(&dependency.to),
-                    &public_entries,
+                    &context.policies.public_entrypoints,
                 )
             {
                 let importer = context
@@ -223,7 +236,7 @@ impl Rule for FeatureBoundaryRule {
                     .get(&dependency.from)
                     .map_or("outside", |feature| feature.name.as_str());
                 sink.emit(dependency_diagnostic(
-                    FEATURE.id,
+                    "ARCH-004",
                     &format!(
                         "Importer `{importer}` accesses internals of feature `{}` in package `{}`",
                         target_feature.name, target_feature.package.0
@@ -237,11 +250,10 @@ impl Rule for FeatureBoundaryRule {
     }
 }
 
-static PRIVATE: RuleMetadata = RuleMetadata { id: "ARCH-005", title: "Private module import" };
 pub struct PrivateImportRule;
 impl Rule for PrivateImportRule {
-    fn metadata(&self) -> &'static RuleMetadata {
-        &PRIVATE
+    fn metadata(&self) -> &'static RuleDescriptor {
+        rule_registry::descriptor("ARCH-005").expect("registered built-in rule")
     }
     fn evaluate(
         &self,
@@ -259,7 +271,7 @@ impl Rule for PrivateImportRule {
             };
             if private && outside_owner {
                 sink.emit(dependency_diagnostic(
-                    PRIVATE.id,
+                    "ARCH-005",
                     "Private module imported outside its public API",
                     dependency,
                     "Import from the module's public entrypoint.",
@@ -358,6 +370,7 @@ mod tests {
             module_layers: Box::leak(Box::new(HashMap::new())),
             module_features: features,
             module_feature_roots: Box::leak(Box::new(HashMap::new())),
+            policies: Box::leak(Box::new(CompiledRulePolicies::compile(config).unwrap())),
         }
     }
 
@@ -438,6 +451,7 @@ mod tests {
                     module_layers: &HashMap::new(),
                     module_features: &features,
                     module_feature_roots: &roots,
+                    policies: &CompiledRulePolicies::compile(&config).unwrap(),
                 },
                 &mut diagnostics,
             )
@@ -450,5 +464,22 @@ mod tests {
         let exact = compile_matcher("src/shared/*.ts").unwrap();
         assert!(exact.is_match("src/shared/util.ts"));
         assert!(!exact.is_match("src/shared/deep/util.ts"));
+    }
+
+    #[test]
+    fn feature_and_private_rules_do_not_duplicate_the_same_edge() {
+        let edge =
+            dependency("src/features/payment/service.ts", "src/features/user/internal/token.ts");
+        let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
+        let graph = ModuleGraph::from_project(&project);
+        let config = Config { configured: true, ..Config::default() };
+        let features = HashMap::from([
+            (edge.from, FeatureId { package: PackageName("app".into()), name: "payment".into() }),
+            (edge.to, FeatureId { package: PackageName("app".into()), name: "user".into() }),
+        ]);
+        let diagnostics =
+            RuleSet::defaults().evaluate(&context(&project, &graph, &config, &features)).unwrap();
+        assert_eq!(diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-004").count(), 1);
+        assert_eq!(diagnostics.iter().filter(|d| d.rule_id.0 == "ARCH-005").count(), 0);
     }
 }

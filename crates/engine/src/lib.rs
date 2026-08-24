@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,10 +14,12 @@ use wae_core::domain::{
 use wae_graph::ModuleGraph;
 use wae_parser::{JsTsParser, ParserAdapter};
 use wae_resolver::{
-    ModuleResolver, Resolution, ResolverPipeline, TsConfigLoader, WorkspacePackage,
-    WorkspaceResolver,
+    ModuleResolver, Resolution, ResolutionRequest, ResolverPipeline, TsConfigIndex,
+    WorkspacePackage, WorkspaceResolver,
 };
-use wae_rules::{RuleContext, RuleSet};
+use wae_rules::{CompiledRulePolicies, RuleContext, RuleSet};
+
+mod suppression;
 
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
@@ -37,6 +39,76 @@ pub struct Analysis {
     pub project: Project,
     pub graph: ModuleGraph,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub changed: HashSet<String>,
+    pub deleted: HashSet<String>,
+}
+
+/// Port implemented by Git (or another VCS) outside the analysis engine.
+pub trait VcsPort {
+    fn changes(&self, base: Option<&str>) -> Result<ChangeSet, String>;
+}
+
+pub struct ImpactAnalyzer;
+
+impl ImpactAnalyzer {
+    pub fn affected(analysis: &Analysis, changes: &ChangeSet) -> HashSet<String> {
+        let mut affected = changes.changed.clone();
+        for diagnostic in &analysis.diagnostics {
+            if diagnostic.rule_id.0 != "RESOLVE-001" {
+                continue;
+            }
+            let candidate_deleted = diagnostic
+                .metadata
+                .get("candidatePaths")
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| changes.deleted.contains(candidate))
+                });
+            if candidate_deleted {
+                if let Some(location) = &diagnostic.primary_location {
+                    affected.insert(location.file.clone());
+                }
+            }
+        }
+        let mut queue = VecDeque::from_iter(affected.iter().cloned());
+        while let Some(module) = queue.pop_front() {
+            for importer in analysis.graph.incoming(&ModuleId(module)) {
+                if affected.insert(importer.0.clone()) {
+                    queue.push_back(importer.0);
+                }
+            }
+        }
+        affected
+    }
+}
+
+/// Mutable membership index kept in lockstep with `Project` while the graph is built.
+/// It prevents repeated linear scans for every resolved edge in large repositories.
+#[derive(Default)]
+struct ProjectIndex {
+    modules: HashSet<ModuleId>,
+    packages: HashSet<PackageName>,
+}
+
+impl ProjectIndex {
+    fn from_project(project: &Project) -> Self {
+        Self {
+            modules: project.modules.iter().map(|module| module.id.clone()).collect(),
+            packages: project.packages.iter().map(|package| package.name.clone()).collect(),
+        }
+    }
+
+    fn insert_module(&mut self, id: ModuleId) -> bool {
+        self.modules.insert(id)
+    }
+
+    fn insert_package(&mut self, name: PackageName) -> bool {
+        self.packages.insert(name)
+    }
 }
 
 #[derive(Debug)]
@@ -71,13 +143,12 @@ impl<P: ParserAdapter> Engine<P> {
         let config = Config::load(&root).map_err(AnalysisError::Config)?;
         let architecture = CompiledArchitectureModel::compile(&config)?;
         let files = discover_modules(&root, &config)?;
-        let tsconfig = TsConfigLoader::load(&root).map_err(AnalysisError::Project)?;
+        let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_resolver =
             WorkspaceResolver::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_packages = workspace_resolver.packages().to_vec();
-        let resolver = ResolverPipeline::node_with_workspaces(
-            tsconfig.base_url,
-            tsconfig.aliases,
+        let resolver = ResolverPipeline::indexed_node_with_workspaces(
+            tsconfigs,
             workspace_resolver,
             config.resolution.mode,
         );
@@ -89,6 +160,7 @@ impl<P: ParserAdapter> Engine<P> {
         let mut features = HashMap::new();
         let mut feature_roots = HashMap::new();
         let mut cache = AnalysisCache::load(&root, &config)?;
+        let mut suppressions = Vec::new();
 
         for path in &files {
             let relative = relative_path(&root, path);
@@ -119,6 +191,7 @@ impl<P: ParserAdapter> Engine<P> {
 
         project.packages = discovered_packages.into_values().collect();
         project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
+        let mut project_index = ProjectIndex::from_project(&project);
 
         for path in &files {
             let module_path = ModulePath(normalize(path));
@@ -135,6 +208,13 @@ impl<P: ParserAdapter> Engine<P> {
                 }
             };
             let source_hash = stable_hash(source.as_bytes());
+            suppression::collect(
+                &module_id.0,
+                &source,
+                config.suppressions.require_reason,
+                &mut suppressions,
+                &mut project.diagnostics,
+            );
             let parsed = cache
                 .get(&module_id.0, source_hash)
                 .map(Ok)
@@ -147,10 +227,21 @@ impl<P: ParserAdapter> Engine<P> {
                     for mut import in imports {
                         import.module_id = module_id.clone();
                         import.location.file = module_id.0.clone();
-                        match resolver.resolve(&module_path, &import.specifier) {
+                        let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
+                        let resolution_request = ResolutionRequest {
+                            importer: &module_path,
+                            specifier: &import.specifier,
+                            dependency_kind: candidate.kind.clone(),
+                            mode: config.resolution.mode,
+                            custom_conditions: &config.resolution.custom_conditions,
+                        };
+                        let candidate_paths = resolver
+                            .candidate_paths(&resolution_request)
+                            .into_iter()
+                            .map(|path| relative_resolved_path(&root, &path.0))
+                            .collect::<Vec<_>>();
+                        match resolver.resolve(&resolution_request) {
                             Resolution::Module(target) => {
-                                let candidate =
-                                    wae_core::domain::DependencyCandidate::from(import.clone());
                                 let target_id = ModuleId(relative_resolved_path(&root, &target.0));
                                 let target_kind = workspace_packages
                                     .iter()
@@ -165,7 +256,7 @@ impl<P: ParserAdapter> Engine<P> {
                                             module: target_id.clone(),
                                         },
                                     );
-                                if !project.modules.iter().any(|module| module.id == target_id) {
+                                if project_index.insert_module(target_id.clone()) {
                                     let target_path = root.join(&target_id.0);
                                     let package = infer_package(
                                         &root,
@@ -173,11 +264,7 @@ impl<P: ParserAdapter> Engine<P> {
                                         &workspace_packages,
                                         &default_package,
                                     );
-                                    if !project
-                                        .packages
-                                        .iter()
-                                        .any(|known| known.name == package.name)
-                                    {
+                                    if project_index.insert_package(package.name.clone()) {
                                         project.packages.push(package.clone());
                                     }
                                     let layer = architecture.layer(&target_id.0)?;
@@ -218,7 +305,7 @@ impl<P: ParserAdapter> Engine<P> {
                             }
                             Resolution::External(name) => {
                                 let external_id = ModuleId(format!("external:{name}"));
-                                if !project.modules.iter().any(|module| module.id == external_id) {
+                                if project_index.insert_module(external_id.clone()) {
                                     let external_package = PackageName(name.clone());
                                     project.modules.push(Module {
                                         id: external_id.clone(),
@@ -229,19 +316,13 @@ impl<P: ParserAdapter> Engine<P> {
                                         layer: None,
                                         framework_metadata: FrameworkMetadata::default(),
                                     });
-                                    if !project
-                                        .packages
-                                        .iter()
-                                        .any(|package| package.name == external_package)
-                                    {
+                                    if project_index.insert_package(external_package.clone()) {
                                         project.packages.push(Package {
                                             name: external_package,
                                             root_path: String::new(),
                                         });
                                     }
                                 }
-                                let candidate =
-                                    wae_core::domain::DependencyCandidate::from(import.clone());
                                 project.resolved_dependencies.push(ResolvedDependency {
                                     from: module_id.clone(),
                                     specifier: import.specifier.clone(),
@@ -257,8 +338,6 @@ impl<P: ParserAdapter> Engine<P> {
                                 });
                             }
                             Resolution::Unresolved => {
-                                let candidate =
-                                    wae_core::domain::DependencyCandidate::from(import.clone());
                                 project.resolved_dependencies.push(ResolvedDependency {
                                     from: module_id.clone(),
                                     specifier: import.specifier.clone(),
@@ -271,7 +350,39 @@ impl<P: ParserAdapter> Engine<P> {
                                     },
                                     location: import.location.clone(),
                                 });
-                                project.diagnostics.push(unresolved_diagnostic(&import))
+                                let mut diagnostic = unresolved_diagnostic(&import);
+                                if !candidate_paths.is_empty() {
+                                    diagnostic.metadata.insert(
+                                        "candidatePaths".into(),
+                                        serde_json::to_string(&candidate_paths).map_err(
+                                            |error| AnalysisError::Internal(error.to_string()),
+                                        )?,
+                                    );
+                                    diagnostic.refresh_fingerprint();
+                                }
+                                project.diagnostics.push(diagnostic)
+                            }
+                            Resolution::Invalid(reason) => {
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind.clone(),
+                                    target: DependencyTarget::Unresolved {
+                                        specifier: import.specifier.clone(),
+                                        reason: reason.clone(),
+                                    },
+                                    location: import.location.clone(),
+                                });
+                                let mut diagnostic =
+                                    simple_diagnostic("RESOLVE-002", reason, &module_id.0);
+                                diagnostic.primary_location = Some(import.location.clone());
+                                diagnostic.refresh_fingerprint();
+                                project.diagnostics.push(diagnostic);
+                            }
+                            Resolution::Redirect(target) => {
+                                return Err(AnalysisError::Internal(format!(
+                                    "resolver leaked redirect `{target}` out of its pipeline"
+                                )));
                             }
                         }
                         project.dependency_candidates.push(import.clone().into());
@@ -296,6 +407,8 @@ impl<P: ParserAdapter> Engine<P> {
         project.modules.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         project.dependencies.sort_by(|a, b| (&a.from.0, &a.to.0).cmp(&(&b.from.0, &b.to.0)));
         let graph = ModuleGraph::from_project(&project);
+        let rule_policies =
+            CompiledRulePolicies::compile(&config).map_err(AnalysisError::Internal)?;
         let context = RuleContext {
             project: &project,
             graph: &graph,
@@ -303,9 +416,11 @@ impl<P: ParserAdapter> Engine<P> {
             module_layers: &layers,
             module_features: &features,
             module_feature_roots: &feature_roots,
+            policies: &rule_policies,
         };
         let mut diagnostics = project.diagnostics.clone();
         diagnostics.extend(self.rules.evaluate(&context).map_err(AnalysisError::Internal)?);
+        suppression::apply(&mut diagnostics, &mut suppressions, config.suppressions.report_unused);
         diagnostics.sort_by(|a, b| diagnostic_key(a).cmp(&diagnostic_key(b)));
         Ok(Analysis { schema_version: OUTPUT_SCHEMA_VERSION, project, graph, diagnostics })
     }
@@ -617,12 +732,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_suppressions_require_reasons_and_report_unused_directives() {
+        let mut directives = Vec::new();
+        let mut diagnostics = Vec::new();
+        suppression::collect(
+            "src/app.ts",
+            "// wae-ignore ARCH-003 -- migration ticket ARC-12\nimport './feature';\n// wae-ignore ARCH-004 -- temporary",
+            true,
+            &mut directives,
+            &mut diagnostics,
+        );
+        let mut violation = Diagnostic::new("ARCH-003", "layer");
+        violation.primary_location =
+            Some(SourceLocation { file: "src/app.ts".into(), line: 2, column: 1 });
+        diagnostics.push(violation);
+        suppression::apply(&mut diagnostics, &mut directives, true);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule_id.0 == "ARCH-003"
+                && diagnostic.suppressed
+                && diagnostic.suppression_reason.as_deref() == Some("migration ticket ARC-12")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule_id.0 == "SUPPRESS-001" && diagnostic.message.contains("Unused")
+        }));
+    }
+
+    #[test]
+    fn source_suppression_without_required_reason_is_invalid() {
+        let mut directives = Vec::new();
+        let mut diagnostics = Vec::new();
+        suppression::collect(
+            "src/app.ts",
+            "// wae-ignore ARCH-003",
+            true,
+            &mut directives,
+            &mut diagnostics,
+        );
+        assert!(directives.is_empty());
+        assert_eq!(diagnostics[0].rule_id.0, "SUPPRESS-001");
+        assert!(diagnostics[0].message.contains("requires a reason"));
+    }
+
+    #[test]
     fn resolved_windows_verbatim_paths_become_project_relative_ids() {
         let root = Path::new(r"\\?\D:\a\wae\wae");
         let resolved = "//?/D:/a/wae/wae/src/a.ts";
         assert_eq!(relative_resolved_path(root, "//?/D:/a/wae/wae"), "");
         assert_eq!(relative_resolved_path(root, resolved), "src/a.ts");
         assert!(normalized_path_is_within(resolved, Path::new(r"\\?\D:\a\wae\wae")));
+    }
+
+    #[test]
+    fn real_twelve_package_monorepo_fixture_resolves_end_to_end() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/monorepo-12");
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(root)).unwrap();
+        assert_eq!(analysis.project.modules.len(), 12);
+        assert_eq!(analysis.project.dependencies.len(), 11);
+        assert_eq!(analysis.graph.node_count(), 12);
+        assert!(analysis.diagnostics.is_empty(), "{:?}", analysis.diagnostics);
+        assert_eq!(
+            analysis
+                .project
+                .resolved_dependencies
+                .iter()
+                .filter(|dependency| matches!(
+                    dependency.target,
+                    DependencyTarget::WorkspacePackage { .. }
+                ))
+                .count(),
+            11
+        );
     }
 
     #[test]
