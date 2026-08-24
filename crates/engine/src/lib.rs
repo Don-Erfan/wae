@@ -145,12 +145,11 @@ impl<P: ParserAdapter> Engine<P> {
                             Resolution::Module(target) => {
                                 let candidate =
                                     wae_core::domain::DependencyCandidate::from(import.clone());
-                                let target_id =
-                                    ModuleId(relative_path(&root, Path::new(&target.0)));
+                                let target_id = ModuleId(relative_resolved_path(&root, &target.0));
                                 let target_kind = workspace_packages
                                     .iter()
                                     .filter(|package| {
-                                        Path::new(&target.0).starts_with(&package.root)
+                                        normalized_path_is_within(&target.0, &package.root)
                                     })
                                     .max_by_key(|package| package.root.components().count())
                                     .map_or_else(
@@ -480,6 +479,26 @@ fn infer_package(
 fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
+
+fn relative_resolved_path(root: &Path, resolved: &str) -> String {
+    let root = normalize(root);
+    let resolved = resolved.replace('\\', "/");
+    resolved
+        .strip_prefix(root.trim_end_matches('/'))
+        .and_then(|relative| relative.strip_prefix('/'))
+        .unwrap_or(&resolved)
+        .to_string()
+}
+
+fn normalized_path_is_within(resolved: &str, directory: &Path) -> bool {
+    let directory = normalize(directory);
+    let resolved = resolved.replace('\\', "/");
+    resolved == directory
+        || resolved
+            .strip_prefix(directory.trim_end_matches('/'))
+            .is_some_and(|relative| relative.starts_with('/'))
+}
+
 fn normalize(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -515,6 +534,15 @@ fn unresolved_diagnostic(import: &wae_core::domain::Import) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_windows_verbatim_paths_become_project_relative_ids() {
+        let root = Path::new(r"\\?\D:\a\wae\wae");
+        let resolved = "//?/D:/a/wae/wae/src/a.ts";
+        assert_eq!(relative_resolved_path(root, resolved), "src/a.ts");
+        assert!(normalized_path_is_within(resolved, Path::new(r"\\?\D:\a\wae\wae")));
+    }
+
     #[test]
     fn circular_fixture_is_analyzed_from_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/circular");
