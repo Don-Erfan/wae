@@ -118,7 +118,7 @@ fn acquire_advisory_lock(path: &Path) -> Result<File, AnalysisError> {
     for _ in 0..500 {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => {
@@ -134,6 +134,14 @@ fn acquire_advisory_lock(path: &Path) -> Result<File, AnalysisError> {
     )))
 }
 
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match (error.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => error.kind() == expected.kind(),
+    }
+}
+
 pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -141,4 +149,18 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_lock_contended;
+
+    #[test]
+    fn recognizes_the_platform_specific_lock_contention_error() {
+        assert!(is_lock_contended(&fs2::lock_contended_error()));
+        assert!(!is_lock_contended(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not lock contention",
+        )));
+    }
 }
