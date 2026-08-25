@@ -46,10 +46,10 @@ Diagnostics / Reporters / Integrations
 - `Facade`: `wae-engine::Engine` تنها API سطح‌بالای pipeline برای CLI و integrationهای آینده است.
 - `Strategy / Adapter`: قرارداد `ParserAdapter` جزئیات parser را از IR و engine جدا می‌کند.
 - `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias، workspace و external package را به‌ترتیب اجرا می‌کند.
-- `Strategy`: `ConditionSetProvider` انتخاب conditionهای Node16، NodeNext و Bundler را مستقل و قابل‌آزمون نگه می‌دارد.
+- `Strategy`: `ResolutionKindProvider` نوع `import`/`require` را از syntax و mode تعیین می‌کند و `ConditionSetProvider` conditionهای Node10، Node16، NodeNext و Bundler را مستقل و قابل‌آزمون نگه می‌دارد.
 - `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.
 - `Repository`: baseline storage پشت command صریح `baseline create` قرار دارد و `check --changed` هرگز آن را ایجاد نمی‌کند.
-- `Repository`: cache store قفل advisory را در تمام چرخه read→merge→write نگه می‌دارد و پس از crash نیازمند پاک‌کردن lock-file نیست.
+- `Repository`: cache store snapshot را بدون قفل می‌خواند و قفل advisory را فقط برای reload→merge→prune→atomic-write می‌گیرد؛ پس از crash نیز نیازمند پاک‌کردن lock-file نیست.
 - `Ports & Adapters`: قرارداد `VcsPort` و `ChangeSet` در engine قرار دارد و Git/CLI در لبه می‌مانند؛ ruleها به command یا reporter وابسته نیستند.
 
 این انتخاب‌ها با تعریف‌های Refactoring.Guru هم‌راستا هستند: Facade سطح ساده‌ای روی subsystem می‌دهد، Strategy الگوریتم‌های قابل‌تعویض را جدا می‌کند، Chain درخواست را در handlerهای مرتب عبور می‌دهد، و Composite مجموعه‌ای از اجزا را پشت قرارداد مشترک قرار می‌دهد.
@@ -76,6 +76,7 @@ Diagnostics / Reporters / Integrations
 - incremental invalidation بر اساس dependency impact
 - `ProjectIndex` مبتنی بر hash set برای lookupهای O(1) هنگام ساخت graph
 - `TsConfigIndex` با انتخاب نزدیک‌ترین config والد برای monorepoها
+- `PackageScopeIndex` محدود به ancestorهای importerهای کشف‌شده، بدون crawl کردن خروجی‌های excluded
 
 ## 7) قرارداد Diagnostic (نسخه پایه)
 
@@ -96,6 +97,10 @@ Diagnostics / Reporters / Integrations
 semantic گروه‌بندی می‌کند. بالاترین severity حفظ می‌شود، tie با specificity صریح شکسته می‌شود و
 تمام ruleهای مرتبط در `metadata.related_rules` باقی می‌مانند. سپس suppression و `FailurePolicy`
 اعمال می‌شوند؛ CLI و reporterها همین policy واحد را مصرف می‌کنند.
+
+`DiagnosticIdentity` یک Value Object دامنه‌ای مستقل از representation است. `related_rules` و سایر
+metadataهای نمایشی هرگز identity را بازنویسی نمی‌کنند؛ baseline repository برای مهاجرت aliasهای
+fingerprint نسخه‌های `0.0.10` و `0.0.11` را نیز می‌پذیرد.
 
 ## 8) معیار Done فاز 0
 

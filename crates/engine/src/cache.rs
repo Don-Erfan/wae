@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,16 +30,18 @@ pub(crate) struct AnalysisCache {
     enabled: bool,
     path: PathBuf,
     file: CacheFile,
-    // The advisory lock spans read -> update -> atomic write. The OS releases it on process exit,
-    // so a stale physical `.lock` file never blocks later analyses.
-    _lock: Option<File>,
+    live_files: BTreeSet<String>,
 }
 
 impl AnalysisCache {
-    pub(crate) fn load(root: &Path, config: &Config) -> Result<Self, AnalysisError> {
+    pub(crate) fn load(
+        root: &Path,
+        config: &Config,
+        live_files: BTreeSet<String>,
+    ) -> Result<Self, AnalysisError> {
         let path = root.join(&config.cache.directory).join("imports-v1.json");
         if !config.cache.enabled {
-            return Ok(Self { enabled: false, path, file: fresh_cache(), _lock: None });
+            return Ok(Self { enabled: false, path, file: fresh_cache(), live_files });
         }
         let parent = path
             .parent()
@@ -47,15 +49,8 @@ impl AnalysisCache {
         fs::create_dir_all(parent).map_err(|error| {
             AnalysisError::Project(format!("cannot create cache directory: {error}"))
         })?;
-        let lock = acquire_advisory_lock(&path.with_extension("lock"))?;
-        let file = fs::read_to_string(&path)
-            .ok()
-            .and_then(|source| serde_json::from_str::<CacheFile>(&source).ok())
-            .filter(|cache| {
-                cache.schema_version == 1 && cache.parser_version == PARSER_CACHE_VERSION
-            })
-            .unwrap_or_else(fresh_cache);
-        Ok(Self { enabled: true, path, file, _lock: Some(lock) })
+        let file = read_cache(&path);
+        Ok(Self { enabled: true, path, file, live_files })
     }
 
     pub(crate) fn get(&self, module: &str, hash: u64) -> Option<Vec<Import>> {
@@ -76,10 +71,21 @@ impl AnalysisCache {
         if !self.enabled {
             return Ok(());
         }
+        // Parsing and graph analysis happen without a global writer lock. The short transaction
+        // below locks, reloads the newest snapshot, merges this analysis, prunes deleted files and
+        // atomically replaces the cache.
+        let _lock = acquire_advisory_lock(&self.path.with_extension("lock"))?;
+        let mut merged = read_cache(&self.path);
+        merged.files.retain(|module, _| self.live_files.contains(module));
+        for (module, cached) in &self.file.files {
+            if self.live_files.contains(module) {
+                merged.files.insert(module.clone(), cached.clone());
+            }
+        }
         static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
         let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
         let temporary = self.path.with_extension(format!("tmp-{}-{write_id}", std::process::id()));
-        let contents = serde_json::to_vec(&self.file)
+        let contents = serde_json::to_vec(&merged)
             .map_err(|error| AnalysisError::Internal(error.to_string()))?;
         fs::write(&temporary, contents)
             .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
@@ -97,6 +103,14 @@ impl AnalysisCache {
         }
         Ok(())
     }
+}
+
+fn read_cache(path: &Path) -> CacheFile {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|source| serde_json::from_str::<CacheFile>(&source).ok())
+        .filter(|cache| cache.schema_version == 1 && cache.parser_version == PARSER_CACHE_VERSION)
+        .unwrap_or_else(fresh_cache)
 }
 
 fn fresh_cache() -> CacheFile {

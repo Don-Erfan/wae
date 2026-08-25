@@ -1,0 +1,34 @@
+version: 1
+
+project:
+  include: ["src/**/*.ts", "src/**/*.tsx"]
+  exclude: ["**/*.test.*", "**/node_modules/**", "**/.next/**"]
+  roots: ["."]
+
+resolution:
+  mode: bundler
+
+architecture:
+  layers:
+    app:
+      patterns: ["src/app/**"]
+      canImport: ["features", "entities", "shared"]
+    features:
+      patterns: ["src/features/**"]
+      canImport: ["entities", "shared"]
+    entities:
+      patterns: ["src/entities/**"]
+      canImport: ["shared"]
+    shared:
+      patterns: ["src/shared/**"]
+      canImport: []
+  features:
+    roots: ["src/features"]
+    public_entrypoints: ["index.ts", "index.tsx"]
+
+rules:
+  ARCH-001: error
+  ARCH-002: error
+  ARCH-003: error
+  ARCH-004: error
+  ARCH-005: error

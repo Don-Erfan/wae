@@ -14,7 +14,8 @@
 
 - `Config schema`: versioned (`version: 1`)
 - `JSON output schema`: versioned (`schemaVersion: 1`)
-- `Baseline schema`: writer uses version 2; readers migrate version 1
+- `Baseline schema`: writer uses version 2; readers migrate version 1 and accept legacy `0.0.10`
+  and `0.0.11` fingerprint identities
 - `Rule IDs`: پایدار در minor/patch؛ تغییر breaking فقط در major
 - `CLI exit codes`: پایدار و contract-based
 
@@ -36,11 +37,14 @@
 
 ### module system
 
+- modeهای صریح `node10`، `node16`، `nodenext` و `bundler` (`node` alias سازگار برای `node10` است)
 - ESM و mappingهای TypeScript NodeNext (`.js` → `.ts`, `.mjs` → `.mts`, `.cjs` → `.cts`)
 - CommonJS با condition مجزای `require` (متقابلاً انحصاری با `import`)
 - type-only resolution با condition اختصاصی `types`
 - JSONC `tsconfig.json`, relative `extends`, `baseUrl`, longest-match `paths` و انتخاب نزدیک‌ترین config والد در monorepo
-- package context شامل نزدیک‌ترین workspace و `package.json#type`
+- package context شامل نزدیک‌ترین `package.json#type` فقط روی ancestorهای importer و workspace
+  declarationهای صریح است
+- legacy entrypointهای `main`، `module`، `types` و `typings` در Node10 و fallback فاقد `exports`
 
 فایل resolve‌شده‌ای که با `project.exclude` از discovery کنار گذاشته شده، به‌صورت node صریح
 `Excluded` و opaque در مدل نگه‌داری می‌شود؛ dependencyهای transitive آن تحلیل نمی‌شوند.

@@ -39,7 +39,6 @@ impl DiagnosticArbitrator {
             related_rules.dedup();
             if related_rules.len() > 1 {
                 selected.metadata.insert("related_rules".into(), related_rules.join(","));
-                selected.refresh_fingerprint();
             }
             output.push(selected);
         }
@@ -107,5 +106,18 @@ mod tests {
             let result = DiagnosticArbitrator::arbitrate(diagnostics);
             assert_eq!(result[0].rule_id.0, "ARCH-005");
         }
+    }
+
+    #[test]
+    fn presentation_metadata_does_not_change_the_selected_fingerprint() {
+        let original = diagnostic("ARCH-005", Severity::Error);
+        let expected = original.fingerprint.clone();
+        let result = DiagnosticArbitrator::arbitrate(vec![
+            diagnostic("ARCH-004", Severity::Error),
+            original,
+        ]);
+        assert_eq!(result[0].rule_id.0, "ARCH-005");
+        assert_eq!(result[0].fingerprint, expected);
+        assert_eq!(result[0].metadata["related_rules"], "ARCH-004,ARCH-005");
     }
 }

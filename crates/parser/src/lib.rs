@@ -105,7 +105,13 @@ fn collect_dependencies(
             if let Some(specifier) = node.child_by_field_name("source") {
                 let kind = classify_import(node, source);
                 push_string_import(output, module_path, source, specifier, kind);
+            } else {
+                collect_import_equals_require(node, module_path, source, output);
             }
+            return;
+        }
+        "import_alias" => {
+            collect_import_equals_require(node, module_path, source, output);
             return;
         }
         "export_statement" => {
@@ -128,6 +134,28 @@ fn collect_dependencies(
     for child in node.named_children(&mut cursor) {
         collect_dependencies(child, module_path, source, output);
     }
+}
+
+fn collect_import_equals_require(
+    node: Node<'_>,
+    module_path: &ModulePath,
+    source: &str,
+    output: &mut Vec<Import>,
+) {
+    if !node.utf8_text(source.as_bytes()).ok().is_some_and(|text| text.contains("require")) {
+        return;
+    }
+    if let Some(specifier) = first_descendant_of_kind(node, "string") {
+        push_string_import(output, module_path, source, specifier, ImportKind::Require);
+    }
+}
+
+fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| first_descendant_of_kind(child, kind))
 }
 
 fn collect_call(node: Node<'_>, module_path: &ModulePath, source: &str, output: &mut Vec<Import>) {
@@ -209,6 +237,7 @@ import data from "./data.json" assert { type: "json" };
 import modern from "./modern.json" with { type: "json" };
 const lazy = import('./lazy');
 const legacy = require('./legacy');
+import legacyAlias = require('./legacy-alias');
 // import nope from './comment';
 "#;
         let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
@@ -223,10 +252,12 @@ const legacy = require('./legacy');
                 "./modern.json",
                 "./lazy",
                 "./legacy",
+                "./legacy-alias",
             ]
         );
         assert_eq!(imports[1].kind, ImportKind::TypeOnly);
         assert_eq!(imports[2].kind, ImportKind::ReExport);
+        assert_eq!(imports.last().unwrap().kind, ImportKind::Require);
     }
 
     #[test]

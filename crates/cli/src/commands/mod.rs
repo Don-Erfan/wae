@@ -5,22 +5,22 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use serde_json::json;
-use wae_config::{CONFIG_FILE, Config};
+use wae_config::{CONFIG_FILE, Config, ConfigPreset};
 use wae_core::domain::{Diagnostic, ModuleKind};
 use wae_engine::{
     Analysis, AnalysisError, AnalyzeRequest, ChangeSet, Engine, FailurePolicy, ImpactAnalyzer,
-    VcsPort,
+    VcsPort, validate_project_config,
 };
 use wae_reporters::{Format, render};
 
 use crate::CliOutput;
 
-pub fn init(root: &Path) -> CliOutput {
+pub fn init(root: &Path, preset: ConfigPreset) -> CliOutput {
     let path = root.join(CONFIG_FILE);
     if path.exists() {
         return CliOutput::success(format!("Configuration already exists: {}", path.display()));
     }
-    let config = Config::default();
+    let config = Config::for_preset(preset);
     match config.to_yaml().and_then(|yaml| {
         std::fs::write(&path, yaml).map_err(|e| wae_core::domain::ConfigError {
             kind: wae_core::domain::ConfigErrorKind::Io,
@@ -83,8 +83,7 @@ pub fn check(
             Err(error) => return CliOutput::project_error(error),
         };
         analysis.diagnostics.retain(|diagnostic| {
-            diagnostic_affects(diagnostic, &affected)
-                && !signatures.contains(&diagnostic.fingerprint)
+            diagnostic_affects(diagnostic, &affected) && !signatures.matches(diagnostic)
         });
     }
     let format = match format {
@@ -137,31 +136,90 @@ pub fn graph(root: &Path) -> CliOutput {
 }
 
 pub fn doctor(root: &Path) -> CliOutput {
-    let checks = vec![
-        ("project root", root.is_dir(), root.display().to_string()),
-        ("configuration", Config::load(root).is_ok(), root.join(CONFIG_FILE).display().to_string()),
-        (
-            "git",
-            Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .arg("rev-parse")
-                .arg("--is-inside-work-tree")
-                .output()
-                .is_ok_and(|o| o.status.success()),
-            "required for --changed".into(),
-        ),
-        ("analysis", analyze(root).is_ok(), "parser → resolver → graph → rules".into()),
-    ];
-    let ok = checks.iter().all(|(_, passed, _)| *passed);
-    let report = checks
-        .into_iter()
-        .map(|(name, passed, detail)| {
-            format!("{} {name}: {detail}", if passed { "✓" } else { "✖" })
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut ok = true;
+    let mut report = Vec::new();
+    if root.is_dir() {
+        report.push(format!("✓ project root: {}", root.display()));
+    } else {
+        ok = false;
+        report.push(format!("✖ project root: {} is not a directory", root.display()));
+    }
+    match Config::load(root) {
+        Ok(_) => report.push(format!("✓ configuration: {}", root.join(CONFIG_FILE).display())),
+        Err(error) => {
+            ok = false;
+            report.push(format!("✖ configuration\n  {}", config_error(&error)));
+        }
+    }
+    let git_ok = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if git_ok {
+        report.push("✓ git: available for --changed".into());
+    } else {
+        ok = false;
+        report.push("✖ git: required for --changed".into());
+    }
+    match Engine::default().analyze(AnalyzeRequest::new(root)) {
+        Ok(_) => report.push("✓ analysis: parser → resolver → graph → rules".into()),
+        Err(error) => {
+            ok = false;
+            report.push(format!(
+                "✖ analysis\n  {}{}",
+                analysis_error_detail(&error),
+                analysis_error_suggestions(&error)
+            ));
+        }
+    }
+    let report = report.join("\n");
     if ok { CliOutput::success(report) } else { CliOutput::project_error(report) }
+}
+
+pub fn config_validate(root: &Path, show_overlaps: bool) -> CliOutput {
+    match validate_project_config(root) {
+        Ok(validation) if validation.layer_overlaps.is_empty() => CliOutput::success(format!(
+            "✓ configuration valid: {} source modules, no layer overlaps",
+            validation.source_modules
+        )),
+        Ok(validation) => {
+            let overlaps = if show_overlaps {
+                validation.layer_overlaps.as_slice()
+            } else {
+                &validation.layer_overlaps[..1]
+            };
+            let mut report = vec![format!(
+                "✖ {} module(s) match multiple architecture layers:",
+                validation.layer_overlaps.len()
+            )];
+            for overlap in overlaps {
+                report.push(format!("  {}: {}", overlap.module, overlap.layers.join(", ")));
+            }
+            if !show_overlaps && validation.layer_overlaps.len() > 1 {
+                report.push("  Run: wae config validate --show-overlaps".into());
+            }
+            report.push("\nSuggested fixes:".into());
+            let mut layers = overlaps
+                .iter()
+                .flat_map(|overlap| overlap.layers.iter().cloned())
+                .collect::<Vec<_>>();
+            layers.sort();
+            layers.dedup();
+            for layer in layers {
+                report.push(format!("- Anchor `{layer}` to `src/{layer}/**`"));
+            }
+            report.push("- Add an explicit exclude to the broader layer".into());
+            CliOutput::project_error(report.join("\n"))
+        }
+        Err(error) => CliOutput::project_error(format!(
+            "{}{}",
+            analysis_error_detail(&error),
+            analysis_error_suggestions(&error)
+        )),
+    }
 }
 
 pub fn explain(rule: &str) -> CliOutput {
@@ -190,6 +248,25 @@ fn config_error(error: &wae_core::domain::ConfigError) -> String {
         error.path.as_ref().map(|p| format!(" at {p}")).unwrap_or_default(),
         error.message
     )
+}
+
+fn analysis_error_detail(error: &AnalysisError) -> String {
+    match error {
+        AnalysisError::Config(error) => config_error(error),
+        AnalysisError::Project(message) => format!("Project error: {message}"),
+        AnalysisError::Internal(message) => format!("Internal error: {message}"),
+    }
+}
+
+fn analysis_error_suggestions(error: &AnalysisError) -> String {
+    match error {
+        AnalysisError::Config(error)
+            if error.path.as_deref() == Some("architecture.layers") =>
+        {
+            "\n\n  Suggested fixes:\n  - Anchor layer patterns to project roots such as `src/shared/**`\n  - Add an exclude to the broader layer\n  - Run: wae config validate --show-overlaps".into()
+        }
+        _ => String::new(),
+    }
 }
 
 fn affected_modules(

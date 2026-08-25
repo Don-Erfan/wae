@@ -16,15 +16,24 @@ pub fn resolve_file_with_mode(base: &Path, mode: ResolutionMode) -> Option<Modul
     }
     let mapped: &[&str] = match (mode, base.extension().and_then(|value| value.to_str())) {
         (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            ResolutionMode::Node10
+            | ResolutionMode::Node16
+            | ResolutionMode::NodeNext
+            | ResolutionMode::Bundler,
             Some("js"),
         ) => &["ts", "tsx", "js", "jsx"],
         (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            ResolutionMode::Node10
+            | ResolutionMode::Node16
+            | ResolutionMode::NodeNext
+            | ResolutionMode::Bundler,
             Some("mjs"),
         ) => &["mts", "mjs"],
         (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            ResolutionMode::Node10
+            | ResolutionMode::Node16
+            | ResolutionMode::NodeNext
+            | ResolutionMode::Bundler,
             Some("cjs"),
         ) => &["cts", "cjs"],
         _ => &[],
@@ -79,15 +88,24 @@ pub(super) fn resolution_candidates(base: &Path, mode: ResolutionMode) -> Vec<Mo
     let mut candidates = vec![ModulePath(normalize(base))];
     let extensions: &[&str] = match (mode, base.extension().and_then(|value| value.to_str())) {
         (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            ResolutionMode::Node10
+            | ResolutionMode::Node16
+            | ResolutionMode::NodeNext
+            | ResolutionMode::Bundler,
             Some("js"),
         ) => &["ts", "tsx", "js", "jsx"],
         (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            ResolutionMode::Node10
+            | ResolutionMode::Node16
+            | ResolutionMode::NodeNext
+            | ResolutionMode::Bundler,
             Some("mjs"),
         ) => &["mts", "mjs"],
         (
-            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler,
+            ResolutionMode::Node10
+            | ResolutionMode::Node16
+            | ResolutionMode::NodeNext
+            | ResolutionMode::Bundler,
             Some("cjs"),
         ) => &["cts", "cjs"],
         _ => &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"],

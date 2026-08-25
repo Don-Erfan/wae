@@ -1,0 +1,14 @@
+{
+  "name": "wae-next-consumer-contract",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "architecture": "wae config validate --show-overlaps && wae check --format json"
+  },
+  "devDependencies": {
+    "@don-erfan/wae": "0.0.12",
+    "next": "15.2.6",
+    "typescript": "5.1.6"
+  }
+}

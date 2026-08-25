@@ -49,6 +49,70 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfigPreset {
+    #[default]
+    Blank,
+    Fsd,
+    Next,
+    Nx,
+}
+
+impl Config {
+    pub fn for_preset(preset: ConfigPreset) -> Self {
+        let mut config = Self::default();
+        config.architecture.layers = match preset {
+            ConfigPreset::Blank => BTreeMap::new(),
+            ConfigPreset::Fsd => fsd_layers("src/"),
+            ConfigPreset::Next => {
+                let mut layers = fsd_layers("src/");
+                layers.get_mut("app").expect("FSD app layer").patterns =
+                    vec!["app/**".into(), "src/app/**".into()];
+                layers
+            }
+            ConfigPreset::Nx => BTreeMap::from([
+                (
+                    "apps".into(),
+                    LayerConfig {
+                        patterns: vec!["apps/*/src/**".into()],
+                        can_import: vec!["libs".into()],
+                    },
+                ),
+                (
+                    "libs".into(),
+                    LayerConfig { patterns: vec!["libs/*/src/**".into()], can_import: vec![] },
+                ),
+            ]),
+        };
+        config
+    }
+}
+
+fn fsd_layers(prefix: &str) -> BTreeMap<String, LayerConfig> {
+    let pattern = |segment: &str| vec![format!("{prefix}{segment}/**")];
+    BTreeMap::from([
+        (
+            "app".into(),
+            LayerConfig {
+                patterns: pattern("app"),
+                can_import: vec!["features".into(), "entities".into(), "shared".into()],
+            },
+        ),
+        (
+            "features".into(),
+            LayerConfig {
+                patterns: pattern("features"),
+                can_import: vec!["entities".into(), "shared".into()],
+            },
+        ),
+        (
+            "entities".into(),
+            LayerConfig { patterns: pattern("entities"), can_import: vec!["shared".into()] },
+        ),
+        ("shared".into(), LayerConfig { patterns: pattern("shared"), can_import: vec![] }),
+    ])
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectConfig {
@@ -89,50 +153,13 @@ impl Default for ProjectConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ArchitectureConfig {
     pub layers: BTreeMap<String, LayerConfig>,
     pub features: FeatureConfig,
     pub forbidden_dependencies: Vec<ForbiddenDependency>,
     pub presets: ArchitecturePresets,
-}
-
-impl Default for ArchitectureConfig {
-    fn default() -> Self {
-        let mut layers = BTreeMap::new();
-        layers.insert(
-            "app".into(),
-            LayerConfig {
-                patterns: vec!["**/app/**".into()],
-                can_import: vec!["features".into(), "entities".into(), "shared".into()],
-            },
-        );
-        layers.insert(
-            "features".into(),
-            LayerConfig {
-                patterns: vec!["**/features/**".into()],
-                can_import: vec!["entities".into(), "shared".into()],
-            },
-        );
-        layers.insert(
-            "entities".into(),
-            LayerConfig {
-                patterns: vec!["**/entities/**".into()],
-                can_import: vec!["shared".into()],
-            },
-        );
-        layers.insert(
-            "shared".into(),
-            LayerConfig { patterns: vec!["**/shared/**".into()], can_import: vec![] },
-        );
-        Self {
-            layers,
-            features: FeatureConfig::default(),
-            forbidden_dependencies: Vec::new(),
-            presets: ArchitecturePresets::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +221,8 @@ impl FeatureConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolutionMode {
-    Node,
+    #[serde(alias = "node")]
+    Node10,
     Node16,
     #[default]
     NodeNext,
@@ -540,5 +568,30 @@ mod tests {
         for declaration in ["**/*.d.ts", "**/*.d.mts", "**/*.d.cts"] {
             assert!(config.project.exclude.iter().any(|pattern| pattern == declaration));
         }
+    }
+
+    #[test]
+    fn blank_is_safe_and_fsd_patterns_are_anchored() {
+        assert!(Config::for_preset(ConfigPreset::Blank).architecture.layers.is_empty());
+        let fsd = Config::for_preset(ConfigPreset::Fsd);
+        assert_eq!(fsd.architecture.layers["app"].patterns, ["src/app/**"]);
+        assert_eq!(fsd.architecture.layers["shared"].patterns, ["src/shared/**"]);
+        assert!(
+            fsd.architecture
+                .layers
+                .values()
+                .flat_map(|layer| &layer.patterns)
+                .all(|pattern| !pattern.starts_with("**/"))
+        );
+    }
+
+    #[test]
+    fn legacy_node_mode_deserializes_as_explicit_node10() {
+        let legacy: Config =
+            yaml_serde::from_str("version: 1\nresolution:\n  mode: node\n").unwrap();
+        assert_eq!(legacy.resolution.mode, ResolutionMode::Node10);
+        assert!(
+            Config::for_preset(ConfigPreset::Blank).to_yaml().unwrap().contains("mode: nodenext")
+        );
     }
 }

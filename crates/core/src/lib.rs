@@ -448,6 +448,11 @@ pub mod domain {
         pub dependency_path: Vec<ModuleId>,
         pub suggestion: Option<String>,
         pub metadata: BTreeMap<String, String>,
+        /// Optional semantic target used when no resolved dependency target exists (for example,
+        /// the requested specifier of an unresolved import). It is intentionally not serialized:
+        /// machine output exposes diagnostics, not the internal fingerprint implementation.
+        #[serde(skip)]
+        pub identity_target: Option<ModuleId>,
         #[serde(default)]
         pub suppressed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,34 +464,106 @@ pub mod domain {
             Self { rule_id: RuleId(rule_id.into()), message: message.into(), ..Self::default() }
         }
 
-        /// FNV-1a is intentionally used instead of `DefaultHasher`: its output is stable
-        /// across processes and Rust releases, which makes baseline files portable.
+        pub fn identity(&self) -> DiagnosticIdentity {
+            let source = self.dependency_path.first().cloned().or_else(|| {
+                self.primary_location.as_ref().map(|location| ModuleId(location.file.clone()))
+            });
+            let target =
+                self.identity_target.clone().or_else(|| self.dependency_path.get(1).cloned());
+            let stable_location = self
+                .primary_location
+                .as_ref()
+                .map(|location| StableLocation { file: location.file.replace('\\', "/") });
+            DiagnosticIdentity { rule_id: self.rule_id.clone(), source, target, stable_location }
+        }
+
+        /// FNV-1a is intentionally used instead of `DefaultHasher`: its output is stable across
+        /// processes and Rust releases. Presentation fields such as metadata, message, severity,
+        /// suggestions and source line numbers never participate in identity.
         pub fn refresh_fingerprint(&mut self) {
-            let mut identity = self.rule_id.0.clone();
-            if self.dependency_path.is_empty() {
-                if let Some(location) = &self.primary_location {
-                    identity.push('|');
-                    identity.push_str(&location.file.replace('\\', "/"));
+            self.fingerprint = stable_fingerprint(&self.identity().canonical());
+        }
+
+        /// Fingerprints emitted by 0.0.10 and 0.0.11. Baseline matching uses these aliases during
+        /// migration, while newly-created baselines only store the stable identity fingerprint.
+        pub fn legacy_fingerprint_aliases(&self) -> Vec<String> {
+            let with_all_metadata = legacy_identity(self, false);
+            let without_presentation_metadata = legacy_identity(self, true);
+            let mut aliases = vec![
+                stable_fingerprint(&with_all_metadata),
+                stable_fingerprint(&without_presentation_metadata),
+            ];
+            aliases.sort();
+            aliases.dedup();
+            aliases
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct DiagnosticIdentity {
+        pub rule_id: RuleId,
+        pub source: Option<ModuleId>,
+        pub target: Option<ModuleId>,
+        pub stable_location: Option<StableLocation>,
+    }
+
+    impl DiagnosticIdentity {
+        fn canonical(&self) -> String {
+            let mut value = self.rule_id.0.clone();
+            if let Some(source) = &self.source {
+                value.push_str("|source=");
+                value.push_str(&source.0.replace('\\', "/"));
+            }
+            if let Some(target) = &self.target {
+                value.push_str("|target=");
+                value.push_str(&target.0.replace('\\', "/"));
+            }
+            if self.source.is_none() {
+                if let Some(location) = &self.stable_location {
+                    value.push_str("|file=");
+                    value.push_str(&location.file);
                 }
             }
-            for module in &self.dependency_path {
-                identity.push('|');
-                identity.push_str(&module.0.replace('\\', "/"));
-            }
-            for (key, value) in &self.metadata {
-                identity.push('|');
-                identity.push_str(key);
-                identity.push('=');
-                identity.push_str(value);
-            }
-
-            let mut hash = 0xcbf29ce484222325_u64;
-            for byte in identity.as_bytes() {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-            self.fingerprint = format!("{:016x}", hash);
+            value
         }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct StableLocation {
+        pub file: String,
+    }
+
+    fn legacy_identity(diagnostic: &Diagnostic, ignore_presentation_metadata: bool) -> String {
+        let mut identity = diagnostic.rule_id.0.clone();
+        if diagnostic.dependency_path.is_empty() {
+            if let Some(location) = &diagnostic.primary_location {
+                identity.push('|');
+                identity.push_str(&location.file.replace('\\', "/"));
+            }
+        }
+        for module in &diagnostic.dependency_path {
+            identity.push('|');
+            identity.push_str(&module.0.replace('\\', "/"));
+        }
+        for (key, value) in &diagnostic.metadata {
+            if ignore_presentation_metadata && key == "related_rules" {
+                continue;
+            }
+            identity.push('|');
+            identity.push_str(key);
+            identity.push('=');
+            identity.push_str(value);
+        }
+        identity
+    }
+
+    fn stable_fingerprint(identity: &str) -> String {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in identity.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
     }
 }
 
@@ -585,7 +662,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.11"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.12"]);
     }
 
     #[test]
@@ -694,5 +771,49 @@ mod tests {
         moved.primary_location.as_mut().unwrap().line = 200;
         moved.refresh_fingerprint();
         assert_eq!(first.fingerprint, moved.fingerprint);
+    }
+
+    #[test]
+    fn diagnostic_identity_ignores_presentation_fields_and_keeps_legacy_aliases() {
+        use crate::domain::{Diagnostic, ModuleId, Severity, SourceLocation};
+        let mut diagnostic = Diagnostic::new("ARCH-005", "Private feature import");
+        diagnostic.severity = Severity::Warning;
+        diagnostic.primary_location =
+            Some(SourceLocation { file: "src/app.ts".into(), line: 3, column: 7 });
+        diagnostic.dependency_path =
+            vec![ModuleId("src/app.ts".into()), ModuleId("src/features/a/private.ts".into())];
+        diagnostic.metadata.insert("owner".into(), "a".into());
+        let legacy_before_arbitration = diagnostic.legacy_fingerprint_aliases();
+        diagnostic.refresh_fingerprint();
+        let stable = diagnostic.fingerprint.clone();
+
+        diagnostic.message = "Reworded message".into();
+        diagnostic.severity = Severity::Error;
+        diagnostic.suggestion = Some("Use the public entrypoint".into());
+        diagnostic.metadata.insert("related_rules".into(), "ARCH-004,ARCH-005".into());
+        diagnostic.refresh_fingerprint();
+
+        assert_eq!(diagnostic.fingerprint, stable);
+        assert!(
+            diagnostic
+                .legacy_fingerprint_aliases()
+                .iter()
+                .any(|alias| legacy_before_arbitration.contains(alias))
+        );
+    }
+
+    #[test]
+    fn unresolved_specifiers_have_distinct_stable_identities() {
+        use crate::domain::{Diagnostic, ModuleId, SourceLocation};
+        let diagnostic = |specifier: &str| {
+            let mut diagnostic = Diagnostic::new("RESOLVE-001", "unresolved");
+            diagnostic.primary_location =
+                Some(SourceLocation { file: "src/app.ts".into(), line: 1, column: 1 });
+            diagnostic.dependency_path = vec![ModuleId("src/app.ts".into())];
+            diagnostic.identity_target = Some(ModuleId(format!("unresolved:{specifier}")));
+            diagnostic.refresh_fingerprint();
+            diagnostic
+        };
+        assert_ne!(diagnostic("alpha").fingerprint, diagnostic("beta").fingerprint);
     }
 }

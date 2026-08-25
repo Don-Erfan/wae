@@ -17,10 +17,14 @@ cargo run -p wae-cli -- graph
 cargo run -p wae-cli -- doctor
 ```
 
-Create a typed, versioned configuration:
+Create a typed, versioned configuration. The default is intentionally blank, so WAE never assigns
+ownership from broad guesses. Choose an explicit preset when the repository follows a known
+layout:
 
 ```bash
 cargo run -p wae-cli -- init
+cargo run -p wae-cli -- init --preset next
+cargo run -p wae-cli -- config validate --show-overlaps
 ```
 
 Ratchet mode never creates state implicitly. Review the current diagnostics, explicitly create and commit the baseline, then compare affected files and their importer closure against Git:
@@ -41,6 +45,25 @@ npx wae check
 ```
 
 The installer supports Linux x64/arm64, macOS x64/arm64, and Windows x64. It allows only HTTPS GitHub hosts, enforces redirect, timeout, and size limits, downloads to temporary files, verifies SHA-256, and atomically installs the verified binary.
+
+## Verify release assets
+
+Release binaries, the SPDX SBOM, and their aggregate manifest are covered by `SHA256SUMS`. Verify
+the files first, then verify the manifest's keyless Sigstore identity:
+
+```bash
+sha256sum --check SHA256SUMS
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github\.com/Don-Erfan/wae/\.github/workflows/release-binaries\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
+jq '.packages | length' wae-v0.0.12.spdx.json
+```
+
+The checksum proves the downloaded SBOM is the one signed by the release workflow; the SBOM can
+then be inspected with any SPDX-compatible tool.
 
 ## Development
 

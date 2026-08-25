@@ -17,7 +17,7 @@ resolution:
 architecture:
   layers:
     app:
-      patterns: ["**/app/**"]
+      patterns: ["src/app/**"]
       canImport: ["features", "entities", "shared"]
   features:
     roots: ["src/features"]
@@ -37,6 +37,13 @@ baseline:
 
 ## Resolution
 
+Supported modes are `node10`, `node16`, `nodenext`, and `bundler`. The legacy spelling `node` is
+accepted as an input alias for `node10`, but generated configuration always uses the explicit
+name. Node10 intentionally ignores package `exports`/`imports` and falls back to legacy package
+entrypoints. Modern modes prefer `exports`; when it is absent, runtime imports use `module` then
+`main`, while type-only imports prefer `types`/`typings`. Legacy values are package-relative paths
+and do not need a `./` prefix.
+
 The resolver selects the nearest ancestor `tsconfig.json` for each importer. It supports JSONC,
 `extends`, `baseUrl`, `paths`, workspace manifests, package `exports`/`imports`, and conditional
 targets. In Node16/NodeNext mode, the importer extension and nearest package `type` determine
@@ -46,14 +53,17 @@ their underlying `import`/`require` condition, including nested conditional-expo
 `node` or `browser` is selected by `resolution.mode`; additional explicit conditions belong in
 `custom_conditions`.
 
-Package format and workspace identity use separate indexes. `PackageScopeIndex` records every
-`package.json` under the project—including private manifests without `name` and nested manifests
-that are not workspaces—and chooses the nearest ancestor for `type`. `WorkspacePackageIndex`
-contains only named, declared workspace packages and owns package-name/exports/imports resolution.
-Consequently, `name` never affects ESM/CommonJS classification.
+Package format and workspace identity use separate indexes. `PackageScopeIndex` visits only the
+ancestor directories of discovered source importers, records private or unnamed boundaries, and
+chooses the nearest ancestor for `type`. Excluded build output is never crawled merely to classify
+an importer. `WorkspacePackageIndex` contains only named, declared workspace packages and owns
+package-name/exports/imports resolution. Consequently, `name` never affects ESM/CommonJS
+classification.
 
-Bundler mode activates `import` or `require`, `types` for type-only edges, `default`, and configured
-custom conditions. It does **not** activate `browser` implicitly; add `browser` to
+Bundler mode derives `import` or `require` from source syntax, never from the nearest package
+`type`. Static imports, re-exports, dynamic imports and type imports use the import branch;
+`require()` and TypeScript `import x = require("x")` use the require branch. It also activates
+`types` for type-only edges, `default`, and configured custom conditions. It does **not** activate `browser` implicitly; add `browser` to
 `resolution.custom_conditions` only when that matches the project's bundler profile.
 
 Node16/NodeNext ESM relative imports require an explicit runtime extension (for example,
@@ -97,12 +107,36 @@ and unused directives produce `SUPPRESS-001` warnings when the corresponding opt
 suppressed diagnostics remain visible in reports but are excluded from the ratchet file; the
 command prints the recorded and excluded counts.
 
+Fingerprint identity is structural: rule ID, canonical source/target and stable file identity.
+Messages, severity, suggestions, line/column movement and `related_rules` presentation metadata do
+not change it. The baseline reader accepts the old `0.0.10` and `0.0.11` fingerprint forms as
+migration aliases, so existing committed baselines remain valid after upgrading to `0.0.12`.
+
+## Safe initialization and ownership validation
+
+`wae init` is equivalent to `--preset blank` and produces no inferred layers. The opt-in presets
+use repository-anchored patterns:
+
+```bash
+wae init --preset blank
+wae init --preset fsd
+wae init --preset next
+wae init --preset nx
+wae config validate --show-overlaps
+```
+
+The validation command lists every source file matching multiple layers and suggests anchored
+patterns or exclusions. `wae doctor` includes the same root cause instead of collapsing it into a
+generic analysis failure.
+
 ## Cache concurrency
 
-The cache repository uses an operating-system advisory lock held across read, merge, atomic write,
-and rename. The `.lock` path is a persistent coordination inode, not an ownership marker: its mere
-existence is harmless, and the OS releases ownership automatically when a process crashes or is
-killed. Cache payloads are also invalidated by parser behavior version.
+Analysis reads an unlocked cache snapshot. Saving takes an operating-system advisory lock only for
+the short reload, merge, prune, atomic-write and rename transaction. The reload preserves entries
+written by concurrent processes, while pruning removes entries for deleted or renamed sources.
+The `.lock` path is a persistent coordination inode, not an ownership marker: its mere existence is
+harmless, and the OS releases ownership automatically after a crash. Payloads are also invalidated
+by parser behavior version.
 
 ## Changed mode
 

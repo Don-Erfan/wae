@@ -51,6 +51,26 @@ pub struct SaveResult {
     pub informational: usize,
 }
 
+#[derive(Debug, Default)]
+pub struct BaselineMatcher {
+    fingerprints: HashSet<String>,
+}
+
+impl BaselineMatcher {
+    pub fn matches(&self, diagnostic: &Diagnostic) -> bool {
+        self.fingerprints.contains(&diagnostic.fingerprint)
+            || diagnostic
+                .legacy_fingerprint_aliases()
+                .iter()
+                .any(|fingerprint| self.fingerprints.contains(fingerprint))
+    }
+
+    #[cfg(test)]
+    fn contains(&self, fingerprint: &str) -> bool {
+        self.fingerprints.contains(fingerprint)
+    }
+}
+
 pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
     let path = root.join(config.baseline.file);
@@ -91,7 +111,7 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
     Ok(SaveResult { path, recorded, suppressed, informational })
 }
 
-pub fn load(root: &Path) -> Result<HashSet<String>, String> {
+pub fn load(root: &Path) -> Result<BaselineMatcher, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
     let path = root.join(config.baseline.file);
     if !path.exists() {
@@ -104,10 +124,10 @@ pub fn load(root: &Path) -> Result<HashSet<String>, String> {
     let stored: StoredBaseline =
         serde_json::from_str(&source).map_err(|error| format!("invalid baseline: {error}"))?;
     match stored.schema_version {
-        1 => Ok(stored.fingerprints.into_iter().collect()),
-        BASELINE_SCHEMA_VERSION => {
-            Ok(stored.entries.into_iter().map(|entry| entry.fingerprint).collect())
-        }
+        1 => Ok(BaselineMatcher { fingerprints: stored.fingerprints.into_iter().collect() }),
+        BASELINE_SCHEMA_VERSION => Ok(BaselineMatcher {
+            fingerprints: stored.entries.into_iter().map(|entry| entry.fingerprint).collect(),
+        }),
         version => Err(format!("unsupported baseline schema version `{version}`")),
     }
 }
@@ -151,7 +171,7 @@ mod tests {
         assert_eq!(saved.suppressed, 1);
         assert_eq!(saved.informational, 1);
         let baseline = load(&root).unwrap();
-        assert_eq!(baseline, HashSet::from([kept.fingerprint]));
+        assert!(baseline.contains(&kept.fingerprint));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -165,6 +185,26 @@ mod tests {
         )
         .unwrap();
         assert!(load(&root).unwrap().contains("legacy"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matches_pre_arbitration_0_0_10_fingerprints() {
+        let root = std::env::temp_dir().join(format!("wae-baseline-legacy-{}", std::process::id()));
+        fs::create_dir_all(root.join(".wae")).unwrap();
+        let mut diagnostic = Diagnostic::new("ARCH-005", "private import");
+        diagnostic.dependency_path =
+            vec![ModuleId("src/app.ts".into()), ModuleId("src/features/a/private.ts".into())];
+        diagnostic.metadata.insert("owner".into(), "a".into());
+        let legacy = diagnostic.legacy_fingerprint_aliases().into_iter().next().unwrap();
+        diagnostic.metadata.insert("related_rules".into(), "ARCH-004,ARCH-005".into());
+        diagnostic.refresh_fingerprint();
+        fs::write(
+            root.join(".wae/baseline.json"),
+            format!(r#"{{"schemaVersion":1,"fingerprints":["{legacy}"]}}"#),
+        )
+        .unwrap();
+        assert!(load(&root).unwrap().matches(&diagnostic));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -11,8 +11,8 @@ use wae_core::domain::{
 use wae_graph::ModuleGraph;
 use wae_parser::{JsTsParser, ParserAdapter};
 use wae_resolver::{
-    ModuleFormat, ModuleResolver, PackageScopeIndex, Resolution, ResolutionKind, ResolutionRequest,
-    ResolverPipeline, TsConfigIndex, WorkspacePackage, WorkspacePackageIndex,
+    ModuleResolver, PackageScopeIndex, Resolution, ResolutionRequest, ResolverPipeline,
+    TsConfigIndex, WorkspacePackage, WorkspacePackageIndex, resolution_kind_for,
 };
 use wae_rules::{CompiledRulePolicies, RuleContext, RuleSet};
 
@@ -46,6 +46,38 @@ pub struct Analysis {
     pub project: Project,
     pub graph: ModuleGraph,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerOverlap {
+    pub module: String,
+    pub layers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigValidation {
+    pub source_modules: usize,
+    pub layer_overlaps: Vec<LayerOverlap>,
+}
+
+pub fn validate_project_config(root: impl AsRef<Path>) -> Result<ConfigValidation, AnalysisError> {
+    let root = root
+        .as_ref()
+        .canonicalize()
+        .map_err(|error| AnalysisError::Project(format!("cannot open project root: {error}")))?;
+    let config = Config::load(&root).map_err(AnalysisError::Config)?;
+    let architecture = CompiledArchitectureModel::compile(&config)?;
+    let files = discover_modules(&root, &config)?;
+    let mut layer_overlaps = files
+        .iter()
+        .filter_map(|path| {
+            let module = relative_path(&root, path);
+            let layers = architecture.matching_layers(&module);
+            (layers.len() > 1).then_some(LayerOverlap { module, layers })
+        })
+        .collect::<Vec<_>>();
+    layer_overlaps.sort_by(|left, right| left.module.cmp(&right.module));
+    Ok(ConfigValidation { source_modules: files.len(), layer_overlaps })
 }
 
 /// Single failure policy shared by exit codes and machine-readable reporting.
@@ -166,7 +198,8 @@ impl<P: ParserAdapter> Engine<P> {
         let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_resolver =
             WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
-        let package_scopes = PackageScopeIndex::discover(&root).map_err(AnalysisError::Project)?;
+        let package_scopes =
+            PackageScopeIndex::from_importers(&root, &files).map_err(AnalysisError::Project)?;
         let workspace_packages = workspace_resolver.packages().to_vec();
         let module_formats = ModuleFormatResolver::new(&package_scopes);
         let resolver = ResolverPipeline::indexed_node_with_workspaces(
@@ -181,7 +214,8 @@ impl<P: ParserAdapter> Engine<P> {
         let mut layers = HashMap::new();
         let mut features = HashMap::new();
         let mut feature_roots = HashMap::new();
-        let mut cache = AnalysisCache::load(&root, &config)?;
+        let live_cache_files = files.iter().map(|path| relative_path(&root, path)).collect();
+        let mut cache = AnalysisCache::load(&root, &config, live_cache_files)?;
         let mut suppressions = Vec::new();
 
         for path in &files {
@@ -251,14 +285,11 @@ impl<P: ParserAdapter> Engine<P> {
                         import.location.file = module_id.0.clone();
                         let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
                         let importer_format = module_formats.resolve(path);
-                        let resolution_kind = match candidate.kind {
-                            wae_core::domain::DependencyKind::Dynamic => ResolutionKind::Import,
-                            wae_core::domain::DependencyKind::Require => ResolutionKind::Require,
-                            _ if importer_format == ModuleFormat::CommonJs => {
-                                ResolutionKind::Require
-                            }
-                            _ => ResolutionKind::Import,
-                        };
+                        let resolution_kind = resolution_kind_for(
+                            config.resolution.mode,
+                            &candidate.kind,
+                            importer_format,
+                        );
                         let resolution_request = ResolutionRequest {
                             importer: &module_path,
                             specifier: &import.specifier,
@@ -540,6 +571,7 @@ fn unresolved_diagnostic(import: &wae_core::domain::Import) -> Diagnostic {
     diagnostic.severity = Severity::Error;
     diagnostic.primary_location = Some(import.location.clone());
     diagnostic.dependency_path = vec![import.module_id.clone()];
+    diagnostic.identity_target = Some(ModuleId(format!("unresolved:{}", import.specifier)));
     diagnostic.metadata.insert("specifier".into(), import.specifier.clone());
     diagnostic.refresh_fingerprint();
     diagnostic
@@ -701,6 +733,54 @@ mod tests {
     }
 
     #[test]
+    fn bundler_resolution_uses_dependency_syntax_without_package_type() {
+        let root = std::env::temp_dir().join(format!("wae-engine-bundler-{}", std::process::id()));
+        let package = root.join("packages/dual");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(root.join("package.json"), r#"{"private":true,"workspaces":["packages/*"]}"#)
+            .unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"@fixture/dual","exports":{".":{"browser":"./src/browser.js","import":"./src/import.js","require":"./src/require.cjs","default":"./src/default.js"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/app.ts"),
+            "import value from '@fixture/dual'; const legacy = require('@fixture/dual'); export { value, legacy };",
+        )
+        .unwrap();
+        for file in ["browser.js", "import.ts", "require.cts", "default.ts"] {
+            fs::write(package.join("src").join(file), "export default true;").unwrap();
+        }
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nresolution:\n  mode: bundler\narchitecture:\n  layers: {}\n",
+        )
+        .unwrap();
+
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let targets = analysis
+            .project
+            .resolved_dependencies
+            .iter()
+            .filter(|dependency| dependency.from.0 == "src/app.ts")
+            .map(|dependency| (&dependency.kind, &dependency.target))
+            .collect::<Vec<_>>();
+        assert!(targets.iter().any(|(kind, target)| {
+            **kind == wae_core::domain::DependencyKind::Static
+                && matches!(target, DependencyTarget::WorkspacePackage { module, .. }
+                    if module.0.ends_with("packages/dual/src/import.ts"))
+        }));
+        assert!(targets.iter().any(|(kind, target)| {
+            **kind == wae_core::domain::DependencyKind::Require
+                && matches!(target, DependencyTarget::WorkspacePackage { module, .. }
+                    if module.0.ends_with("packages/dual/src/require.cts"))
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn feature_roots_are_relative_to_each_workspace_package() {
         let root =
             std::env::temp_dir().join(format!("wae-feature-workspace-{}", std::process::id()));
@@ -834,6 +914,23 @@ mod tests {
     }
 
     #[test]
+    fn invalid_package_manifest_outside_roots_and_excludes_is_ignored() {
+        let root = std::env::temp_dir().join(format!("wae-scoped-manifest-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("src/good.ts"), "export const good = true;").unwrap();
+        fs::write(root.join("dist/package.json"), "not-json").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nproject:\n  roots: [src]\n  include: ['**/*.ts']\n  exclude: ['dist/**']\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(analysis.project.modules.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn enabled_cache_is_persisted_and_reusable() {
         let root = std::env::temp_dir().join(format!("wae-cache-{}", std::process::id()));
         fs::create_dir_all(root.join("src")).unwrap();
@@ -857,6 +954,28 @@ mod tests {
         let refreshed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
         assert_eq!(refreshed["parser_version"], PARSER_CACHE_VERSION);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_save_prunes_deleted_and_renamed_modules() {
+        let root = std::env::temp_dir().join(format!("wae-cache-prune-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/old.ts"), "export const value = 1;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\ncache:\n  enabled: true\n  directory: .wae/cache\n",
+        )
+        .unwrap();
+        Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        fs::rename(root.join("src/old.ts"), root.join("src/new.ts")).unwrap();
+        Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let cache: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".wae/cache/imports-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(cache["files"]["src/old.ts"].is_null());
+        assert!(cache["files"]["src/new.ts"].is_object());
         fs::remove_dir_all(root).unwrap();
     }
 

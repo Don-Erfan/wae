@@ -8,6 +8,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.12] - 2026-08-25
+
+### Fixed
+
+- Make diagnostic identity structural and independent of messages, severity, suggestions,
+  positions, arbitration metadata, and presentation changes while accepting both `0.0.10` and
+  `0.0.11` legacy baseline fingerprints during migration.
+- Select Bundler `import`/`require` conditions from dependency syntax instead of the importer's
+  package `type`, including TypeScript `import = require()` syntax.
+- Keep modern package `exports` targets separate from legacy `main`, `module`, `types`, and
+  `typings` entrypoints; support package-relative legacy paths and prioritize declaration targets
+  for type-only imports.
+- Limit package-scope discovery to source-importer ancestors so malformed manifests in excluded
+  output directories cannot break analysis.
+- Shorten cache lock duration to the reload/merge/prune/atomic-save transaction and prune entries
+  for renamed or deleted source files.
+- Generate a non-opinionated blank configuration by default and replace repository-wide layer
+  globs with explicit, anchored `fsd`, `next`, and `nx` presets.
+
+### Added
+
+- `wae config validate --show-overlaps` and actionable `wae doctor` details for ambiguous layer
+  ownership.
+- Explicit `node10` resolution mode with a backward-compatible `node` configuration alias.
+- Dedicated resolution-kind strategies and package-target/legacy-entrypoint value objects.
+- A realistic Next.js/TypeScript consumer contract in Architecture Check CI.
+- Documented checksum, keyless Sigstore, provenance-attestation, and SPDX SBOM verification.
+
 ## [0.0.11] - 2026-08-24
 
 ### Fixed
@@ -52,6 +80,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.11...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.12...HEAD
+[0.0.12]: https://github.com/Don-Erfan/wae/compare/v0.0.11...v0.0.12
 [0.0.11]: https://github.com/Don-Erfan/wae/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/Don-Erfan/wae/compare/v0.0.9...v0.0.10

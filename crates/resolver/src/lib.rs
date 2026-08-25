@@ -2,23 +2,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use globset::{GlobBuilder, GlobMatcher};
-use serde::Deserialize;
 use wae_config::ResolutionMode;
 use wae_core::domain::ModulePath;
 
 mod conditions;
+mod package;
 mod package_scope;
 mod relative;
 mod request;
+mod resolution_kind;
 pub use conditions::{
     BundlerConditions, ConditionSet, ConditionSetProvider, Node16Conditions, NodeNextConditions,
+};
+pub use package::{
+    LegacyEntrypoints, PackageModuleType, PackageRelativePath, WorkspacePackage,
+    WorkspacePackageIndex,
 };
 pub use package_scope::{PackageScope, PackageScopeIndex};
 use relative::{resolution_candidates, resolve_relative};
 pub use relative::{resolve_file, resolve_file_with_mode};
 pub use request::{
     ModuleFormat, ModuleResolver, Resolution, ResolutionHandler, ResolutionKind, ResolutionRequest,
+};
+pub use resolution_kind::{
+    BundlerResolutionKindProvider, DependencySyntax, Node10ResolutionKindProvider,
+    Node16ResolutionKindProvider, NodeNextResolutionKindProvider, ResolutionKindProvider,
+    resolution_kind_for,
 };
 
 #[derive(Default)]
@@ -63,10 +72,9 @@ impl ResolverPipeline {
     pub fn node_with_workspaces(
         root: impl Into<PathBuf>,
         aliases: Vec<PathAlias>,
-        mut workspaces: WorkspacePackageIndex,
+        workspaces: WorkspacePackageIndex,
         mode: ResolutionMode,
     ) -> Self {
-        workspaces.mode = mode;
         Self::new()
             .with_handler(RelativeResolver { mode })
             .with_handler(AliasResolver { root: root.into(), aliases, mode })
@@ -76,10 +84,9 @@ impl ResolverPipeline {
 
     pub fn indexed_node_with_workspaces(
         tsconfigs: TsConfigIndex,
-        mut workspaces: WorkspacePackageIndex,
+        workspaces: WorkspacePackageIndex,
         mode: ResolutionMode,
     ) -> Self {
-        workspaces.mode = mode;
         Self::new()
             .with_handler(RelativeResolver { mode })
             .with_handler(IndexedAliasResolver::new(tsconfigs))
@@ -519,407 +526,9 @@ impl ResolutionHandler for PackageResolver {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspacePackage {
-    pub name: String,
-    pub root: PathBuf,
-    has_exports: bool,
-    entrypoints: BTreeMap<String, serde_json::Value>,
-    imports: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PackageModuleType {
-    Module,
-    CommonJs,
-    #[default]
-    Unspecified,
-}
-
-#[derive(Clone, Debug)]
-pub struct WorkspacePackageIndex {
-    packages: Vec<WorkspacePackage>,
-    mode: ResolutionMode,
-}
-
-impl Default for WorkspacePackageIndex {
-    fn default() -> Self {
-        Self { packages: Vec::new(), mode: ResolutionMode::NodeNext }
-    }
-}
-
-impl WorkspacePackageIndex {
-    pub fn discover(project_root: &Path) -> Result<Self, String> {
-        let patterns = workspace_patterns(project_root)?;
-        let (includes, excludes) = compile_workspace_patterns(&patterns)?;
-        let mut packages = Vec::new();
-        let mut builder = ignore::WalkBuilder::new(project_root);
-        builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true);
-        for entry in builder.build() {
-            let entry = entry.map_err(|error| error.to_string())?;
-            if entry.file_name() != "package.json"
-                || entry.path().components().any(|part| part.as_os_str() == "node_modules")
-            {
-                continue;
-            }
-            let package_root = entry.path().parent().unwrap_or(project_root);
-            let relative =
-                normalize(package_root.strip_prefix(project_root).unwrap_or(package_root));
-            let is_project_root = package_root == project_root;
-            let declared = includes.iter().any(|pattern| pattern.is_match(&relative))
-                && !excludes.iter().any(|pattern| pattern.is_match(&relative));
-            if !is_project_root && !declared {
-                continue;
-            }
-            let source = fs::read_to_string(entry.path())
-                .map_err(|error| format!("cannot read `{}`: {error}", entry.path().display()))?;
-            let manifest: serde_json::Value = serde_json::from_str(&source).map_err(|error| {
-                format!("invalid package manifest `{}`: {error}", entry.path().display())
-            })?;
-            let Some(name) = manifest.get("name").and_then(|value| value.as_str()) else {
-                continue;
-            };
-            let root = entry.path().parent().unwrap_or(project_root).to_path_buf();
-            packages.push(WorkspacePackage {
-                name: name.into(),
-                root,
-                has_exports: manifest.get("exports").is_some(),
-                entrypoints: manifest_entrypoints(&manifest),
-                imports: manifest_imports(&manifest),
-            });
-        }
-        packages.sort_by(|left, right| left.name.cmp(&right.name));
-        for duplicate in packages.windows(2) {
-            if duplicate[0].name == duplicate[1].name {
-                return Err(format!(
-                    "duplicate workspace package name `{}` in `{}` and `{}`",
-                    duplicate[0].name,
-                    duplicate[0].root.display(),
-                    duplicate[1].root.display()
-                ));
-            }
-        }
-        Ok(Self { packages, mode: ResolutionMode::NodeNext })
-    }
-
-    pub fn packages(&self) -> &[WorkspacePackage] {
-        &self.packages
-    }
-}
-
-impl ResolutionHandler for WorkspacePackageIndex {
-    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
-        let importer = Path::new(&request.importer.0);
-        let specifier = request.specifier;
-        if specifier.starts_with('.') || specifier.starts_with('/') {
-            return None;
-        }
-        if specifier.starts_with('#') {
-            let package = self
-                .packages
-                .iter()
-                .filter(|package| importer.starts_with(&package.root))
-                .max_by_key(|package| package.root.components().count())?;
-            let target = resolve_export(&package.imports, specifier, request);
-            return Some(resolve_package_target(package, target, request.mode, true));
-        }
-        let name = package_name(specifier);
-        let package = self.packages.iter().find(|package| package.name == name)?;
-        let subpath = specifier.strip_prefix(&name).unwrap_or_default().trim_start_matches('/');
-        let key = if subpath.is_empty() { ".".into() } else { format!("./{subpath}") };
-        let configured = resolve_export(&package.entrypoints, &key, request);
-        if package.has_exports {
-            return Some(resolve_package_target(package, configured, request.mode, false));
-        }
-        if configured.is_some() {
-            return Some(resolve_package_target(package, configured, request.mode, false));
-        }
-        let candidate = if subpath.is_empty() {
-            package.root.join("src/index")
-        } else {
-            package.root.join(subpath)
-        };
-        Some(
-            resolve_file_with_mode(&candidate, request.mode)
-                .map_or(Resolution::Unresolved, Resolution::Module),
-        )
-    }
-
-    fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
-        let importer = Path::new(&request.importer.0);
-        let (package, target) = if request.specifier.starts_with('#') {
-            let Some(package) = self
-                .packages
-                .iter()
-                .filter(|package| importer.starts_with(&package.root))
-                .max_by_key(|package| package.root.components().count())
-            else {
-                return Vec::new();
-            };
-            (package, resolve_export(&package.imports, request.specifier, request))
-        } else {
-            let name = package_name(request.specifier);
-            let Some(package) = self.packages.iter().find(|package| package.name == name) else {
-                return Vec::new();
-            };
-            let subpath =
-                request.specifier.strip_prefix(&name).unwrap_or_default().trim_start_matches('/');
-            let key = if subpath.is_empty() { ".".into() } else { format!("./{subpath}") };
-            let target = resolve_export(&package.entrypoints, &key, request).or_else(|| {
-                (!package.has_exports).then(|| {
-                    PackageTarget::InternalPath(if subpath.is_empty() {
-                        "./src/index".into()
-                    } else {
-                        format!("./{subpath}")
-                    })
-                })
-            });
-            (package, target)
-        };
-        match target {
-            Some(PackageTarget::InternalPath(target)) => {
-                let candidate = package.root.join(target.trim_start_matches("./"));
-                if lexically_within(&candidate, &package.root) {
-                    resolution_candidates(&candidate, request.mode)
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => Vec::new(),
-        }
-    }
-}
-
 /// Compatibility alias retained for integrations compiled against the pre-0.0.11 name.
 #[deprecated(note = "use WorkspacePackageIndex; package scopes are indexed separately")]
 pub type WorkspaceResolver = WorkspacePackageIndex;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum PackageTarget {
-    InternalPath(String),
-    ExternalSpecifier(String),
-    Blocked,
-}
-
-fn manifest_imports(manifest: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
-    manifest
-        .get("imports")
-        .and_then(|value| value.as_object())
-        .into_iter()
-        .flatten()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn manifest_entrypoints(manifest: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
-    let mut entries = BTreeMap::new();
-    match manifest.get("exports") {
-        Some(
-            value @ (serde_json::Value::String(_)
-            | serde_json::Value::Array(_)
-            | serde_json::Value::Null),
-        ) => {
-            entries.insert(".".into(), value.clone());
-        }
-        Some(serde_json::Value::Object(exports)) => {
-            if exports.keys().any(|key| key.starts_with('.')) {
-                for (key, value) in exports {
-                    if key.starts_with('.') {
-                        entries.insert(key.clone(), value.clone());
-                    }
-                }
-            } else {
-                entries.insert(".".into(), serde_json::Value::Object(exports.clone()));
-            }
-        }
-        _ => {}
-    }
-    if !entries.contains_key(".") {
-        for field in ["module", "main", "types"] {
-            if let Some(target) = manifest.get(field).and_then(|value| value.as_str()) {
-                entries.insert(".".into(), serde_json::Value::String(target.into()));
-                break;
-            }
-        }
-    }
-    entries
-}
-
-fn export_target(
-    value: &serde_json::Value,
-    request: &ResolutionRequest<'_>,
-) -> Option<PackageTarget> {
-    match value {
-        serde_json::Value::String(value) if value.starts_with("./") => {
-            Some(PackageTarget::InternalPath(value.clone()))
-        }
-        serde_json::Value::String(value) => Some(PackageTarget::ExternalSpecifier(value.clone())),
-        serde_json::Value::Null => Some(PackageTarget::Blocked),
-        serde_json::Value::Array(targets) => {
-            let mut blocked = false;
-            for target in targets {
-                match export_target(target, request) {
-                    Some(
-                        path @ (PackageTarget::InternalPath(_)
-                        | PackageTarget::ExternalSpecifier(_)),
-                    ) => return Some(path),
-                    Some(PackageTarget::Blocked) => blocked = true,
-                    None => {}
-                }
-            }
-            blocked.then_some(PackageTarget::Blocked)
-        }
-        serde_json::Value::Object(conditions) => {
-            conditions.iter().find_map(|(condition, value)| {
-                condition_is_active(condition, request)
-                    .then(|| export_target(value, request))
-                    .flatten()
-            })
-        }
-        _ => None,
-    }
-}
-
-fn condition_is_active(condition: &str, request: &ResolutionRequest<'_>) -> bool {
-    conditions::active_conditions(request).contains(condition)
-}
-
-fn resolve_export(
-    entries: &BTreeMap<String, serde_json::Value>,
-    key: &str,
-    request: &ResolutionRequest<'_>,
-) -> Option<PackageTarget> {
-    if let Some(target) = entries.get(key) {
-        return export_target(target, request);
-    }
-    entries
-        .iter()
-        .filter_map(|(pattern, target)| {
-            let (prefix, suffix) = pattern.split_once('*')?;
-            if !key.starts_with(prefix) || !key.ends_with(suffix) {
-                return None;
-            }
-            Some((prefix.len() + suffix.len(), prefix.len(), prefix, suffix, target))
-        })
-        .max_by_key(|(specificity, prefix_len, ..)| (*specificity, *prefix_len))
-        .and_then(|(_, _, prefix, suffix, target)| {
-            let capture = &key[prefix.len()..key.len() - suffix.len()];
-            export_target(target, request).map(|target| match target {
-                PackageTarget::InternalPath(path) => {
-                    PackageTarget::InternalPath(path.replace('*', capture))
-                }
-                PackageTarget::ExternalSpecifier(path) => {
-                    PackageTarget::ExternalSpecifier(path.replace('*', capture))
-                }
-                PackageTarget::Blocked => PackageTarget::Blocked,
-            })
-        })
-}
-
-fn resolve_package_target(
-    package: &WorkspacePackage,
-    target: Option<PackageTarget>,
-    mode: ResolutionMode,
-    allow_external: bool,
-) -> Resolution {
-    let Some(target) = target else { return Resolution::Unresolved };
-    let target = match target {
-        PackageTarget::InternalPath(target) => target,
-        PackageTarget::ExternalSpecifier(target) if allow_external => {
-            return Resolution::Redirect(target);
-        }
-        PackageTarget::ExternalSpecifier(_) | PackageTarget::Blocked => {
-            return Resolution::Unresolved;
-        }
-    };
-    let candidate = package.root.join(target.trim_start_matches("./"));
-    if !lexically_within(&candidate, &package.root) {
-        return Resolution::Unresolved;
-    }
-    resolve_file_with_mode(&candidate, mode).map_or(Resolution::Unresolved, Resolution::Module)
-}
-
-fn lexically_within(path: &Path, directory: &Path) -> bool {
-    let path = lexical_path(path);
-    let directory = lexical_path(directory);
-    path.starts_with(directory)
-}
-
-fn lexical_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
-}
-
-#[derive(Deserialize)]
-struct PnpmWorkspace {
-    #[serde(default)]
-    packages: Vec<String>,
-}
-
-fn workspace_patterns(project_root: &Path) -> Result<Vec<String>, String> {
-    let mut patterns = Vec::new();
-    let manifest_path = project_root.join("package.json");
-    if manifest_path.exists() {
-        let source = fs::read_to_string(&manifest_path)
-            .map_err(|error| format!("cannot read `{}`: {error}", manifest_path.display()))?;
-        let manifest: serde_json::Value = serde_json::from_str(&source).map_err(|error| {
-            format!("invalid package manifest `{}`: {error}", manifest_path.display())
-        })?;
-        match manifest.get("workspaces") {
-            Some(serde_json::Value::Array(values)) => {
-                patterns.extend(values.iter().filter_map(|value| value.as_str().map(str::to_owned)))
-            }
-            Some(serde_json::Value::Object(value)) => {
-                if let Some(values) = value.get("packages").and_then(|value| value.as_array()) {
-                    patterns.extend(
-                        values.iter().filter_map(|value| value.as_str().map(str::to_owned)),
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    let pnpm_path = project_root.join("pnpm-workspace.yaml");
-    if pnpm_path.exists() {
-        let source = fs::read_to_string(&pnpm_path)
-            .map_err(|error| format!("cannot read `{}`: {error}", pnpm_path.display()))?;
-        let workspace: PnpmWorkspace = yaml_serde::from_str(&source).map_err(|error| {
-            format!("invalid pnpm workspace `{}`: {error}", pnpm_path.display())
-        })?;
-        patterns.extend(workspace.packages);
-    }
-    Ok(patterns)
-}
-
-fn compile_workspace_patterns(
-    patterns: &[String],
-) -> Result<(Vec<GlobMatcher>, Vec<GlobMatcher>), String> {
-    let mut includes = Vec::new();
-    let mut excludes = Vec::new();
-    for pattern in patterns {
-        let (target, pattern) = if let Some(pattern) = pattern.strip_prefix('!') {
-            (&mut excludes, pattern)
-        } else {
-            (&mut includes, pattern.as_str())
-        };
-        let matcher = GlobBuilder::new(pattern)
-            .literal_separator(true)
-            .build()
-            .map_err(|error| format!("invalid workspace pattern `{pattern}`: {error}"))?
-            .compile_matcher();
-        target.push(matcher);
-    }
-    Ok((includes, excludes))
-}
 
 fn normalize(path: &Path) -> String {
     let mut result = PathBuf::new();
@@ -1161,6 +770,72 @@ mod tests {
         assert!(matches!(
             resolve_with(&resolver, Path::new("apps/web/src/app.ts"), "@acme/ui/components/button"),
             Some(Resolution::Module(path)) if path.0.ends_with("packages/ui/src/components/button.ts")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_main_and_types_use_package_relative_paths_and_kind_precedence() {
+        let root =
+            std::env::temp_dir().join(format!("wae-legacy-entrypoints-{}", std::process::id()));
+        let package = root.join("packages/pkg");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::write(root.join("package.json"), r#"{"workspaces":["packages/*"]}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"@fixture/pkg","main":"dist/index.js","types":"dist/index.d.ts"}"#,
+        )
+        .unwrap();
+        fs::write(package.join("dist/index.js"), "").unwrap();
+        fs::write(package.join("dist/index.d.ts"), "").unwrap();
+        let resolver = WorkspacePackageIndex::discover(&root).unwrap();
+
+        assert!(matches!(
+            resolve_kind_with(
+                &resolver,
+                &root.join("src/app.ts"),
+                "@fixture/pkg",
+                DependencyKind::Static,
+            ),
+            Some(Resolution::Module(path)) if path.0.ends_with("packages/pkg/dist/index.js")
+        ));
+        assert!(matches!(
+            resolve_kind_with(
+                &resolver,
+                &root.join("src/app.ts"),
+                "@fixture/pkg",
+                DependencyKind::TypeOnly,
+            ),
+            Some(Resolution::Module(path)) if path.0.ends_with("packages/pkg/dist/index.d.ts")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn node10_ignores_exports_and_maps_javascript_extensions() {
+        let root = std::env::temp_dir().join(format!("wae-node10-{}", std::process::id()));
+        let package = root.join("packages/pkg");
+        fs::create_dir_all(package.join("dist")).unwrap();
+        fs::write(root.join("package.json"), r#"{"workspaces":["packages/*"]}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"pkg","exports":"./dist/modern.js","main":"dist/legacy.js"}"#,
+        )
+        .unwrap();
+        fs::write(package.join("dist/modern.ts"), "").unwrap();
+        fs::write(package.join("dist/legacy.ts"), "").unwrap();
+        let resolver = WorkspacePackageIndex::discover(&root).unwrap();
+        assert!(matches!(
+            resolve_request_with(
+                &resolver,
+                &root.join("src/app.ts"),
+                "pkg",
+                DependencyKind::Static,
+                ResolutionKind::Import,
+                ModuleFormat::CommonJs,
+                ResolutionMode::Node10,
+            ),
+            Some(Resolution::Module(path)) if path.0.ends_with("packages/pkg/dist/legacy.ts")
         ));
         fs::remove_dir_all(root).unwrap();
     }

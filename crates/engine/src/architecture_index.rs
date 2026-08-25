@@ -31,12 +31,7 @@ impl CompiledArchitectureModel {
     }
 
     pub(crate) fn layer(&self, path: &str) -> Result<Option<String>, AnalysisError> {
-        let matches = self
-            .layers
-            .iter()
-            .filter(|(_, matcher)| matcher.is_match(path))
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
+        let matches = self.matching_layers(path);
         if matches.len() > 1 {
             return Err(AnalysisError::Config(wae_core::domain::ConfigError {
                 kind: wae_core::domain::ConfigErrorKind::ConflictingConfig,
@@ -48,6 +43,14 @@ impl CompiledArchitectureModel {
             }));
         }
         Ok(matches.into_iter().next())
+    }
+
+    pub(crate) fn matching_layers(&self, path: &str) -> Vec<String> {
+        self.layers
+            .iter()
+            .filter(|(_, matcher)| matcher.is_match(path))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     pub(crate) fn feature(

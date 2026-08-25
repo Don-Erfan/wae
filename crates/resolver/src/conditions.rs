@@ -71,7 +71,7 @@ impl ConditionSetProvider for BundlerConditions {
 
 pub(crate) fn active_conditions(request: &ResolutionRequest<'_>) -> ConditionSet {
     match request.mode {
-        ResolutionMode::Node | ResolutionMode::Node16 => {
+        ResolutionMode::Node10 | ResolutionMode::Node16 => {
             Node16Conditions.active_conditions(request)
         }
         ResolutionMode::NodeNext => NodeNextConditions.active_conditions(request),

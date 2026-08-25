@@ -1,1 +1,9 @@
 version: 1
+architecture:
+  layers:
+    app:
+      patterns: ["src/app/**"]
+      canImport: ["entities"]
+    entities:
+      patterns: ["src/entities/**"]
+      canImport: []

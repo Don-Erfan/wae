@@ -12,7 +12,8 @@ yarn add -D @don-erfan/wae
 
 ```bash
 wae help
-wae init
+wae init --preset next
+wae config validate --show-overlaps
 wae scan
 wae check
 wae check --changed
@@ -26,6 +27,8 @@ wae check --changed
 - Repository can be configured by:
   - `wae.githubRepo` in `package.json`
   - `WAE_GITHUB_REPOSITORY` environment variable (overrides config)
+- GitHub Releases include an aggregate checksum manifest, keyless Sigstore bundle, SPDX SBOM and
+  provenance attestations. See the repository README for verification commands.
 
 ## Maintainer note
 
