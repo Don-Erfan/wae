@@ -19,11 +19,11 @@ license = "MIT"
 
 [workspace.dependencies]
 ignore = "=0.4.23"
-globset = "=0.4.15"
+globset = "=0.4.19"
 fs2 = "=0.4.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 yaml_serde = "=0.10.7"
-tree-sitter = "=0.24.7"
+tree-sitter = "=0.26.12"
 tree-sitter-typescript = "=0.23.2"
