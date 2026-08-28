@@ -8,7 +8,7 @@ use dependency_classifier::{classify_export, classify_import};
 
 /// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
 /// persist this value so parser upgrades can never reuse stale import IR.
-pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v3");
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v4");
 
 pub trait ParserAdapter: Send + Sync {
     fn parse_imports(
@@ -163,6 +163,7 @@ fn collect_call(node: Node<'_>, module_path: &ModulePath, source: &str, output: 
     let kind = match function.utf8_text(source.as_bytes()).ok() {
         Some("import") => ImportKind::Dynamic,
         Some("require") if function.kind() == "identifier" => ImportKind::Require,
+        Some("require.resolve") if function.kind() == "member_expression" => ImportKind::Require,
         _ => return,
     };
     let Some(arguments) = node.child_by_field_name("arguments") else { return };
@@ -237,6 +238,7 @@ import data from "./data.json" assert { type: "json" };
 import modern from "./modern.json" with { type: "json" };
 const lazy = import('./lazy');
 const legacy = require('./legacy');
+const resolved = require.resolve('./resolved');
 import legacyAlias = require('./legacy-alias');
 // import nope from './comment';
 "#;
@@ -252,12 +254,13 @@ import legacyAlias = require('./legacy-alias');
                 "./modern.json",
                 "./lazy",
                 "./legacy",
+                "./resolved",
                 "./legacy-alias",
             ]
         );
         assert_eq!(imports[1].kind, ImportKind::TypeOnly);
         assert_eq!(imports[2].kind, ImportKind::ReExport);
-        assert_eq!(imports.last().unwrap().kind, ImportKind::Require);
+        assert!(imports[7..].iter().all(|import| import.kind == ImportKind::Require));
     }
 
     #[test]

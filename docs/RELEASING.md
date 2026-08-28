@@ -2,7 +2,8 @@
 
 ## Preconditions
 
-1. Protect `master` and require the `quality`, `tests`, `audit`, and `npm-installer` CI jobs.
+1. Protect `master` and require the `quality`, `tests`, `audit`, `npm-installer`, and
+   `v1 readiness` CI jobs.
 2. Configure npm Trusted Publishing for package `@don-erfan/wae`, repository `Don-Erfan/wae`, and workflow `release-binaries.yml`.
 3. Keep Cargo, npm, and tag versions identical.
 4. Enable GitHub's immutable releases setting before publishing the first immutable release.
@@ -18,7 +19,7 @@ git tag -s vX.Y.Z -m "WAE vX.Y.Z"
 git push origin master vX.Y.Z
 ```
 
-GitHub Actions builds every supported native target, verifies and publishes an aggregate
+GitHub Actions builds the CLI, LSP and MCP server for every supported native target, verifies and publishes an aggregate
 `SHA256SUMS` manifest, signs that manifest through keyless Sigstore, generates an SPDX JSON SBOM,
 and records GitHub SLSA build-provenance attestations for every binary. The curated section for the
 version in `CHANGELOG.md` is prepended to GitHub's generated pull-request notes. npm publication

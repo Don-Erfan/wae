@@ -38,6 +38,7 @@ pub trait ModuleResolver: Send + Sync {
 
 /// A resolution handler is one link in the Node/TypeScript resolution chain.
 pub trait ResolutionHandler: Send + Sync {
+    fn name(&self) -> &'static str;
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution>;
 
     fn candidate_paths(&self, _request: &ResolutionRequest<'_>) -> Vec<ModulePath> {

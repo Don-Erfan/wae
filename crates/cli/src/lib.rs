@@ -1,13 +1,16 @@
 mod commands;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use wae_config::ConfigPreset;
+use wae_core::domain::DependencyKind;
+use wae_engine::CancellationToken;
 use wae_reporters::Format;
 
 pub const EXIT_PASSED: i32 = 0;
 pub const EXIT_VIOLATIONS: i32 = 1;
 pub const EXIT_PROJECT: i32 = 2;
 pub const EXIT_INTERNAL: i32 = 3;
+pub const EXIT_CANCELLED: i32 = 130;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliOutput {
@@ -28,36 +31,92 @@ impl CliOutput {
     pub fn internal_error(stderr: impl Into<String>) -> Self {
         Self { exit_code: EXIT_INTERNAL, stdout: String::new(), stderr: stderr.into() }
     }
+    pub fn cancelled() -> Self {
+        Self {
+            exit_code: EXIT_CANCELLED,
+            stdout: String::new(),
+            stderr: "analysis cancelled".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
-    Init { preset: ConfigPreset },
+    Init {
+        preset: ConfigPreset,
+    },
     Scan,
-    Check { changed: bool, format: Option<Format>, base: Option<String> },
+    Discover {
+        json: bool,
+        write: bool,
+        force: bool,
+    },
+    Check {
+        changed: bool,
+        format: Option<Format>,
+        base: Option<String>,
+        config: Option<PathBuf>,
+        no_cache: bool,
+        verbose: bool,
+    },
     BaselineCreate,
     Graph,
+    Explore {
+        output: PathBuf,
+    },
     Doctor,
-    ConfigValidate { show_overlaps: bool },
+    ConfigValidate {
+        show_overlaps: bool,
+    },
     Explain(String),
+    Resolve {
+        importer: PathBuf,
+        specifier: String,
+        kind: DependencyKind,
+        config: Option<PathBuf>,
+    },
     Version,
     Help,
 }
 
 pub fn run(args: &[String], cwd: &Path) -> CliOutput {
+    run_with_cancellation(args, cwd, &CancellationToken::default())
+}
+
+pub fn run_with_cancellation(
+    args: &[String],
+    cwd: &Path,
+    cancellation: &CancellationToken,
+) -> CliOutput {
     let command = match parse(args) {
         Ok(command) => command,
         Err(error) => return CliOutput::project_error(format!("{error}\n\n{}", usage())),
     };
     match command {
         Command::Init { preset } => commands::init(cwd, preset),
-        Command::Scan => commands::scan(cwd),
-        Command::Check { changed, format, base } => commands::check(cwd, changed, format, base),
-        Command::BaselineCreate => commands::baseline_create(cwd),
-        Command::Graph => commands::graph(cwd),
-        Command::Doctor => commands::doctor(cwd),
+        Command::Scan => commands::scan(cwd, cancellation),
+        Command::Discover { json, write, force } => commands::discover(cwd, json, write, force),
+        Command::Check { changed, format, base, config, no_cache, verbose } => commands::check(
+            cwd,
+            commands::CheckOptions {
+                changed,
+                format,
+                base,
+                config_path: config,
+                no_cache,
+                verbose,
+                cancellation: cancellation.clone(),
+            },
+        ),
+        Command::BaselineCreate => commands::baseline_create(cwd, cancellation),
+        Command::Graph => commands::graph(cwd, cancellation),
+        Command::Explore { output } => commands::explore(cwd, output, cancellation),
+        Command::Doctor => commands::doctor(cwd, cancellation),
         Command::ConfigValidate { show_overlaps } => commands::config_validate(cwd, show_overlaps),
         Command::Explain(rule) => commands::explain(&rule),
+        Command::Resolve { importer, specifier, kind, config } => {
+            commands::resolve(cwd, importer, specifier, kind, config)
+        }
         Command::Version => CliOutput::success(format!("wae {}", env!("CARGO_PKG_VERSION"))),
         Command::Help => CliOutput::success(usage()),
     }
@@ -68,7 +127,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
     match command {
         "init" => parse_init(&args[1..]),
         "scan" if args.len() == 1 => Ok(Command::Scan),
+        "discover" => parse_discover(&args[1..]),
         "graph" if args.len() == 1 => Ok(Command::Graph),
+        "explore" => parse_explore(&args[1..]),
         "doctor" if args.len() == 1 => Ok(Command::Doctor),
         "config" if args.get(1).map(String::as_str) == Some("validate") => {
             parse_config_validate(&args[2..])
@@ -77,6 +138,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::BaselineCreate)
         }
         "explain" if args.len() == 2 => Ok(Command::Explain(args[1].clone())),
+        "resolve" => parse_resolve(&args[1..]),
         "check" => parse_check(&args[1..]),
         "--version" | "-V" if args.len() == 1 => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
@@ -101,6 +163,24 @@ fn parse_init(args: &[String]) -> Result<Command, String> {
     Ok(Command::Init { preset })
 }
 
+fn parse_discover(args: &[String]) -> Result<Command, String> {
+    let mut json = false;
+    let mut write = false;
+    let mut force = false;
+    for option in args {
+        match option.as_str() {
+            "--json" => json = true,
+            "--write" => write = true,
+            "--force" => force = true,
+            value => return Err(format!("unknown discover option `{value}`")),
+        }
+    }
+    if force && !write {
+        return Err("discover --force requires --write".into());
+    }
+    Ok(Command::Discover { json, write, force })
+}
+
 fn parse_config_validate(args: &[String]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::ConfigValidate { show_overlaps: false }),
@@ -115,6 +195,9 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
     let mut changed = false;
     let mut format = None;
     let mut base = None;
+    let mut config = None;
+    let mut no_cache = false;
+    let mut verbose = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -130,15 +213,65 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
                 index += 1;
                 base = Some(args.get(index).ok_or("--base requires a value")?.clone());
             }
+            "--config" => {
+                index += 1;
+                config = Some(PathBuf::from(args.get(index).ok_or("--config requires a value")?));
+            }
+            "--no-cache" => no_cache = true,
+            "--verbose" | "-v" => verbose = true,
             value => return Err(format!("unknown check option `{value}`")),
         }
         index += 1;
     }
-    Ok(Command::Check { changed, format, base })
+    Ok(Command::Check { changed, format, base, config, no_cache, verbose })
+}
+
+fn parse_resolve(args: &[String]) -> Result<Command, String> {
+    if args.len() < 2 {
+        return Err("resolve requires <IMPORTER> <SPECIFIER>".into());
+    }
+    let importer = PathBuf::from(&args[0]);
+    let specifier = args[1].clone();
+    let mut kind = DependencyKind::Static;
+    let mut config = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--kind" => {
+                index += 1;
+                kind = match args.get(index).map(String::as_str) {
+                    Some("static") => DependencyKind::Static,
+                    Some("dynamic") => DependencyKind::Dynamic,
+                    Some("require") => DependencyKind::Require,
+                    Some("type") => DependencyKind::TypeOnly,
+                    Some("re-export") => DependencyKind::ReExport,
+                    Some(value) => return Err(format!("unsupported dependency kind `{value}`")),
+                    None => return Err("--kind requires a value".into()),
+                };
+            }
+            "--config" => {
+                index += 1;
+                config = Some(PathBuf::from(args.get(index).ok_or("--config requires a value")?));
+            }
+            value => return Err(format!("unknown resolve option `{value}`")),
+        }
+        index += 1;
+    }
+    Ok(Command::Resolve { importer, specifier, kind, config })
+}
+
+fn parse_explore(args: &[String]) -> Result<Command, String> {
+    match args {
+        [] => Ok(Command::Explore { output: PathBuf::from(".wae/explorer.html") }),
+        [option, path] if option == "--output" => {
+            Ok(Command::Explore { output: PathBuf::from(path) })
+        }
+        _ => Err("explore accepts only `--output PATH`".into()),
+    }
 }
 
 fn usage() -> &'static str {
-    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n  baseline create              Explicitly record current violations\n  config validate [--show-overlaps]\n                               Validate config and layer ownership\n  graph                        Print the real dependency graph as JSON\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error"
+    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  config validate [--show-overlaps]\n                               Validate config and layer ownership\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
 }
 
 #[cfg(test)]
@@ -166,6 +299,15 @@ mod tests {
     #[test]
     fn basic_fixture_passes() {
         assert_eq!(run(&["check".into()], &fixture("basic")).exit_code, EXIT_PASSED);
+    }
+
+    #[test]
+    fn cancellation_has_the_conventional_signal_exit_code() {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let output = run_with_cancellation(&["check".into()], &fixture("basic"), &cancellation);
+        assert_eq!(output.exit_code, EXIT_CANCELLED);
+        assert_eq!(output.stderr, "analysis cancelled");
     }
     #[test]
     fn malformed_config_uses_project_exit_code() {
@@ -206,6 +348,59 @@ mod tests {
             command,
             Command::Check { changed: true, base: Some(base), .. } if base == "origin/main"
         ));
+    }
+
+    #[test]
+    fn check_supports_custom_config_no_cache_and_verbose_timing() {
+        let root = std::env::temp_dir().join(format!("wae-observability-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "export const value = 1;").unwrap();
+        std::fs::write(
+            root.join("architecture.yml"),
+            "version: 1\noutput:\n  format: json\ncache:\n  enabled: true\n",
+        )
+        .unwrap();
+        let output = run(
+            &[
+                "check".into(),
+                "--config".into(),
+                "architecture.yml".into(),
+                "--no-cache".into(),
+                "--verbose".into(),
+            ],
+            &root,
+        );
+        assert_eq!(output.exit_code, EXIT_PASSED);
+        assert!(output.stdout.contains("\"schemaVersion\""));
+        assert!(output.stderr.contains("WAE timing:"));
+        assert!(output.stderr.contains("enabled=false"));
+        assert!(!root.join(".wae/cache").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_command_explains_alias_handler_conditions_and_outcome() {
+        let output = run(
+            &[
+                "resolve".into(),
+                "src/app/page.tsx".into(),
+                "@/features/cart".into(),
+                "--kind".into(),
+                "static".into(),
+            ],
+            &fixture("consumer-next"),
+        );
+        assert_eq!(output.exit_code, EXIT_PASSED, "{}", output.stderr);
+        let trace: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(trace["resolutionKind"], "Import");
+        assert!(
+            trace["activeConditions"].as_array().unwrap().iter().any(|value| value == "import")
+        );
+        assert!(trace["attempts"].as_array().unwrap().iter().any(|attempt| {
+            attempt["handler"] == "tsconfig-alias"
+                && attempt["outcome"].as_str().is_some_and(|value| value.starts_with("module:"))
+        }));
+        assert_eq!(trace["outcome"], "module:src/features/cart/index.ts");
     }
 
     #[test]

@@ -1,0 +1,28 @@
+version: 1
+project:
+  include: ["**/*.ts"]
+  exclude: ["**/node_modules/**"]
+resolution:
+  mode: bundler
+architecture:
+  layers:
+    packages:
+      patterns: ["packages/*/src/**"]
+      canImport: ["packages"]
+  forbidden_package_dependencies:
+    - from: "@fixture/a"
+      to: "@fixture/b"
+rules:
+  ARCH-006:
+    severity: error
+    max_depth: 1
+    entrypoints: ["packages/a/src/index.ts"]
+  ARCH-007:
+    severity: error
+    max_fan_out: 1
+  ARCH-008:
+    severity: error
+    max_fan_in: 1
+  ARCH-009:
+    severity: error
+    entrypoints: ["packages/a/src/index.ts"]

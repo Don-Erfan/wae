@@ -9,5 +9,7 @@ wae-core = { path = "../core" }
 wae-config = { path = "../config" }
 wae-engine = { path = "../engine" }
 wae-reporters = { path = "../reporters" }
+wae-discovery = { path = "../discovery" }
 serde_json.workspace = true
 serde.workspace = true
+ctrlc.workspace = true

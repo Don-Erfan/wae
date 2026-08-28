@@ -213,6 +213,14 @@ fn sarif_level(severity: &Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_machine_output_schema_is_valid_and_version_synchronized() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/diagnostics.schema.json")).unwrap();
+        assert_eq!(schema["properties"]["schemaVersion"]["const"], 1);
+        assert_eq!(schema["properties"]["diagnostics"]["type"], "array");
+    }
     #[test]
     fn empty_json_has_a_versioned_schema() {
         let analysis = Analysis {
@@ -220,6 +228,8 @@ mod tests {
             project: Default::default(),
             graph: Default::default(),
             diagnostics: vec![],
+            incremental: Default::default(),
+            timings: Default::default(),
         };
         assert!(json_report(&analysis).unwrap().contains("\"schemaVersion\": 1"));
     }
@@ -231,6 +241,8 @@ mod tests {
             project: Default::default(),
             graph: Default::default(),
             diagnostics: vec![],
+            incremental: Default::default(),
+            timings: Default::default(),
         };
         let output = sarif(&analysis).unwrap();
         assert!(output.contains("2.1.0"));
@@ -244,6 +256,8 @@ mod tests {
             project: Default::default(),
             graph: Default::default(),
             diagnostics: vec![Diagnostic::new("ARCH-001", "cycle")],
+            incremental: Default::default(),
+            timings: Default::default(),
         };
         let output = jsonl(&analysis).unwrap();
         for line in output.lines() {
@@ -262,6 +276,8 @@ mod tests {
             project: Default::default(),
             graph: Default::default(),
             diagnostics: vec![diagnostic],
+            incremental: Default::default(),
+            timings: Default::default(),
         };
         let value: serde_json::Value = serde_json::from_str(&sarif(&analysis).unwrap()).unwrap();
         assert_eq!(value["runs"][0]["invocations"][0]["executionSuccessful"], true);
@@ -286,6 +302,8 @@ mod tests {
             project: Default::default(),
             graph: Default::default(),
             diagnostics: vec![Diagnostic::new("ARCH-001", "failure"), info, suppressed],
+            incremental: Default::default(),
+            timings: Default::default(),
         };
         let value: serde_json::Value =
             serde_json::from_str(&json_report(&analysis).unwrap()).unwrap();

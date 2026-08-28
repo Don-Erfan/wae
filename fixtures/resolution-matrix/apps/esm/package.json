@@ -1,1 +1,1 @@
-{"name":"@fixture/esm-app","type":"module"}
+{"name":"@fixture/esm-app","type":"module","dependencies":{"@fixture/domain":"workspace:*"}}

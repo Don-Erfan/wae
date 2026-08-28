@@ -1,19 +1,38 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
-use wae_core::domain::{Diagnostic, FeatureId, ModuleId, Project, SourceLocation};
+use wae_core::domain::{Diagnostic, FeatureId, ModuleId, PackageName, Project, SourceLocation};
 use wae_core::rule_registry::{self, RuleDescriptor};
-use wae_graph::ModuleGraph;
+use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
+
+mod architecture_metrics;
+mod package_rules;
+mod runtime_rules;
+use architecture_metrics::{
+    DependencyDepthRule, IncomingCouplingRule, OrphanModuleRule, OutgoingCouplingRule,
+    UnassignedLayerRule,
+};
+use package_rules::{
+    CrossPackageRelativeImportRule, ForbiddenPackageDependencyRule, PackageCycleRule,
+    UndeclaredWorkspaceDependencyRule,
+};
+use runtime_rules::{
+    AmbiguousUniversalRuntimeRule, BrowserIncompatiblePackageRule, BrowserToNodeRule,
+    BrowserToServerRule, EdgeIncompatibleDependencyRule, IncompatibleRuntimeCycleRule,
+};
 
 pub struct RuleContext<'a> {
     pub project: &'a Project,
     pub graph: &'a ModuleGraph,
+    pub package_graph: &'a PackageGraph,
+    pub runtime_graph: &'a RuntimeGraph,
     pub config: &'a Config,
     pub module_layers: &'a HashMap<ModuleId, String>,
     pub module_features: &'a HashMap<ModuleId, FeatureId>,
     pub module_feature_roots: &'a HashMap<ModuleId, String>,
     pub policies: &'a CompiledRulePolicies,
+    pub declared_package_dependencies: &'a HashMap<PackageName, HashSet<PackageName>>,
 }
 
 pub struct CompiledRulePolicies {
@@ -77,29 +96,86 @@ impl RuleSet {
             .with_rule(LayerBoundaryRule)
             .with_rule(FeatureBoundaryRule)
             .with_rule(PrivateImportRule)
+            .with_rule(DependencyDepthRule)
+            .with_rule(OutgoingCouplingRule)
+            .with_rule(IncomingCouplingRule)
+            .with_rule(OrphanModuleRule)
+            .with_rule(UnassignedLayerRule)
+            .with_rule(PackageCycleRule)
+            .with_rule(ForbiddenPackageDependencyRule)
+            .with_rule(UndeclaredWorkspaceDependencyRule)
+            .with_rule(CrossPackageRelativeImportRule)
+            .with_rule(BrowserToServerRule)
+            .with_rule(BrowserToNodeRule)
+            .with_rule(BrowserIncompatiblePackageRule)
+            .with_rule(EdgeIncompatibleDependencyRule)
+            .with_rule(AmbiguousUniversalRuntimeRule)
+            .with_rule(IncompatibleRuntimeCycleRule)
     }
     pub fn with_rule<R: Rule + 'static>(mut self, rule: R) -> Self {
         self.rules.push(Box::new(rule));
         self
     }
     pub fn evaluate(&self, context: &RuleContext<'_>) -> Result<Vec<Diagnostic>, String> {
+        let enabled = self
+            .rules
+            .iter()
+            .filter(|rule| context.config.configured || rule.metadata().id == "ARCH-001")
+            .filter_map(|rule| {
+                context
+                    .config
+                    .rules
+                    .get(rule.metadata().id)
+                    .and_then(|value| value.severity())
+                    .map(|severity| (rule.as_ref(), severity))
+            })
+            .collect::<Vec<_>>();
+        let parallel = context.project.modules.len() >= 100
+            && enabled.len() >= 4
+            && std::thread::available_parallelism().is_ok_and(|workers| workers.get() > 1);
+        let batches = if parallel {
+            std::thread::scope(|scope| {
+                let handles = enabled
+                    .iter()
+                    .map(|(rule, severity)| {
+                        scope.spawn(move || evaluate_one(*rule, severity.clone(), context))
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| "architecture rule worker panicked".to_string())?
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })?
+        } else {
+            enabled
+                .into_iter()
+                .map(|(rule, severity)| evaluate_one(rule, severity, context))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let mut diagnostics = Vec::new();
-        for rule in &self.rules {
-            if !context.config.configured && rule.metadata().id != "ARCH-001" {
-                continue;
-            }
-            let severity =
-                context.config.rules.get(rule.metadata().id).and_then(|value| value.severity());
-            let Some(severity) = severity else { continue };
-            let before = diagnostics.len();
-            rule.evaluate(context, &mut diagnostics)?;
-            for diagnostic in &mut diagnostics[before..] {
-                diagnostic.severity = severity.clone();
-                diagnostic.refresh_fingerprint();
-            }
+        for batch in batches {
+            diagnostics.extend(batch);
         }
         Ok(diagnostics)
     }
+}
+
+fn evaluate_one(
+    rule: &dyn Rule,
+    severity: wae_core::domain::Severity,
+    context: &RuleContext<'_>,
+) -> Result<Vec<Diagnostic>, String> {
+    let mut diagnostics = Vec::new();
+    rule.evaluate(context, &mut diagnostics)?;
+    for diagnostic in &mut diagnostics {
+        diagnostic.severity = severity.clone();
+        diagnostic.refresh_fingerprint();
+    }
+    Ok(diagnostics)
 }
 
 pub struct CircularDependencyRule;
@@ -357,11 +433,14 @@ mod tests {
         RuleContext {
             project,
             graph,
+            package_graph: Box::leak(Box::new(PackageGraph::from_project(project))),
+            runtime_graph: Box::leak(Box::new(RuntimeGraph::from_project(project))),
             config,
             module_layers: Box::leak(Box::new(HashMap::new())),
             module_features: features,
             module_feature_roots: Box::leak(Box::new(HashMap::new())),
             policies: Box::leak(Box::new(CompiledRulePolicies::compile(config).unwrap())),
+            declared_package_dependencies: Box::leak(Box::new(HashMap::new())),
         }
     }
 
@@ -438,11 +517,14 @@ mod tests {
                 &RuleContext {
                     project: &project,
                     graph: &graph,
+                    package_graph: &PackageGraph::from_project(&project),
+                    runtime_graph: &RuntimeGraph::from_project(&project),
                     config: &config,
                     module_layers: &HashMap::new(),
                     module_features: &features,
                     module_feature_roots: &roots,
                     policies: &CompiledRulePolicies::compile(&config).unwrap(),
+                    declared_package_dependencies: &HashMap::new(),
                 },
                 &mut diagnostics,
             )

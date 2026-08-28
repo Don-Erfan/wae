@@ -9,3 +9,6 @@ globset.workspace = true
 wae-core = { path = "../core" }
 serde.workspace = true
 yaml_serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

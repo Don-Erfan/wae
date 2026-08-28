@@ -65,6 +65,25 @@ impl BaselineMatcher {
                 .any(|fingerprint| self.fingerprints.contains(fingerprint))
     }
 
+    pub fn len(&self) -> usize {
+        self.fingerprints.len()
+    }
+
+    pub fn matched_count(&self, diagnostics: &[Diagnostic]) -> usize {
+        self.fingerprints
+            .iter()
+            .filter(|stored| {
+                diagnostics.iter().any(|diagnostic| {
+                    &diagnostic.fingerprint == *stored
+                        || diagnostic
+                            .legacy_fingerprint_aliases()
+                            .iter()
+                            .any(|alias| alias == *stored)
+                })
+            })
+            .count()
+    }
+
     #[cfg(test)]
     fn contains(&self, fingerprint: &str) -> bool {
         self.fingerprints.contains(fingerprint)

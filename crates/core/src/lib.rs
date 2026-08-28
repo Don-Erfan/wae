@@ -130,7 +130,7 @@ pub mod domain {
         }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
     pub enum Runtime {
         Browser,
         Server,
@@ -614,6 +614,111 @@ pub mod rule_registry {
             configurable: true,
         },
         RuleDescriptor {
+            id: "ARCH-006",
+            title: "Dependency depth",
+            description: "Limits transitive dependency depth from configured architecture entrypoints.",
+            category: "maintainability",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-007",
+            title: "Outgoing coupling",
+            description: "Limits the number of modules directly imported by one module.",
+            category: "maintainability",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-008",
+            title: "Incoming coupling",
+            description: "Limits the number of modules directly depending on one module.",
+            category: "maintainability",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-009",
+            title: "Orphan module",
+            description: "Finds source modules unreachable from configured architecture entrypoints.",
+            category: "maintainability",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "ARCH-010",
+            title: "Unassigned architecture module",
+            description: "Requires every source module to belong to a configured architecture layer.",
+            category: "architecture",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "PACKAGE-001",
+            title: "Package cycle",
+            description: "Detects circular dependencies between workspace packages.",
+            category: "package-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "PACKAGE-002",
+            title: "Forbidden package dependency",
+            description: "Enforces configured package-to-package dependency policies.",
+            category: "package-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "PACKAGE-003",
+            title: "Undeclared workspace dependency",
+            description: "Requires cross-workspace imports to be declared in the importer manifest.",
+            category: "package-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "PACKAGE-004",
+            title: "Cross-package relative import",
+            description: "Prevents relative paths from bypassing workspace package entrypoints.",
+            category: "package-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "RUNTIME-001",
+            title: "Browser to server dependency",
+            description: "Prevents browser modules from reaching server-only modules transitively.",
+            category: "runtime-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "RUNTIME-002",
+            title: "Browser to Node dependency",
+            description: "Prevents browser modules from reaching Node-only modules transitively.",
+            category: "runtime-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "RUNTIME-003",
+            title: "Browser-incompatible package",
+            description: "Prevents browser modules from reaching configured incompatible packages.",
+            category: "runtime-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "RUNTIME-004",
+            title: "Edge-incompatible dependency",
+            description: "Prevents Edge modules from reaching Node-only modules or incompatible packages.",
+            category: "runtime-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "RUNTIME-005",
+            title: "Ambiguous universal runtime",
+            description: "Detects universal modules that transitively require incompatible runtime capabilities.",
+            category: "runtime-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
+            id: "RUNTIME-006",
+            title: "Incompatible runtime cycle",
+            description: "Detects dependency cycles that join incompatible runtime domains.",
+            category: "runtime-graph",
+            configurable: true,
+        },
+        RuleDescriptor {
             id: "PARSE-001",
             title: "Parse failure",
             description: "Reports malformed or unreadable source files.",
@@ -662,7 +767,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.12"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.13"]);
     }
 
     #[test]

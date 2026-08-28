@@ -1,0 +1,1 @@
+{"name":"@fixture/a","exports":"./src/index.ts","dependencies":{"@fixture/b":"workspace:*"}}

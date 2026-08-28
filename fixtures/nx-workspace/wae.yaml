@@ -1,0 +1,13 @@
+version: 1
+project:
+  roots: ["apps", "libs"]
+architecture:
+  layers:
+    apps:
+      patterns: ["apps/*/src/**"]
+      canImport: ["libs"]
+    libs:
+      patterns: ["libs/*/src/**"]
+      canImport: []
+  presets:
+    monorepo_boundaries: true

@@ -6,7 +6,7 @@ WAE analyzes JavaScript and TypeScript dependency architecture. Its production p
 source discovery → import parsing → Node/TypeScript resolution → module graph → rules → diagnostics
 ```
 
-The current engine traverses the Tree-sitter AST for static imports, type-only imports, re-exports, literal dynamic imports, and CommonJS `require` calls. It resolves relative extension/index imports, JSONC `tsconfig` aliases and `extends`, workspace packages, `exports`, and `imports`, then evaluates `ARCH-001` through `ARCH-005` against a shared deterministic graph.
+The current engine traverses the Tree-sitter AST for static imports, type-only imports, re-exports, literal dynamic imports, and CommonJS `require` calls. It resolves relative extension/index imports, JSONC `tsconfig` aliases and `extends`, workspace packages, `exports`, and `imports`, then evaluates `ARCH-001` through `ARCH-010`, `PACKAGE-001` through `PACKAGE-004`, and `RUNTIME-001` through `RUNTIME-006` against shared deterministic graphs. A real framework adapter classifies Next.js App/Pages Router modules, client/server directives, routes, actions, middleware, and explicit runtime exports. Runtime diagnostics carry the shortest transitive dependency path, while Server Actions act as explicit RPC boundaries.
 
 ## Use from source
 
@@ -14,7 +14,9 @@ The current engine traverses the Tree-sitter AST for static imports, type-only i
 cargo run -p wae-cli -- check
 cargo run -p wae-cli -- check --format json
 cargo run -p wae-cli -- graph
+cargo run -p wae-cli -- explore
 cargo run -p wae-cli -- doctor
+cargo run -p wae-cli -- resolve src/app/page.tsx '@/features/cart'
 ```
 
 Create a typed, versioned configuration. The default is intentionally blank, so WAE never assigns
@@ -24,6 +26,7 @@ layout:
 ```bash
 cargo run -p wae-cli -- init
 cargo run -p wae-cli -- init --preset next
+cargo run -p wae-cli -- discover
 cargo run -p wae-cli -- config validate --show-overlaps
 ```
 
@@ -44,7 +47,10 @@ npm install --save-dev @don-erfan/wae
 npx wae check
 ```
 
-The installer supports Linux x64/arm64, macOS x64/arm64, and Windows x64. It allows only HTTPS GitHub hosts, enforces redirect, timeout, and size limits, downloads to temporary files, verifies SHA-256, and atomically installs the verified binary.
+The installer supports Linux x64/arm64, macOS x64/arm64, and Windows x64. It installs the CLI,
+language server and MCP server, allows only HTTPS GitHub hosts, enforces redirect, timeout, and size
+limits, downloads to temporary files, verifies SHA-256, and atomically installs each verified
+binary.
 
 ## Verify release assets
 
@@ -59,7 +65,7 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.12.spdx.json
+jq '.packages | length' wae-v0.0.13.spdx.json
 ```
 
 The checksum proves the downloaded SBOM is the one signed by the release workflow; the SBOM can
@@ -71,7 +77,8 @@ then be inspected with any SPDX-compatible tool.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+cargo bench --workspace --no-run
 ```
 
-See [Configuration](docs/CONFIGURATION.md), [Architecture](docs/ARCHITECTURE.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
+See [Configuration](docs/CONFIGURATION.md), [Architecture](docs/ARCHITECTURE.md), [Acceptance](docs/ACCEPTANCE.md), [Debugging](docs/DEBUGGING.md), [IDE integrations](docs/IDE.md), [MCP/Explorer/Action integrations](docs/INTEGRATIONS.md), [Performance](docs/PERFORMANCE.md), [Reliability](docs/RELIABILITY.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
 Release maintainers should also read [Releasing](docs/RELEASING.md).

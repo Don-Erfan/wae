@@ -131,7 +131,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Build release binary
-        run: cargo build --release -p wae-cli --target ${{ matrix.target }}
+        run: cargo build --release -p wae-cli -p wae-lsp -p wae-mcp --target ${{ matrix.target }}
 
       - name: Collect binary asset
         shell: bash
@@ -155,10 +155,14 @@ jobs:
           fi
 
           cp "$src" "dist/${{ matrix.artifact }}"
+          cp "target/${{ matrix.target }}/release/wae-lsp${{ matrix.exe_suffix }}" \
+            "dist/wae-lsp-${{ matrix.target }}${{ matrix.exe_suffix }}"
+          cp "target/${{ matrix.target }}/release/wae-mcp${{ matrix.exe_suffix }}" \
+            "dist/wae-mcp-${{ matrix.target }}${{ matrix.exe_suffix }}"
           if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+            (cd dist && for asset in wae*; do sha256sum "$asset" > "$asset.sha256"; done)
           else
-            (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+            (cd dist && for asset in wae*; do shasum -a 256 "$asset" > "$asset.sha256"; done)
           fi
 
       - name: Upload binary asset artifact
@@ -166,8 +170,7 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/${{ matrix.artifact }}
-            dist/${{ matrix.artifact }}.sha256
+            dist/*
           if-no-files-found: error
 
   release:

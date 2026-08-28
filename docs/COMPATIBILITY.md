@@ -27,7 +27,9 @@
 - TypeScript
 - React
 
-تشخیص اختصاصی Next.js App Router/Pages و runtime rules فعلاً experimental است و جزو پشتیبانی رسمی نیست.
+طبقه‌بندی semantic مربوط به Next.js App Router و Pages Router پشتیبانی و در CI تست می‌شود.
+`RuntimeGraph` و قوانین transitive از `RUNTIME-001` تا `RUNTIME-006` کوتاه‌ترین مسیر ناسازگار را
+گزارش می‌کنند و Server Action را به‌عنوان مرز RPC در نظر می‌گیرند.
 
 ### ساختار پروژه
 
@@ -70,6 +72,7 @@
 - `1`: violation شناسایی شد
 - `2`: خطای config/project
 - `3`: خطای داخلی سیستم
+- `130`: تحلیل با Ctrl+C لغو شد
 
 این قرارداد برای CI ثابت فرض می‌شود.
 

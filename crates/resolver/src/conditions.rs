@@ -13,6 +13,10 @@ impl ConditionSet {
         self.0.contains(condition)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
     fn common(request: &ResolutionRequest<'_>) -> Self {
         let mut conditions = BTreeSet::from(["default".to_owned()]);
         conditions.insert(

@@ -2,6 +2,19 @@
 
 `wae.yaml` is a versioned, strict schema. Unknown keys and invalid glob patterns are errors.
 
+For YAML autocomplete and inline validation, add this first line (or associate the schema in the
+editor's YAML settings):
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Don-Erfan/wae/master/schemas/wae.schema.json
+```
+
+The bundled schema is registry-synchronized by a test, so every configurable rule ID appears in
+completion and removed/unknown keys are rejected before WAE runs.
+
+Use an alternate file for one invocation with `wae check --config path/to/architecture.yml`.
+`--no-cache` disables reads and writes without mutating that file.
+
 ```yaml
 version: 1
 
@@ -14,11 +27,22 @@ resolution:
   mode: nodenext
   custom_conditions: []
 
+framework:
+  auto_detect: true
+  enabled: []
+
+runtime:
+  browser_incompatible_packages: ["node:*", "@acme/server-*"]
+  edge_incompatible_packages: ["node:*", "*-native"]
+
 architecture:
   layers:
     app:
       patterns: ["src/app/**"]
       canImport: ["features", "entities", "shared"]
+  forbidden_package_dependencies:
+    - from: "@acme/shared-*"
+      to: "@acme/app-*"
   features:
     roots: ["src/features"]
     public_entrypoints: ["index.ts", "index.tsx", "index.mts", "index.cts", "index.js", "index.jsx", "index.mjs", "index.cjs"]
@@ -26,6 +50,10 @@ architecture:
 rules:
   ARCH-001: error
   ARCH-004: warning
+  ARCH-006:
+    severity: warning
+    max_depth: 8
+    entrypoints: ["src/app/**/page.tsx"]
 
 suppressions:
   require_reason: true
@@ -86,6 +114,37 @@ specifiers are all marked `type`. Mixed clauses remain runtime `Static`/`ReExpor
 Absolute module specifiers are rejected because they escape the project analysis boundary.
 Duplicate workspace package names are configuration errors.
 
+## Framework adapters
+
+`framework.auto_detect` is enabled by default. Next.js is selected only when `next` appears in a
+root dependency section or a `next.config.js|mjs|cjs|ts` file exists; directory names alone are not
+authoritative evidence. To disable all adapters use `auto_detect: false` with an empty `enabled`
+list. To force the adapter for a nonstandard project use:
+
+```yaml
+framework:
+  auto_detect: false
+  enabled: [nextjs]
+```
+
+The Next.js adapter classifies App Router pages/layouts/loading/error/not-found/templates, route
+handlers, module-level client/server directives, middleware, Pages Router pages/API routes and
+custom `_app`/`_document`/`_error` files. It also records explicit `edge`/`nodejs` runtime exports.
+Classification is stored as open `FrameworkMetadata`, so core and rule APIs do not depend on a
+Next-specific enum.
+
+## Runtime graph
+
+`RuntimeGraph` propagates browser, server, Node and Edge requirements over the resolved module
+graph and retains a deterministic shortest path for every requirement. `RUNTIME-001` through
+`RUNTIME-006` consume this shared projection rather than repeating traversal per parser or
+framework. Explicit runtime exports are classified before graph construction. Next.js Server
+Actions terminate propagation because importing an action creates an RPC reference, not a client
+bundle dependency on its server implementation.
+
+The incompatible package lists are opt-in glob policies. Keep them specific to dependencies known
+to require unavailable platform APIs; an empty list produces no package-compatibility diagnostic.
+
 ## Source suppressions
 
 A suppression is a standalone `//` comment, is rule-scoped, applies to its own line or the
@@ -129,7 +188,30 @@ The validation command lists every source file matching multiple layers and sugg
 patterns or exclusions. `wae doctor` includes the same root cause instead of collapsing it into a
 generic analysis failure.
 
+For an existing repository, `wae discover` produces a read-only proposal with explicit evidence,
+confidence, detected config files and feature clusters. It recognizes authoritative Next.js
+dependencies/configs, `nx.json`, `turbo.json`, FSD directory segments, `tsconfig.json` and
+`jsconfig.json`. No config is written until approval:
+
+```bash
+wae discover
+wae discover --json > architecture-proposal.json
+wae discover --write
+# Overwriting an existing file requires both flags:
+wae discover --write --force
+```
+
+The resolver selects `tsconfig.json` over `jsconfig.json` when both exist in one directory; otherwise
+either file supplies the nearest configured-project `baseUrl` and `paths` aliases.
+
 ## Cache concurrency
+
+`analysis-v2.json` stores module-level parse results, normalized resolution records, graph edges
+and parser/resolver diagnostics. A resolution-environment fingerprint covers configuration,
+workspace manifests, ts/jsconfig files and framework configs. Unchanged modules restore those
+fragments without parsing or resolving again; deleted targets and newly satisfiable unresolved
+candidates invalidate the owning module. A graph-identity snapshot also reuses rule diagnostics
+when the complete semantic graph is unchanged. Any graph change reevaluates rules for correctness.
 
 Analysis reads an unlocked cache snapshot. Saving takes an operating-system advisory lock only for
 the short reload, merge, prune, atomic-write and rename transaction. The reload preserves entries
@@ -149,4 +231,7 @@ wae check --changed --base origin/main
 
 Changed mode evaluates changed/deleted files plus their transitive importer closure. Resolver
 candidate hints ensure that deleting a relative, TypeScript-alias, or workspace-export target also
-marks its importer as affected.
+marks its importer as affected. Human, JSON, JSONL and SARIF outputs include a regression summary
+with affected-module, existing, introduced and fixed counts. Incremental cache fragments restore
+unaffected modules, so the semantic project remains complete without reparsing/re-resolving the
+entire source set.

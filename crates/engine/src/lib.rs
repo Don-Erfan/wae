@@ -1,18 +1,22 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use wae_config::Config;
 use wae_core::domain::{
-    Dependency, DependencyTarget, Diagnostic, FrameworkMetadata, LayerId, Module, ModuleId,
-    ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime, Severity,
-    SourceLocation,
+    Dependency, DependencyTarget, Diagnostic, FeatureId, FrameworkMetadata, LayerId, Module,
+    ModuleId, ModuleKind, ModulePath, Package, PackageName, Project, ResolvedDependency, Runtime,
+    Severity, SourceLocation,
 };
-use wae_graph::ModuleGraph;
+use wae_framework::{FrameworkAdapter, FrameworkRegistry, ModuleEvidence, ProjectEvidence};
+use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
 use wae_parser::{JsTsParser, ParserAdapter};
 use wae_resolver::{
-    ModuleResolver, PackageScopeIndex, Resolution, ResolutionRequest, ResolverPipeline,
-    TsConfigIndex, WorkspacePackage, WorkspacePackageIndex, resolution_kind_for,
+    BundlerConditions, ConditionSetProvider, ModuleResolver, Node16Conditions, NodeNextConditions,
+    PackageScopeIndex, Resolution, ResolutionRequest, ResolverPipeline, TsConfigIndex,
+    WorkspacePackage, WorkspacePackageIndex, resolution_kind_for,
 };
 use wae_rules::{CompiledRulePolicies, RuleContext, RuleSet};
 
@@ -23,7 +27,7 @@ mod discovery;
 mod resolution_context;
 mod suppression;
 use architecture_index::CompiledArchitectureModel;
-use cache::{AnalysisCache, stable_hash};
+use cache::{AnalysisCache, CachedModuleAnalysis, stable_hash};
 use diagnostic_arbitrator::DiagnosticArbitrator;
 use discovery::discover_modules;
 use resolution_context::ModuleFormatResolver;
@@ -33,10 +37,49 @@ pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 #[derive(Clone, Debug)]
 pub struct AnalyzeRequest {
     pub root: PathBuf,
+    pub config_path: Option<PathBuf>,
+    pub cache_enabled: Option<bool>,
+    pub overlays: BTreeMap<String, String>,
+    pub cancellation: CancellationToken,
 }
 impl AnalyzeRequest {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            config_path: None,
+            cache_enabled: None,
+            overlays: BTreeMap::new(),
+            cancellation: CancellationToken::default(),
+        }
+    }
+    pub fn with_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_path = Some(path.into());
+        self
+    }
+    pub fn without_cache(mut self) -> Self {
+        self.cache_enabled = Some(false);
+        self
+    }
+    pub fn with_overlay(mut self, module: impl Into<String>, source: impl Into<String>) -> Self {
+        self.overlays.insert(module.into(), source.into());
+        self.cache_enabled = Some(false);
+        self
+    }
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -46,6 +89,57 @@ pub struct Analysis {
     pub project: Project,
     pub graph: ModuleGraph,
     pub diagnostics: Vec<Diagnostic>,
+    pub incremental: IncrementalStats,
+    pub timings: AnalysisTimings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnalysisTimings {
+    pub discovery_ms: u128,
+    pub module_analysis_ms: u128,
+    pub graph_ms: u128,
+    pub rules_ms: u128,
+    pub total_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceResolutionRequest {
+    pub root: PathBuf,
+    pub importer: PathBuf,
+    pub specifier: String,
+    pub dependency_kind: wae_core::domain::DependencyKind,
+    pub config_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionTrace {
+    pub importer: String,
+    pub specifier: String,
+    pub dependency_kind: String,
+    pub mode: String,
+    pub importer_format: String,
+    pub resolution_kind: String,
+    pub active_conditions: Vec<String>,
+    pub candidate_paths: Vec<String>,
+    pub attempts: Vec<ResolutionTraceAttempt>,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionTraceAttempt {
+    pub specifier: String,
+    pub handler: String,
+    pub outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IncrementalStats {
+    pub cache_enabled: bool,
+    pub restored_modules: usize,
+    pub analyzed_modules: usize,
+    pub rule_snapshot_reused: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +172,89 @@ pub fn validate_project_config(root: impl AsRef<Path>) -> Result<ConfigValidatio
         .collect::<Vec<_>>();
     layer_overlaps.sort_by(|left, right| left.module.cmp(&right.module));
     Ok(ConfigValidation { source_modules: files.len(), layer_overlaps })
+}
+
+pub fn trace_resolution(request: TraceResolutionRequest) -> Result<ResolutionTrace, AnalysisError> {
+    let root = request
+        .root
+        .canonicalize()
+        .map_err(|error| AnalysisError::Project(format!("cannot open project root: {error}")))?;
+    let importer =
+        if request.importer.is_absolute() { request.importer } else { root.join(request.importer) }
+            .canonicalize()
+            .map_err(|error| AnalysisError::Project(format!("cannot open importer: {error}")))?;
+    if !importer.starts_with(&root) {
+        return Err(AnalysisError::Project("importer escapes the project root".into()));
+    }
+    let config = match request.config_path {
+        Some(path) => {
+            let path = if path.is_absolute() { path } else { root.join(path) };
+            Config::load_file(&path).map_err(AnalysisError::Config)?
+        }
+        None => Config::load(&root).map_err(AnalysisError::Config)?,
+    };
+    let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
+    let workspaces = WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
+    let scopes = PackageScopeIndex::from_importers(&root, std::slice::from_ref(&importer))
+        .map_err(AnalysisError::Project)?;
+    let formats = ModuleFormatResolver::new(&scopes);
+    let importer_format = formats.resolve(&importer);
+    let resolution_kind =
+        resolution_kind_for(config.resolution.mode, &request.dependency_kind, importer_format);
+    let importer_path = ModulePath(normalize(&importer));
+    let resolution_request = ResolutionRequest {
+        importer: &importer_path,
+        specifier: &request.specifier,
+        dependency_kind: request.dependency_kind.clone(),
+        resolution_kind,
+        importer_format,
+        mode: config.resolution.mode,
+        custom_conditions: &config.resolution.custom_conditions,
+    };
+    let resolver = ResolverPipeline::indexed_node_with_workspaces(
+        tsconfigs,
+        workspaces,
+        config.resolution.mode,
+    );
+    let candidate_paths = resolver
+        .candidate_paths(&resolution_request)
+        .into_iter()
+        .map(|candidate| relative_resolved_path(&root, &candidate.0))
+        .collect();
+    let active_conditions = match config.resolution.mode {
+        wae_config::ResolutionMode::Node10 | wae_config::ResolutionMode::Node16 => {
+            Node16Conditions.active_conditions(&resolution_request)
+        }
+        wae_config::ResolutionMode::NodeNext => {
+            NodeNextConditions.active_conditions(&resolution_request)
+        }
+        wae_config::ResolutionMode::Bundler => {
+            BundlerConditions.active_conditions(&resolution_request)
+        }
+    }
+    .iter()
+    .map(str::to_owned)
+    .collect();
+    let (outcome, attempts) = resolver.resolve_with_trace(&resolution_request);
+    Ok(ResolutionTrace {
+        importer: relative_path(&root, &importer),
+        specifier: request.specifier,
+        dependency_kind: format!("{:?}", request.dependency_kind),
+        mode: format!("{:?}", config.resolution.mode),
+        importer_format: format!("{importer_format:?}"),
+        resolution_kind: format!("{resolution_kind:?}"),
+        active_conditions,
+        candidate_paths,
+        attempts: attempts
+            .into_iter()
+            .map(|attempt| ResolutionTraceAttempt {
+                specifier: attempt.specifier,
+                handler: attempt.handler.into(),
+                outcome: attempt.outcome.map(|outcome| resolution_text(&root, &outcome)),
+            })
+            .collect(),
+        outcome: resolution_text(&root, &outcome),
+    })
 }
 
 /// Single failure policy shared by exit codes and machine-readable reporting.
@@ -168,6 +345,7 @@ pub enum AnalysisError {
     Config(wae_core::domain::ConfigError),
     Project(String),
     Internal(String),
+    Cancelled,
 }
 
 /// Facade for the complete architecture-analysis subsystem.
@@ -188,19 +366,60 @@ impl<P: ParserAdapter> Engine<P> {
     }
 
     pub fn analyze(&self, request: AnalyzeRequest) -> Result<Analysis, AnalysisError> {
-        let root = request
-            .root
+        let total_started = std::time::Instant::now();
+        let AnalyzeRequest {
+            root: requested_root,
+            config_path,
+            cache_enabled,
+            overlays,
+            cancellation,
+        } = request;
+        if cancellation.is_cancelled() {
+            return Err(AnalysisError::Cancelled);
+        }
+        let root = requested_root
             .canonicalize()
             .map_err(|e| AnalysisError::Project(format!("cannot open project root: {e}")))?;
-        let config = Config::load(&root).map_err(AnalysisError::Config)?;
+        let mut config = match config_path {
+            Some(path) => {
+                let path = if path.is_absolute() { path } else { root.join(path) };
+                Config::load_file(&path).map_err(AnalysisError::Config)?
+            }
+            None => Config::load(&root).map_err(AnalysisError::Config)?,
+        };
+        if let Some(enabled) = cache_enabled {
+            config.cache.enabled = enabled;
+        }
+        let discovery_started = std::time::Instant::now();
         let architecture = CompiledArchitectureModel::compile(&config)?;
         let files = discover_modules(&root, &config)?;
+        let framework_registry = FrameworkRegistry::default();
+        let framework_evidence = framework_project_evidence(&root)?;
+        let framework_adapter = framework_registry.select(
+            &framework_evidence,
+            &config.framework.enabled,
+            config.framework.auto_detect,
+        );
         let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
         let workspace_resolver =
             WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
         let package_scopes =
             PackageScopeIndex::from_importers(&root, &files).map_err(AnalysisError::Project)?;
         let workspace_packages = workspace_resolver.packages().to_vec();
+        let declared_package_dependencies = workspace_packages
+            .iter()
+            .map(|package| {
+                (
+                    PackageName(package.name.clone()),
+                    package
+                        .declared_dependencies
+                        .iter()
+                        .cloned()
+                        .map(PackageName)
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let module_formats = ModuleFormatResolver::new(&package_scopes);
         let resolver = ResolverPipeline::indexed_node_with_workspaces(
             tsconfigs,
@@ -216,9 +435,17 @@ impl<P: ParserAdapter> Engine<P> {
         let mut feature_roots = HashMap::new();
         let live_cache_files = files.iter().map(|path| relative_path(&root, path)).collect();
         let mut cache = AnalysisCache::load(&root, &config, live_cache_files)?;
+        let environment_hash = analysis_environment_hash(&root, &config)?;
+        let mut incremental =
+            IncrementalStats { cache_enabled: cache.enabled(), ..Default::default() };
         let mut suppressions = Vec::new();
+        let discovery_ms = discovery_started.elapsed().as_millis();
+        let module_analysis_started = std::time::Instant::now();
 
         for path in &files {
+            if cancellation.is_cancelled() {
+                return Err(AnalysisError::Cancelled);
+            }
             let relative = relative_path(&root, path);
             let id = ModuleId(relative.clone());
             let package = infer_package(&root, path, &workspace_packages, &default_package);
@@ -246,13 +473,23 @@ impl<P: ParserAdapter> Engine<P> {
         }
 
         project.packages = discovered_packages.into_values().collect();
+        let module_analysis_ms = module_analysis_started.elapsed().as_millis();
+        let graph_started = std::time::Instant::now();
         project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
         let mut project_index = ProjectIndex::from_project(&project);
 
         for path in &files {
+            if cancellation.is_cancelled() {
+                return Err(AnalysisError::Cancelled);
+            }
             let module_path = ModulePath(normalize(path));
             let module_id = ModuleId(relative_path(&root, path));
-            let source = match fs::read_to_string(path) {
+            let source = match overlays
+                .get(&module_id.0)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| fs::read_to_string(path))
+            {
                 Ok(source) => source,
                 Err(error) => {
                     project.diagnostics.push(simple_diagnostic(
@@ -264,6 +501,16 @@ impl<P: ParserAdapter> Engine<P> {
                 }
             };
             let source_hash = stable_hash(source.as_bytes());
+            if let Some(adapter) = framework_adapter {
+                let classification =
+                    adapter.classify(ModuleEvidence { path: &module_id.0, source: &source });
+                if let Some(module) =
+                    project.modules.iter_mut().find(|module| module.id == module_id)
+                {
+                    module.framework_metadata = classification.metadata;
+                    module.runtime = classification.runtime;
+                }
+            }
             suppression::collect(
                 &module_id.0,
                 &source,
@@ -271,16 +518,35 @@ impl<P: ParserAdapter> Engine<P> {
                 &mut suppressions,
                 &mut project.diagnostics,
             );
-            let parsed = cache
-                .get(&module_id.0, source_hash)
-                .map(Ok)
-                .unwrap_or_else(|| self.parser.parse_imports(&module_path, &source));
-            if let Ok(imports) = &parsed {
-                cache.insert(module_id.0.clone(), source_hash, imports.clone());
+            if let Some(cached) = cache.get(&module_id.0, source_hash, environment_hash) {
+                incremental.restored_modules += 1;
+                restore_cached_module(
+                    cached,
+                    &root,
+                    &workspace_packages,
+                    &default_package,
+                    framework_adapter,
+                    &architecture,
+                    &mut project,
+                    &mut project_index,
+                    &mut layers,
+                    &mut features,
+                    &mut feature_roots,
+                )?;
+                continue;
             }
+            incremental.analyzed_modules += 1;
+            let imports_start = project.imports.len();
+            let dependencies_start = project.dependencies.len();
+            let resolved_start = project.resolved_dependencies.len();
+            let diagnostics_start = project.diagnostics.len();
+            let parsed = self.parser.parse_imports(&module_path, &source);
             match parsed {
                 Ok(imports) => {
                     for mut import in imports {
+                        if cancellation.is_cancelled() {
+                            return Err(AnalysisError::Cancelled);
+                        }
                         import.module_id = module_id.clone();
                         import.location.file = module_id.0.clone();
                         let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
@@ -348,9 +614,29 @@ impl<P: ParserAdapter> Engine<P> {
                                         path: ModulePath(target_id.0.clone()),
                                         package: package.name,
                                         kind: ModuleKind::Excluded,
-                                        runtime: Runtime::Unknown,
+                                        runtime: framework_adapter.map_or(
+                                            Runtime::Unknown,
+                                            |adapter| {
+                                                adapter
+                                                    .classify(ModuleEvidence {
+                                                        path: &target_id.0,
+                                                        source: "",
+                                                    })
+                                                    .runtime
+                                            },
+                                        ),
                                         layer: layer.map(LayerId),
-                                        framework_metadata: FrameworkMetadata::default(),
+                                        framework_metadata: framework_adapter.map_or_else(
+                                            FrameworkMetadata::default,
+                                            |adapter| {
+                                                adapter
+                                                    .classify(ModuleEvidence {
+                                                        path: &target_id.0,
+                                                        source: "",
+                                                    })
+                                                    .metadata
+                                            },
+                                        ),
                                     });
                                 }
                                 project.resolved_dependencies.push(ResolvedDependency {
@@ -463,32 +749,259 @@ impl<P: ParserAdapter> Engine<P> {
                     project.diagnostics.push(diagnostic);
                 }
             }
+            cache.insert(
+                module_id.0.clone(),
+                source_hash,
+                environment_hash,
+                CachedModuleAnalysis {
+                    hash: source_hash,
+                    environment_hash,
+                    imports: project.imports[imports_start..].to_vec(),
+                    dependencies: project.dependencies[dependencies_start..].to_vec(),
+                    resolved_dependencies: project.resolved_dependencies[resolved_start..].to_vec(),
+                    diagnostics: project.diagnostics[diagnostics_start..].to_vec(),
+                    resolved_paths: Vec::new(),
+                },
+            );
         }
-
-        cache.save()?;
 
         project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
         project.modules.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         project.dependencies.sort_by(|a, b| (&a.from.0, &a.to.0).cmp(&(&b.from.0, &b.to.0)));
+        if cancellation.is_cancelled() {
+            return Err(AnalysisError::Cancelled);
+        }
         let graph = ModuleGraph::from_project(&project);
+        let package_graph = PackageGraph::from_project(&project);
+        let runtime_graph = RuntimeGraph::from_project(&project);
+        let graph_ms = graph_started.elapsed().as_millis();
+        let rules_started = std::time::Instant::now();
         let rule_policies =
             CompiledRulePolicies::compile(&config).map_err(AnalysisError::Internal)?;
         let context = RuleContext {
             project: &project,
             graph: &graph,
+            package_graph: &package_graph,
+            runtime_graph: &runtime_graph,
             config: &config,
             module_layers: &layers,
             module_features: &features,
             module_feature_roots: &feature_roots,
             policies: &rule_policies,
+            declared_package_dependencies: &declared_package_dependencies,
         };
         let mut diagnostics = project.diagnostics.clone();
-        diagnostics.extend(self.rules.evaluate(&context).map_err(AnalysisError::Internal)?);
+        let graph_hash = analysis_graph_hash(&project, environment_hash)?;
+        let rule_diagnostics = if let Some(diagnostics) = cache.rule_diagnostics(graph_hash) {
+            incremental.rule_snapshot_reused = true;
+            diagnostics
+        } else {
+            let diagnostics = self.rules.evaluate(&context).map_err(AnalysisError::Internal)?;
+            cache.set_rule_diagnostics(graph_hash, diagnostics.clone());
+            diagnostics
+        };
+        if cancellation.is_cancelled() {
+            return Err(AnalysisError::Cancelled);
+        }
+        diagnostics.extend(rule_diagnostics);
         diagnostics = DiagnosticArbitrator::arbitrate(diagnostics);
         suppression::apply(&mut diagnostics, &mut suppressions, config.suppressions.report_unused);
         diagnostics.sort_by(|a, b| diagnostic_key(a).cmp(&diagnostic_key(b)));
-        Ok(Analysis { schema_version: OUTPUT_SCHEMA_VERSION, project, graph, diagnostics })
+        if cancellation.is_cancelled() {
+            return Err(AnalysisError::Cancelled);
+        }
+        cache.save()?;
+        let rules_ms = rules_started.elapsed().as_millis();
+        let timings = AnalysisTimings {
+            discovery_ms,
+            module_analysis_ms,
+            graph_ms,
+            rules_ms,
+            total_ms: total_started.elapsed().as_millis(),
+        };
+        Ok(Analysis {
+            schema_version: OUTPUT_SCHEMA_VERSION,
+            project,
+            graph,
+            diagnostics,
+            incremental,
+            timings,
+        })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_cached_module(
+    cached: CachedModuleAnalysis,
+    root: &Path,
+    workspace_packages: &[WorkspacePackage],
+    default_package: &Package,
+    framework_adapter: Option<&dyn FrameworkAdapter>,
+    architecture: &CompiledArchitectureModel,
+    project: &mut Project,
+    project_index: &mut ProjectIndex,
+    layers: &mut HashMap<ModuleId, String>,
+    features: &mut HashMap<ModuleId, FeatureId>,
+    feature_roots: &mut HashMap<ModuleId, String>,
+) -> Result<(), AnalysisError> {
+    for dependency in &cached.dependencies {
+        if !project_index.insert_module(dependency.to.clone()) {
+            continue;
+        }
+        let resolved = cached
+            .resolved_dependencies
+            .iter()
+            .find(|resolved| {
+                resolved.from == dependency.from
+                    && resolved.kind == dependency.kind
+                    && resolved.location == dependency.location
+            })
+            .ok_or_else(|| {
+                AnalysisError::Internal(format!(
+                    "cached edge `{}` -> `{}` has no resolution record",
+                    dependency.from.0, dependency.to.0
+                ))
+            })?;
+        if let DependencyTarget::ExternalPackage(package_name) = &resolved.target {
+            let package = Package { name: package_name.clone(), root_path: String::new() };
+            if project_index.insert_package(package.name.clone()) {
+                project.packages.push(package.clone());
+            }
+            project.modules.push(Module {
+                id: dependency.to.clone(),
+                path: ModulePath(dependency.to.0.clone()),
+                package: package.name,
+                kind: ModuleKind::External,
+                runtime: Runtime::Unknown,
+                layer: None,
+                framework_metadata: FrameworkMetadata::default(),
+            });
+            continue;
+        }
+
+        let target_path = root.join(&dependency.to.0);
+        let package = infer_package(root, &target_path, workspace_packages, default_package);
+        if project_index.insert_package(package.name.clone()) {
+            project.packages.push(package.clone());
+        }
+        let layer = architecture.layer(&dependency.to.0)?;
+        if let Some(value) = &layer {
+            layers.insert(dependency.to.clone(), value.clone());
+        }
+        let package_root = relative_resolved_path(root, &package.root_path);
+        if let Some((feature, feature_root)) =
+            architecture.feature(&dependency.to.0, &package, &package_root)
+        {
+            features.insert(dependency.to.clone(), feature);
+            feature_roots.insert(dependency.to.clone(), feature_root);
+        }
+        let classification = framework_adapter
+            .map(|adapter| adapter.classify(ModuleEvidence { path: &dependency.to.0, source: "" }));
+        project.modules.push(Module {
+            id: dependency.to.clone(),
+            path: ModulePath(dependency.to.0.clone()),
+            package: package.name,
+            kind: ModuleKind::Excluded,
+            runtime: classification.as_ref().map_or(Runtime::Unknown, |value| value.runtime),
+            layer: layer.map(LayerId),
+            framework_metadata: classification
+                .map_or_else(FrameworkMetadata::default, |value| value.metadata),
+        });
+    }
+    project.dependency_candidates.extend(cached.imports.iter().cloned().map(Into::into));
+    project.imports.extend(cached.imports);
+    project.dependencies.extend(cached.dependencies);
+    project.resolved_dependencies.extend(cached.resolved_dependencies);
+    project.diagnostics.extend(cached.diagnostics);
+    Ok(())
+}
+
+fn analysis_environment_hash(root: &Path, config: &Config) -> Result<u64, AnalysisError> {
+    let mut inputs = Vec::<PathBuf>::new();
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true).filter_entry(
+        |entry| {
+            !entry.file_type().is_some_and(|kind| kind.is_dir())
+                || !matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    "node_modules" | ".git" | ".wae" | ".next" | "dist" | "build" | "target"
+                )
+        },
+    );
+    for entry in builder.build() {
+        let entry = entry.map_err(|error| AnalysisError::Project(error.to_string()))?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "package.json"
+                | "tsconfig.json"
+                | "jsconfig.json"
+                | "next.config.js"
+                | "next.config.mjs"
+                | "next.config.cjs"
+                | "next.config.ts"
+        ) {
+            inputs.push(entry.into_path());
+        }
+    }
+    inputs.sort();
+    let mut identity = format!("wae-analysis-v2\n{config:?}").into_bytes();
+    for path in inputs {
+        identity.extend_from_slice(relative_path(root, &path).as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(&fs::read(&path).map_err(|error| {
+            AnalysisError::Project(format!(
+                "cannot fingerprint analysis input `{}`: {error}",
+                path.display()
+            ))
+        })?);
+        identity.push(0xff);
+    }
+    Ok(stable_hash(&identity))
+}
+
+fn analysis_graph_hash(project: &Project, environment_hash: u64) -> Result<u64, AnalysisError> {
+    let identity = serde_json::to_vec(&(
+        environment_hash,
+        &project.modules,
+        &project.dependencies,
+        &project.resolved_dependencies,
+    ))
+    .map_err(|error| AnalysisError::Internal(error.to_string()))?;
+    Ok(stable_hash(&identity))
+}
+
+fn framework_project_evidence(root: &Path) -> Result<ProjectEvidence, AnalysisError> {
+    let manifest_path = root.join("package.json");
+    let package_manifest = manifest_path
+        .exists()
+        .then(|| {
+            fs::read_to_string(&manifest_path)
+                .map_err(|error| {
+                    AnalysisError::Project(format!(
+                        "cannot read framework manifest `{}`: {error}",
+                        manifest_path.display()
+                    ))
+                })
+                .and_then(|source| {
+                    serde_json::from_str(&source).map_err(|error| {
+                        AnalysisError::Project(format!(
+                            "invalid framework manifest `{}`: {error}",
+                            manifest_path.display()
+                        ))
+                    })
+                })
+        })
+        .transpose()?;
+    let config_files = ["next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"]
+        .into_iter()
+        .filter(|name| root.join(name).is_file())
+        .map(str::to_owned)
+        .collect();
+    Ok(ProjectEvidence { package_manifest, config_files })
 }
 
 fn project_name(root: &Path) -> String {
@@ -533,6 +1046,18 @@ fn relative_resolved_path(root: &Path, resolved: &str) -> String {
         .and_then(|relative| relative.strip_prefix('/'))
         .unwrap_or(&resolved)
         .to_string()
+}
+
+fn resolution_text(root: &Path, resolution: &Resolution) -> String {
+    match resolution {
+        Resolution::Module(module) => {
+            format!("module:{}", relative_resolved_path(root, &module.0))
+        }
+        Resolution::External(package) => format!("external:{package}"),
+        Resolution::Redirect(target) => format!("redirect:{target}"),
+        Resolution::Invalid(reason) => format!("invalid:{reason}"),
+        Resolution::Unresolved => "unresolved".into(),
+    }
 }
 
 fn normalized_path_is_within(resolved: &str, directory: &Path) -> bool {
@@ -653,6 +1178,90 @@ mod tests {
                 .count(),
             11
         );
+    }
+
+    #[test]
+    fn nx_and_turborepo_consumer_structures_resolve_without_false_positives() {
+        for fixture_name in ["nx-workspace", "turbo-workspace"] {
+            let root =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(fixture_name);
+            let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+            assert_eq!(analysis.project.modules.len(), 2, "{fixture_name}");
+            assert_eq!(analysis.project.packages.len(), 2, "{fixture_name}");
+            assert_eq!(analysis.project.dependencies.len(), 1, "{fixture_name}");
+            assert!(analysis.diagnostics.is_empty(), "{fixture_name}: {:?}", analysis.diagnostics);
+        }
+    }
+
+    #[test]
+    fn policy_fixture_exercises_every_architecture_and_package_rule_added_after_mvp() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/policies");
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(root)).unwrap();
+        for rule in [
+            "ARCH-006",
+            "ARCH-007",
+            "ARCH-008",
+            "ARCH-009",
+            "ARCH-010",
+            "PACKAGE-001",
+            "PACKAGE-002",
+            "PACKAGE-003",
+            "PACKAGE-004",
+        ] {
+            assert!(
+                analysis.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == rule),
+                "expected {rule}, got {:?}",
+                analysis.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn next_consumer_is_classified_by_a_real_framework_adapter() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/consumer-next");
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(root)).unwrap();
+        let module = |path: &str| {
+            analysis.project.modules.iter().find(|module| module.id.0 == path).unwrap()
+        };
+        assert_eq!(module("src/app/page.tsx").runtime, Runtime::Server);
+        assert_eq!(
+            module("src/app/client-widget.tsx").framework_metadata.attributes["component"],
+            "client"
+        );
+        assert_eq!(module("src/app/client-widget.tsx").runtime, Runtime::Browser);
+        assert_eq!(module("src/app/api/route.ts").runtime, Runtime::Edge);
+        assert_eq!(
+            module("src/app/actions.ts").framework_metadata.attributes["role"],
+            "server-action-module"
+        );
+        assert_eq!(module("src/middleware.ts").runtime, Runtime::Edge);
+        assert_eq!(
+            module("src/pages/api/health.ts").framework_metadata.attributes["role"],
+            "api-route"
+        );
+        assert!(analysis.diagnostics.is_empty(), "{:?}", analysis.diagnostics);
+    }
+
+    #[test]
+    fn runtime_fixture_exercises_transitive_runtime_graph_rules_end_to_end() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/runtime");
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(root)).unwrap();
+        for rule in [
+            "RUNTIME-001",
+            "RUNTIME-002",
+            "RUNTIME-003",
+            "RUNTIME-004",
+            "RUNTIME-005",
+            "RUNTIME-006",
+        ] {
+            let diagnostic = analysis
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.rule_id.0 == rule)
+                .unwrap_or_else(|| panic!("expected {rule}, got {:?}", analysis.diagnostics));
+            assert!(diagnostic.dependency_path.len() >= 2, "{rule} must explain its path");
+            assert!(diagnostic.metadata.contains_key("runtimePath"));
+        }
     }
 
     #[test]
@@ -896,6 +1505,30 @@ mod tests {
     }
 
     #[test]
+    fn clean_fixture_false_positive_budget_is_zero() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut source_modules = 0;
+        for name in
+            ["basic", "aliases", "monorepo-12", "consumer-next", "nx-workspace", "turbo-workspace"]
+        {
+            let analysis =
+                Engine::default().analyze(AnalyzeRequest::new(fixtures.join(name))).unwrap();
+            source_modules += analysis
+                .project
+                .modules
+                .iter()
+                .filter(|module| module.kind == ModuleKind::Source)
+                .count();
+            assert!(
+                analysis.diagnostics.is_empty(),
+                "false positive in {name}: {:?}",
+                analysis.diagnostics
+            );
+        }
+        assert_eq!(source_modules, 30);
+    }
+
+    #[test]
     fn configured_roots_limit_discovery() {
         let root = std::env::temp_dir().join(format!("wae-roots-{}", std::process::id()));
         fs::create_dir_all(root.join("src")).unwrap();
@@ -940,10 +1573,23 @@ mod tests {
             "version: 1\ncache:\n  enabled: true\n  directory: .wae/cache\n",
         )
         .unwrap();
-        Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
-        let cache = root.join(".wae/cache/imports-v1.json");
+        let cold = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(cold.incremental.analyzed_modules, 1);
+        assert_eq!(cold.incremental.restored_modules, 0);
+        assert!(!cold.incremental.rule_snapshot_reused);
+        let warm = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(warm.incremental.analyzed_modules, 0);
+        assert_eq!(warm.incremental.restored_modules, 1);
+        assert!(warm.incremental.rule_snapshot_reused);
+        assert_eq!(warm.diagnostics, cold.diagnostics);
+        let cache = root.join(".wae/cache/analysis-v2.json");
         assert!(cache.is_file());
-        let lock = root.join(".wae/cache/imports-v1.lock");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+        assert_eq!(snapshot["schema_version"], 2);
+        assert!(snapshot["files"]["src/a.ts"]["resolved_dependencies"].is_array());
+        assert!(snapshot["rules"]["diagnostics"].is_array());
+        let lock = root.join(".wae/cache/analysis-v2.lock");
         assert!(lock.is_file());
         fs::write(&lock, "stale lock file content from a killed process").unwrap();
         let mut stale: serde_json::Value =
@@ -955,6 +1601,68 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
         assert_eq!(refreshed["parser_version"], PARSER_CACHE_VERSION);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_resolution_invalidates_deleted_and_newly_resolvable_targets() {
+        let root = std::env::temp_dir()
+            .join(format!("wae-cache-resolution-invalidation-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.ts"), "import { value } from './b'; export { value };").unwrap();
+        fs::write(root.join("src/b.ts"), "export const value = 1;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nresolution:\n  mode: bundler\ncache:\n  enabled: true\n  directory: .wae/cache\n",
+        )
+        .unwrap();
+
+        let cold = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(cold.incremental.analyzed_modules, 2);
+        let warm = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(warm.incremental.restored_modules, 2);
+        assert!(warm.incremental.rule_snapshot_reused);
+
+        fs::remove_file(root.join("src/b.ts")).unwrap();
+        let deleted = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(deleted.incremental.analyzed_modules, 1);
+        assert!(deleted.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001"));
+
+        fs::write(root.join("src/b.ts"), "export const value = 2;").unwrap();
+        let restored = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(restored.incremental.analyzed_modules, 2);
+        assert!(
+            !restored.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn in_memory_overlay_supports_live_editor_analysis_without_writing_source() {
+        let root = std::env::temp_dir().join(format!("wae-editor-overlay-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.ts"), "import './missing';").unwrap();
+        fs::write(root.join("wae.yaml"), "version: 1\nresolution:\n  mode: bundler\n").unwrap();
+        let disk = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert!(disk.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001"));
+        let live = Engine::default()
+            .analyze(
+                AnalyzeRequest::new(&root).with_overlay("src/a.ts", "export const fixed = true;"),
+            )
+            .unwrap();
+        assert!(!live.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001"));
+        assert!(!live.incremental.cache_enabled);
+        assert_eq!(fs::read_to_string(root.join("src/a.ts")).unwrap(), "import './missing';");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_cancelled_analysis_stops_before_project_work() {
+        let token = CancellationToken::default();
+        token.cancel();
+        let error = Engine::default()
+            .analyze(AnalyzeRequest::new("path-that-must-not-be-opened").with_cancellation(token))
+            .unwrap_err();
+        assert!(matches!(error, AnalysisError::Cancelled));
     }
 
     #[test]
@@ -971,7 +1679,7 @@ mod tests {
         fs::rename(root.join("src/old.ts"), root.join("src/new.ts")).unwrap();
         Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
         let cache: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join(".wae/cache/imports-v1.json")).unwrap(),
+            &fs::read_to_string(root.join(".wae/cache/analysis-v2.json")).unwrap(),
         )
         .unwrap();
         assert!(cache["files"]["src/old.ts"].is_null());
@@ -998,7 +1706,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
-        let cache = fs::read_to_string(root.join(".wae/cache/imports-v1.json")).unwrap();
+        let cache = fs::read_to_string(root.join(".wae/cache/analysis-v2.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&cache).unwrap();
         assert_eq!(parsed["parser_version"], PARSER_CACHE_VERSION);
         fs::remove_dir_all(root).unwrap();

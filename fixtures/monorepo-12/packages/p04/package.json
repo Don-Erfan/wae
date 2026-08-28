@@ -1,1 +1,1 @@
-{"name":"@fixture/p04","type":"module","exports":"./src/index.ts"}
+{"name":"@fixture/p04","type":"module","exports":"./src/index.ts","dependencies":{"@fixture/p03":"workspace:*"}}

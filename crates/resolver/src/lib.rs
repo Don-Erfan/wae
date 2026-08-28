@@ -35,6 +35,13 @@ pub struct ResolverPipeline {
     handlers: Vec<Box<dyn ResolutionHandler>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolutionAttempt {
+    pub specifier: String,
+    pub handler: &'static str,
+    pub outcome: Option<Resolution>,
+}
+
 impl ResolverPipeline {
     pub fn new() -> Self {
         Self::default()
@@ -53,6 +60,51 @@ impl ResolverPipeline {
         candidates.sort_by(|left, right| left.0.cmp(&right.0));
         candidates.dedup();
         candidates
+    }
+
+    pub fn resolve_with_trace(
+        &self,
+        request: &ResolutionRequest<'_>,
+    ) -> (Resolution, Vec<ResolutionAttempt>) {
+        let mut specifier = request.specifier.to_string();
+        let mut visited = BTreeSet::new();
+        let mut attempts = Vec::new();
+        loop {
+            if !visited.insert(specifier.clone()) {
+                return (
+                    Resolution::Invalid(format!(
+                        "package resolution redirect loop at `{specifier}`"
+                    )),
+                    attempts,
+                );
+            }
+            let redirected = ResolutionRequest {
+                importer: request.importer,
+                specifier: &specifier,
+                dependency_kind: request.dependency_kind.clone(),
+                resolution_kind: request.resolution_kind,
+                importer_format: request.importer_format,
+                mode: request.mode,
+                custom_conditions: request.custom_conditions,
+            };
+            let mut result = Resolution::Unresolved;
+            for handler in &self.handlers {
+                let outcome = handler.try_resolve(&redirected);
+                attempts.push(ResolutionAttempt {
+                    specifier: specifier.clone(),
+                    handler: handler.name(),
+                    outcome: outcome.clone(),
+                });
+                if let Some(outcome) = outcome {
+                    result = outcome;
+                    break;
+                }
+            }
+            match result {
+                Resolution::Redirect(target) => specifier = target,
+                result => return (result, attempts),
+            }
+        }
     }
     pub fn node_defaults(root: impl Into<PathBuf>, aliases: Vec<PathAlias>) -> Self {
         Self::node_defaults_with_mode(root, aliases, ResolutionMode::NodeNext)
@@ -97,33 +149,7 @@ impl ResolverPipeline {
 
 impl ModuleResolver for ResolverPipeline {
     fn resolve(&self, request: &ResolutionRequest<'_>) -> Resolution {
-        let mut specifier = request.specifier.to_string();
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert(specifier.clone()) {
-                return Resolution::Invalid(format!(
-                    "package resolution redirect loop at `{specifier}`"
-                ));
-            }
-            let redirected = ResolutionRequest {
-                importer: request.importer,
-                specifier: &specifier,
-                dependency_kind: request.dependency_kind.clone(),
-                resolution_kind: request.resolution_kind,
-                importer_format: request.importer_format,
-                mode: request.mode,
-                custom_conditions: request.custom_conditions,
-            };
-            let result = self
-                .handlers
-                .iter()
-                .find_map(|handler| handler.try_resolve(&redirected))
-                .unwrap_or(Resolution::Unresolved);
-            match result {
-                Resolution::Redirect(target) => specifier = target,
-                result => return result,
-            }
-        }
+        self.resolve_with_trace(request).0
     }
 }
 
@@ -138,6 +164,9 @@ pub struct RelativeResolver {
     pub mode: ResolutionMode,
 }
 impl ResolutionHandler for RelativeResolver {
+    fn name(&self) -> &'static str {
+        "relative"
+    }
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
         let importer = Path::new(&request.importer.0);
         let specifier = request.specifier;
@@ -171,6 +200,9 @@ pub struct AliasResolver {
     pub mode: ResolutionMode,
 }
 impl ResolutionHandler for AliasResolver {
+    fn name(&self) -> &'static str {
+        "alias"
+    }
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
         let specifier = request.specifier;
         let mut matched = false;
@@ -232,10 +264,13 @@ pub struct TsConfigLoader;
 
 impl TsConfigLoader {
     pub fn load(project_root: &Path) -> Result<TsConfigPaths, String> {
-        let path = project_root.join("tsconfig.json");
-        if !path.exists() {
+        let path = ["tsconfig.json", "jsconfig.json"]
+            .into_iter()
+            .map(|name| project_root.join(name))
+            .find(|path| path.is_file());
+        let Some(path) = path else {
             return Ok(TsConfigPaths { base_url: project_root.to_path_buf(), aliases: Vec::new() });
-        }
+        };
         let mut visited = BTreeSet::new();
         let resolved = load_tsconfig(&path, &mut visited)?;
         let mut aliases = resolved
@@ -266,18 +301,21 @@ struct ScopedTsConfig {
 impl TsConfigIndex {
     pub fn discover(project_root: &Path) -> Result<Self, String> {
         let mut configs = Vec::new();
+        let mut directories = BTreeSet::new();
         let mut builder = ignore::WalkBuilder::new(project_root);
         builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true);
         builder.filter_entry(|entry| entry.file_name() != "node_modules");
         for entry in builder.build() {
             let entry = entry.map_err(|error| error.to_string())?;
             if entry.file_type().is_some_and(|kind| kind.is_file())
-                && entry.file_name() == "tsconfig.json"
+                && matches!(entry.file_name().to_str(), Some("tsconfig.json" | "jsconfig.json"))
             {
                 let directory = entry.path().parent().unwrap_or(project_root).to_path_buf();
-                configs
-                    .push(ScopedTsConfig { paths: TsConfigLoader::load(&directory)?, directory });
+                directories.insert(directory);
             }
+        }
+        for directory in directories {
+            configs.push(ScopedTsConfig { paths: TsConfigLoader::load(&directory)?, directory });
         }
         if configs.is_empty() {
             configs.push(ScopedTsConfig {
@@ -320,6 +358,9 @@ impl IndexedAliasResolver {
 }
 
 impl ResolutionHandler for IndexedAliasResolver {
+    fn name(&self) -> &'static str {
+        "tsconfig-alias"
+    }
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
         let importer = Path::new(&request.importer.0);
         let paths = self.index.paths_for(importer)?;
@@ -519,6 +560,9 @@ fn remove_trailing_commas(source: String) -> String {
 #[derive(Clone, Copy, Debug)]
 pub struct PackageResolver;
 impl ResolutionHandler for PackageResolver {
+    fn name(&self) -> &'static str {
+        "external-package"
+    }
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
         let specifier = request.specifier;
         (!specifier.starts_with('.') && !specifier.starts_with('/'))
@@ -696,6 +740,36 @@ mod tests {
         fs::write(root.join("tsconfig.json"), "{ invalid }").unwrap();
         let error = TsConfigLoader::load(&root).unwrap_err();
         assert!(error.contains("invalid JSONC"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jsconfig_aliases_are_discovered_and_tsconfig_wins_in_the_same_directory() {
+        let root = std::env::temp_dir().join(format!("wae-jsconfig-{}", std::process::id()));
+        fs::create_dir_all(root.join("web")).unwrap();
+        fs::create_dir_all(root.join("src/js")).unwrap();
+        fs::create_dir_all(root.join("src/ts")).unwrap();
+        fs::write(root.join("src/js/value.js"), "").unwrap();
+        fs::write(root.join("src/ts/value.ts"), "").unwrap();
+        fs::write(
+            root.join("jsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/js/*"]}}}"#,
+        )
+        .unwrap();
+        let loaded = TsConfigLoader::load(&root).unwrap();
+        assert_eq!(loaded.aliases[0].targets[0], normalize(&root.join("src/js/*")));
+
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/ts/*"]}}}"#,
+        )
+        .unwrap();
+        let index = TsConfigIndex::discover(&root).unwrap();
+        let resolver = IndexedAliasResolver::new(index);
+        assert!(matches!(
+            resolve_with(&resolver, &root.join("web/app.ts"), "@/value"),
+            Some(Resolution::Module(path)) if path.0.ends_with("src/ts/value.ts")
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 

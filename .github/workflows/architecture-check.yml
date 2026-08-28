@@ -38,7 +38,7 @@ jobs:
 
           result = json.loads(Path("wae-consumer-result.json").read_text())
           assert result["failureCount"] == 0, result
-          assert result["sourceModules"] == 5, result
+          assert result["sourceModules"] == 11, result
           assert result["dependencies"] == 5, result
           PY
           rm wae-consumer-result.json
@@ -68,12 +68,15 @@ jobs:
           baseline = json.loads(Path(".wae/baseline.json").read_text())
           diagnostics = result.get("diagnostics", [])
           failure_count = result.get("failureCount", 0)
+          regression = result.get("regression", {})
           lines = [
               "### WAE Architecture Check", "",
               f"Modules analyzed: {result.get('modules', 0)}",
               f"Baseline violations: {len(baseline.get('entries', baseline.get('fingerprints', [])))}",
               f"Diagnostics reported: {len(diagnostics)}",
               f"New affected fail-level violations: {failure_count}", "",
+              f"Existing affected: {regression.get('existing', 0)}",
+              f"Fixed baseline violations: {regression.get('fixed', 0)}", "",
               "✅ No architecture regression." if failure_count == 0 else "❌ Architecture regression detected.",
           ]
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:

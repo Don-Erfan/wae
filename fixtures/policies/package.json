@@ -1,0 +1,1 @@
+{"name":"policy-fixture","private":true,"workspaces":["apps/*","packages/*"]}

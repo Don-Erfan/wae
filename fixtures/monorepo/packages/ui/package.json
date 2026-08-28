@@ -1,4 +1,5 @@
 {
   "name": "@fixture/ui",
-  "exports": "./src/button.ts"
+  "exports": "./src/button.ts",
+  "dependencies": {"@fixture/web": "workspace:*"}
 }

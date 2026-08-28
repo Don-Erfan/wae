@@ -9,7 +9,7 @@ JS/TS source
   ↓
 Dependency-oriented parser adapter → normalized IR
   ↓
-Resolver chain → module/package graphs
+Resolver chain → module/package/runtime graphs
   ↓
 Rule Engine
   ↓
@@ -34,9 +34,12 @@ Diagnostics / Reporters / Integrations
 - `graph`: module/package/runtime graph engine
 - `rules`: rule interfaces + rule implementations
 - `config`: schema + validation + model building
+- `framework`: framework adapter port, registry lifecycle and framework-specific classification strategies
+- `discovery`: evidence-based project/architecture inference and safe configuration proposals
 - `engine`: public Facade and pipeline orchestration
 - `reporters`: human/JSON/JSONL/SARIF presentation strategies
 - `lsp`: thin adapter روی core services
+- `mcp`: thin stdio JSON-RPC/MCP adapter روی engine
 - `cli`: command parsing and thin delivery adapter
 
 ## 4) Design Pattern Map (Refactoring.Guru-aligned)
@@ -45,6 +48,7 @@ Diagnostics / Reporters / Integrations
 
 - `Facade`: `wae-engine::Engine` تنها API سطح‌بالای pipeline برای CLI و integrationهای آینده است.
 - `Strategy / Adapter`: قرارداد `ParserAdapter` جزئیات parser را از IR و engine جدا می‌کند.
+- `Strategy / Adapter`: قرارداد `FrameworkAdapter` تشخیص project و classification ماژول را از engine/core جدا نگه می‌دارد؛ `NextJsAdapter` اولین strategy اجرایی است.
 - `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias، workspace و external package را به‌ترتیب اجرا می‌کند.
 - `Strategy`: `ResolutionKindProvider` نوع `import`/`require` را از syntax و mode تعیین می‌کند و `ConditionSetProvider` conditionهای Node10، Node16، NodeNext و Bundler را مستقل و قابل‌آزمون نگه می‌دارد.
 - `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.
@@ -58,7 +62,7 @@ Diagnostics / Reporters / Integrations
 
 ### 4.2 الگوهای تعمداً به‌تعویق‌افتاده
 
-`Abstract Factory` تا زمانی که provider/framework دوم وجود ندارد اضافه نمی‌شود. `Template Method` و hierarchy برای commandها نیز تا وقتی variation واقعی نداشته باشند ارزش کافی ندارند. Specification برای policyهای پیچیده‌تر و framework adapter برای Next.js در milestone مربوطه اضافه می‌شوند.
+`Abstract Factory` تا زمانی که provider/framework دوم وجود ندارد اضافه نمی‌شود. `Template Method` و hierarchy برای commandها نیز تا وقتی variation واقعی نداشته باشند ارزش کافی ندارند. Policyهای پیچیده با matcherهای compile‌شده و ruleهای مستقل مدل می‌شوند؛ اضافه‌کردن hierarchy عمومی بدون variation واقعی تعمداً انجام نمی‌شود.
 
 ## 5) Anti-patternهای ممنوع در V1
 
@@ -70,9 +74,10 @@ Diagnostics / Reporters / Integrations
 ## 6) تصمیم‌های کارایی
 
 - `adjacency list` برای graph traversal
-- cache key مبتنی بر hash پایدار محتوای فایل؛ cache به‌صورت opt-in و atomic ذخیره می‌شود
+- cache ماژول‌محور مبتنی بر hash محتوا و fingerprint محیط resolution؛ parse، resolution، edge و diagnostic snapshot به‌صورت opt-in و atomic ذخیره می‌شوند
 - deterministic sorting برای diagnostics
-- اجرای ruleها روی snapshot مشترک graph (بدون parse مجدد)
+- اجرای parallel ruleها روی snapshot مشترک graph برای پروژه‌های بزرگ، با merge به ترتیب registry و خروجی deterministic (بدون parse مجدد)
+- propagation قابلیت‌های runtime با shortest-path evidence و RPC boundaryهای framework
 - incremental invalidation بر اساس dependency impact
 - `ProjectIndex` مبتنی بر hash set برای lookupهای O(1) هنگام ساخت graph
 - `TsConfigIndex` با انتخاب نزدیک‌ترین config والد برای monorepoها

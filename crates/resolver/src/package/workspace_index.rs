@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,7 @@ pub struct WorkspacePackage {
     entrypoints: BTreeMap<String, serde_json::Value>,
     imports: BTreeMap<String, serde_json::Value>,
     legacy_entrypoints: LegacyEntrypoints,
+    pub declared_dependencies: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,6 +81,7 @@ impl WorkspacePackageIndex {
                 entrypoints: manifest_entrypoints(&manifest),
                 imports: manifest_imports(&manifest),
                 legacy_entrypoints: LegacyEntrypoints::from_manifest(&manifest),
+                declared_dependencies: declared_dependencies(&manifest),
             });
         }
         packages.sort_by(|left, right| left.name.cmp(&right.name));
@@ -101,7 +103,18 @@ impl WorkspacePackageIndex {
     }
 }
 
+fn declared_dependencies(manifest: &serde_json::Value) -> BTreeSet<String> {
+    ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]
+        .into_iter()
+        .filter_map(|field| manifest.get(field).and_then(serde_json::Value::as_object))
+        .flat_map(|dependencies| dependencies.keys().cloned())
+        .collect()
+}
+
 impl ResolutionHandler for WorkspacePackageIndex {
+    fn name(&self) -> &'static str {
+        "workspace-package"
+    }
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
         let importer = Path::new(&request.importer.0);
         let specifier = request.specifier;

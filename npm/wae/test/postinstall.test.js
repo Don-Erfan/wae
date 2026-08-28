@@ -9,6 +9,7 @@ const test = require("node:test");
 const {
   downloadFile,
   installVerifiedBinary,
+  installVerifiedBinaries,
   validateDownloadUrl,
 } = require("../scripts/postinstall.js");
 
@@ -113,5 +114,36 @@ test("checksum failure preserves the installed binary and removes temporary file
   );
   assert.equal(fs.readFileSync(path.join(binDir, "wae"), "utf8"), "known-good");
   assert.deepEqual(fs.readdirSync(binDir), ["wae"]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("installs CLI, language server and MCP server from version-matched assets", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wae-components-"));
+  const binDir = path.join(root, "bin");
+  const packageJsonPath = path.join(root, "package.json");
+  fs.writeFileSync(packageJsonPath, JSON.stringify({ version: "1.2.3" }));
+  const crypto = require("node:crypto");
+  const requested = [];
+  const download = async (url, destination) => {
+    requested.push(url);
+    const assetUrl = url.endsWith(".sha256") ? url.slice(0, -7) : url;
+    const payload = `binary:${path.basename(assetUrl)}`;
+    const content = url.endsWith(".sha256")
+      ? crypto.createHash("sha256").update(payload).digest("hex")
+      : payload;
+    fs.writeFileSync(destination, content);
+  };
+  await installVerifiedBinaries({
+    packageJsonPath,
+    binDir,
+    repository: "owner/repo",
+    platform: "linux",
+    arch: "x64",
+    download,
+  });
+  assert.deepEqual(fs.readdirSync(binDir).sort(), ["wae", "wae-lsp", "wae-mcp"]);
+  for (const component of ["wae", "wae-lsp", "wae-mcp"]) {
+    assert(requested.some((url) => url.endsWith(`${component}-x86_64-unknown-linux-gnu`)));
+  }
   fs.rmSync(root, { recursive: true, force: true });
 });

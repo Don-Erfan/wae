@@ -1,0 +1,11 @@
+<idea-plugin>
+  <id>com.donerfan.wae</id>
+  <name>Web Architecture Engine</name>
+  <vendor>Don Erfan</vendor>
+  <description>Live WAE architecture diagnostics, hover information and quick fixes.</description>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.lsp</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <platform.lsp.serverSupportProvider implementation="com.donerfan.wae.WaeLspServerSupportProvider"/>
+  </extensions>
+</idea-plugin>

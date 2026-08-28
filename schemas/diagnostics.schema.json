@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Don-Erfan/wae/master/schemas/diagnostics.schema.json",
+  "title": "WAE JSON diagnostic report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "modules", "sourceModules", "excludedModules", "externalPackages", "dependencies", "failureCount", "diagnostics"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "modules": { "type": "integer", "minimum": 0 },
+    "sourceModules": { "type": "integer", "minimum": 0 },
+    "excludedModules": { "type": "integer", "minimum": 0 },
+    "externalPackages": { "type": "integer", "minimum": 0 },
+    "dependencies": { "type": "integer", "minimum": 0 },
+    "failureCount": { "type": "integer", "minimum": 0 },
+    "regression": { "$ref": "#/$defs/regression" },
+    "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
+  },
+  "$defs": {
+    "location": {
+      "type": "object", "additionalProperties": false,
+      "required": ["file", "line", "column"],
+      "properties": {
+        "file": { "type": "string" }, "line": { "type": "integer", "minimum": 1 },
+        "column": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "diagnostic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fingerprint", "rule_id", "severity", "message", "secondary_locations", "dependency_path", "metadata", "suppressed"],
+      "properties": {
+        "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "rule_id": { "type": "string" }, "severity": { "enum": ["error", "warning", "info"] },
+        "message": { "type": "string" },
+        "primary_location": { "anyOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] },
+        "secondary_locations": { "type": "array", "items": { "$ref": "#/$defs/location" } },
+        "dependency_path": { "type": "array", "items": { "type": "string" } },
+        "suggestion": { "type": ["string", "null"] },
+        "metadata": { "type": "object", "additionalProperties": { "type": "string" } },
+        "suppressed": { "type": "boolean" }, "suppression_reason": { "type": "string" }
+      }
+    },
+    "regression": {
+      "type": "object", "additionalProperties": false,
+      "required": ["affectedModules", "existing", "introduced", "fixed"],
+      "properties": {
+        "affectedModules": { "type": "integer", "minimum": 0 },
+        "existing": { "type": "integer", "minimum": 0 },
+        "introduced": { "type": "integer", "minimum": 0 },
+        "fixed": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

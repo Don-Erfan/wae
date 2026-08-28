@@ -169,12 +169,13 @@ async function installVerifiedBinary(options = {}) {
   const target = resolveTarget(platform, arch);
   const version = packageJson.version;
   const extension = platform === "win32" ? ".exe" : "";
-  const assetName = `wae-${target}${extension}`;
+  const component = options.component || "wae";
+  const assetName = `${component}-${target}${extension}`;
   const releaseTag = `v${version}`;
 
   const downloadUrl = `https://github.com/${repository}/releases/download/${releaseTag}/${assetName}`;
   const binDir = options.binDir || path.join(__dirname, "..", "bin");
-  const binaryPath = path.join(binDir, `wae${extension}`);
+  const binaryPath = path.join(binDir, `${component}${extension}`);
   const nonce = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const temporaryBinaryPath = path.join(binDir, `.wae-${nonce}.tmp`);
   const temporaryChecksumPath = path.join(binDir, `.wae-${nonce}.sha256.tmp`);
@@ -211,8 +212,14 @@ async function installVerifiedBinary(options = {}) {
   }
 }
 
+async function installVerifiedBinaries(options = {}) {
+  for (const component of ["wae", "wae-lsp", "wae-mcp"]) {
+    await installVerifiedBinary({ ...options, component });
+  }
+}
+
 async function main() {
-  await installVerifiedBinary();
+  await installVerifiedBinaries();
 }
 
 if (require.main === module) {
@@ -225,6 +232,7 @@ if (require.main === module) {
 module.exports = {
   downloadFile,
   installVerifiedBinary,
+  installVerifiedBinaries,
   resolveTarget,
   sha256,
   validateDownloadUrl,

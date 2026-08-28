@@ -8,6 +8,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.13] - 2026-08-29
+
+### Added
+
+- `ARCH-006` through `ARCH-010`, `PACKAGE-001` through `PACKAGE-004`, and `RUNTIME-001`
+  through `RUNTIME-006` over shared module/package/runtime graphs.
+- A semantic Next.js adapter, module-level incremental cache, resolver traces, Criterion suites,
+  100k-node performance gates, and a 500-module fault-injection acceptance scenario.
+- `wae-lsp`, VS Code and JetBrains clients; `wae-mcp` with four architecture tools; and a
+  self-contained `wae explore` report.
+- Evidence-based `wae discover` proposals for Next.js, FSD, Nx and Turborepo layouts, including
+  feature clusters and explicit approve/overwrite behavior.
+- A synchronized JSON Schema, reusable composite GitHub Action, fuzz/property tests, Ctrl+C
+  cancellation and an aggregate `v1 readiness` CI gate.
+
+### Changed
+
+- The npm installer now downloads and checksum-verifies the CLI, LSP and MCP binaries for every
+  supported platform.
+- Large configured projects evaluate independent rules concurrently and merge results in stable
+  registry order.
+- Alias resolution accepts nearest `jsconfig.json` projects while preferring `tsconfig.json` in
+  the same directory, and the parser recognizes literal `require.resolve()` dependencies.
+
 ## [0.0.12] - 2026-08-25
 
 ### Fixed
@@ -80,7 +104,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.12...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.13...HEAD
+[0.0.13]: https://github.com/Don-Erfan/wae/compare/v0.0.12...v0.0.13
 [0.0.12]: https://github.com/Don-Erfan/wae/compare/v0.0.11...v0.0.12
 [0.0.11]: https://github.com/Don-Erfan/wae/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/Don-Erfan/wae/compare/v0.0.9...v0.0.10

@@ -1,0 +1,9 @@
+{
+  "name": "wae-runtime-fixture",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "next": "15.2.6",
+    "node-only-kit": "1.0.0"
+  }
+}

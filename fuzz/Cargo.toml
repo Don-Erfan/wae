@@ -1,0 +1,28 @@
+[package]
+name = "wae-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wae-config = { path = "../crates/config" }
+wae-core = { path = "../crates/core" }
+wae-parser = { path = "../crates/parser" }
+
+[[bin]]
+name = "parser_imports"
+path = "fuzz_targets/parser_imports.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_yaml"
+path = "fuzz_targets/config_yaml.rs"
+test = false
+doc = false
+bench = false

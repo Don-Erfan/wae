@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["fuzz"]
 members = [
     "crates/core",
     "crates/parser",
@@ -7,6 +8,10 @@ members = [
     "crates/graph",
     "crates/rules",
     "crates/config",
+    "crates/framework",
+    "crates/discovery",
+    "crates/lsp",
+    "crates/mcp",
     "crates/engine",
     "crates/reporters",
     "crates/cli",
@@ -14,7 +19,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.0.12"
+version = "0.0.13"
 license = "MIT"
 
 [workspace.dependencies]
@@ -27,3 +32,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 yaml_serde = "=0.10.7"
 tree-sitter = "=0.24.7"
 tree-sitter-typescript = "=0.23.2"
+criterion = { version = "=0.5.1", default-features = false, features = ["cargo_bench_support"] }
+lsp-server = "=0.7.9"
+url = "=2.5.4"
+ctrlc = "=3.4.7"

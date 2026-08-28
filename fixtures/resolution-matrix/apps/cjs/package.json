@@ -1,1 +1,1 @@
-{"name":"@fixture/cjs-app","type":"commonjs"}
+{"name":"@fixture/cjs-app","type":"commonjs","dependencies":{"@fixture/domain":"workspace:*"}}

@@ -13,6 +13,9 @@ architecture:
     app:
       patterns: ["src/app/**"]
       canImport: ["features", "entities", "shared"]
+    delivery:
+      patterns: ["src/pages/**", "src/middleware.ts"]
+      canImport: ["features", "entities", "shared"]
     features:
       patterns: ["src/features/**"]
       canImport: ["entities", "shared"]

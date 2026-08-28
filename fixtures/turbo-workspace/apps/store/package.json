@@ -1,0 +1,1 @@
+{"name":"@fixture/store","private":true,"dependencies":{"@fixture/shared":"workspace:*"}}

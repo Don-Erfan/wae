@@ -1,0 +1,17 @@
+version: 1
+project:
+  include: ["src/**/*.ts", "src/**/*.tsx"]
+  exclude: ["**/node_modules/**"]
+  roots: ["."]
+resolution:
+  mode: bundler
+runtime:
+  browser_incompatible_packages: ["node-only-*"]
+  edge_incompatible_packages: ["node-only-*"]
+rules:
+  RUNTIME-001: error
+  RUNTIME-002: error
+  RUNTIME-003: error
+  RUNTIME-004: error
+  RUNTIME-005: error
+  RUNTIME-006: error

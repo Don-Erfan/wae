@@ -13,6 +13,14 @@ serde_json.workspace = true
 wae-config = { path = "../config" }
 wae-core = { path = "../core" }
 wae-graph = { path = "../graph" }
+wae-framework = { path = "../framework" }
 wae-parser = { path = "../parser" }
 wae-resolver = { path = "../resolver" }
 wae-rules = { path = "../rules" }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "incremental"
+harness = false

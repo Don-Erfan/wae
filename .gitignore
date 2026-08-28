@@ -1,4 +1,6 @@
 /target
+**/node_modules/
+**/out/
 .idea/
 .wae/cache/
 npm/wae/bin/wae

@@ -1,15 +1,18 @@
 mod baseline;
+mod discover;
+mod explorer;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use serde::Serialize;
 use serde_json::json;
 use wae_config::{CONFIG_FILE, Config, ConfigPreset};
-use wae_core::domain::{Diagnostic, ModuleKind};
+use wae_core::domain::{DependencyKind, Diagnostic, ModuleKind};
 use wae_engine::{
-    Analysis, AnalysisError, AnalyzeRequest, ChangeSet, Engine, FailurePolicy, ImpactAnalyzer,
-    VcsPort, validate_project_config,
+    Analysis, AnalysisError, AnalyzeRequest, CancellationToken, ChangeSet, Engine, FailurePolicy,
+    ImpactAnalyzer, TraceResolutionRequest, VcsPort, trace_resolution, validate_project_config,
 };
 use wae_reporters::{Format, render};
 
@@ -33,8 +36,8 @@ pub fn init(root: &Path, preset: ConfigPreset) -> CliOutput {
     }
 }
 
-pub fn scan(root: &Path) -> CliOutput {
-    match analyze(root) {
+pub fn scan(root: &Path, cancellation: &CancellationToken) -> CliOutput {
+    match analyze(root, cancellation) {
         Ok(result) => {
             let source = result
                 .project
@@ -63,16 +66,44 @@ pub fn scan(root: &Path) -> CliOutput {
     }
 }
 
-pub fn check(
-    root: &Path,
-    changed: bool,
-    format: Option<Format>,
-    base: Option<String>,
-) -> CliOutput {
-    let mut analysis = match analyze(root) {
+pub fn discover(root: &Path, json: bool, write: bool, force: bool) -> CliOutput {
+    discover::run(root, json, write, force)
+}
+
+pub struct CheckOptions {
+    pub changed: bool,
+    pub format: Option<Format>,
+    pub base: Option<String>,
+    pub config_path: Option<PathBuf>,
+    pub no_cache: bool,
+    pub verbose: bool,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegressionSummary {
+    affected_modules: usize,
+    existing: usize,
+    introduced: usize,
+    fixed: usize,
+}
+
+pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
+    let CheckOptions { changed, format, base, config_path, no_cache, verbose, cancellation } =
+        options;
+    let mut request = AnalyzeRequest::new(root).with_cancellation(cancellation);
+    if let Some(path) = &config_path {
+        request = request.with_config(path);
+    }
+    if no_cache {
+        request = request.without_cache();
+    }
+    let mut analysis = match Engine::default().analyze(request).map_err(map_analysis_error) {
         Ok(result) => result,
         Err(output) => return output,
     };
+    let mut regression = None;
     if changed {
         let signatures = match baseline::load(root) {
             Ok(value) => value,
@@ -82,13 +113,39 @@ pub fn check(
             Ok(value) => value,
             Err(error) => return CliOutput::project_error(error),
         };
+        let current_failures = analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| FailurePolicy::is_failure(diagnostic))
+            .cloned()
+            .collect::<Vec<_>>();
+        let existing = current_failures
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic_affects(diagnostic, &affected) && signatures.matches(diagnostic)
+            })
+            .count();
         analysis.diagnostics.retain(|diagnostic| {
             diagnostic_affects(diagnostic, &affected) && !signatures.matches(diagnostic)
+        });
+        regression = Some(RegressionSummary {
+            affected_modules: affected.len(),
+            existing,
+            introduced: FailurePolicy::count(&analysis.diagnostics),
+            fixed: signatures.len().saturating_sub(signatures.matched_count(&current_failures)),
         });
     }
     let format = match format {
         Some(format) => format,
-        None => match Config::load(root)
+        None => match config_path
+            .as_ref()
+            .map_or_else(
+                || Config::load(root),
+                |path| {
+                    let path = if path.is_absolute() { path.clone() } else { root.join(path) };
+                    Config::load_file(&path)
+                },
+            )
             .map_err(|error| error.message)
             .map(|config| config.output.format)
         {
@@ -97,15 +154,70 @@ pub fn check(
         },
     };
     let has_failures = FailurePolicy::count(&analysis.diagnostics) > 0;
-    match render(&analysis, format) {
+    let verbose_report = verbose.then(|| verbose_analysis(&analysis));
+    let mut output = match render(&analysis, format)
+        .and_then(|output| attach_regression_summary(output, format, regression.as_ref()))
+    {
         Ok(output) if has_failures => CliOutput::violations(output),
         Ok(output) => CliOutput::success(output),
         Err(error) => CliOutput::internal_error(error.to_string()),
+    };
+    if let Some(report) = verbose_report {
+        output.stderr = report;
+    }
+    output
+}
+
+fn attach_regression_summary(
+    output: String,
+    format: Format,
+    summary: Option<&RegressionSummary>,
+) -> Result<String, serde_json::Error> {
+    let Some(summary) = summary else { return Ok(output) };
+    match format {
+        Format::Human => Ok(format!(
+            "Regression: {} affected, {} existing, {} introduced, {} fixed\n\n{output}",
+            summary.affected_modules, summary.existing, summary.introduced, summary.fixed
+        )),
+        Format::Json => {
+            let mut value: serde_json::Value = serde_json::from_str(&output)?;
+            value["regression"] = serde_json::to_value(summary)?;
+            serde_json::to_string_pretty(&value)
+        }
+        Format::Jsonl => {
+            let mut lines = output.lines();
+            let Some(first) = lines.next() else { return Ok(output) };
+            let mut event: serde_json::Value = serde_json::from_str(first)?;
+            event["regression"] = serde_json::to_value(summary)?;
+            let mut result = vec![serde_json::to_string(&event)?];
+            result.extend(lines.map(str::to_owned));
+            Ok(result.join("\n"))
+        }
+        Format::Sarif => {
+            let mut value: serde_json::Value = serde_json::from_str(&output)?;
+            value["runs"][0]["properties"]["waeRegression"] = serde_json::to_value(summary)?;
+            serde_json::to_string_pretty(&value)
+        }
     }
 }
 
-pub fn baseline_create(root: &Path) -> CliOutput {
-    let analysis = match analyze(root) {
+fn verbose_analysis(analysis: &Analysis) -> String {
+    format!(
+        "WAE timing: discovery={}ms module-analysis={}ms graph={}ms rules={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={}",
+        analysis.timings.discovery_ms,
+        analysis.timings.module_analysis_ms,
+        analysis.timings.graph_ms,
+        analysis.timings.rules_ms,
+        analysis.timings.total_ms,
+        analysis.incremental.cache_enabled,
+        analysis.incremental.restored_modules,
+        analysis.incremental.analyzed_modules,
+        analysis.incremental.rule_snapshot_reused,
+    )
+}
+
+pub fn baseline_create(root: &Path, cancellation: &CancellationToken) -> CliOutput {
+    let analysis = match analyze(root, cancellation) {
         Ok(result) => result,
         Err(output) => return output,
     };
@@ -121,8 +233,8 @@ pub fn baseline_create(root: &Path) -> CliOutput {
     }
 }
 
-pub fn graph(root: &Path) -> CliOutput {
-    let analysis = match analyze(root) {
+pub fn graph(root: &Path, cancellation: &CancellationToken) -> CliOutput {
+    let analysis = match analyze(root, cancellation) {
         Ok(result) => result,
         Err(output) => return output,
     };
@@ -135,7 +247,15 @@ pub fn graph(root: &Path) -> CliOutput {
     }
 }
 
-pub fn doctor(root: &Path) -> CliOutput {
+pub fn explore(root: &Path, output: PathBuf, cancellation: &CancellationToken) -> CliOutput {
+    let analysis = match analyze(root, cancellation) {
+        Ok(result) => result,
+        Err(output) => return output,
+    };
+    explorer::write(root, &output, &analysis)
+}
+
+pub fn doctor(root: &Path, cancellation: &CancellationToken) -> CliOutput {
     let mut ok = true;
     let mut report = Vec::new();
     if root.is_dir() {
@@ -164,7 +284,9 @@ pub fn doctor(root: &Path) -> CliOutput {
         ok = false;
         report.push("✖ git: required for --changed".into());
     }
-    match Engine::default().analyze(AnalyzeRequest::new(root)) {
+    match Engine::default()
+        .analyze(AnalyzeRequest::new(root).with_cancellation(cancellation.clone()))
+    {
         Ok(_) => report.push("✓ analysis: parser → resolver → graph → rules".into()),
         Err(error) => {
             ok = false;
@@ -232,14 +354,41 @@ pub fn explain(rule: &str) -> CliOutput {
     ))
 }
 
-fn analyze(root: &Path) -> Result<Analysis, CliOutput> {
-    Engine::default().analyze(AnalyzeRequest::new(root)).map_err(map_analysis_error)
+pub fn resolve(
+    root: &Path,
+    importer: PathBuf,
+    specifier: String,
+    dependency_kind: DependencyKind,
+    config_path: Option<PathBuf>,
+) -> CliOutput {
+    match trace_resolution(TraceResolutionRequest {
+        root: root.to_path_buf(),
+        importer,
+        specifier,
+        dependency_kind,
+        config_path,
+    })
+    .map_err(map_analysis_error)
+    .and_then(|trace| {
+        serde_json::to_string_pretty(&trace)
+            .map_err(|error| CliOutput::internal_error(error.to_string()))
+    }) {
+        Ok(output) => CliOutput::success(output),
+        Err(output) => output,
+    }
+}
+
+fn analyze(root: &Path, cancellation: &CancellationToken) -> Result<Analysis, CliOutput> {
+    Engine::default()
+        .analyze(AnalyzeRequest::new(root).with_cancellation(cancellation.clone()))
+        .map_err(map_analysis_error)
 }
 fn map_analysis_error(error: AnalysisError) -> CliOutput {
     match error {
         AnalysisError::Config(error) => CliOutput::project_error(config_error(&error)),
         AnalysisError::Project(error) => CliOutput::project_error(error),
         AnalysisError::Internal(error) => CliOutput::internal_error(error),
+        AnalysisError::Cancelled => CliOutput::cancelled(),
     }
 }
 fn config_error(error: &wae_core::domain::ConfigError) -> String {
@@ -255,6 +404,7 @@ fn analysis_error_detail(error: &AnalysisError) -> String {
         AnalysisError::Config(error) => config_error(error),
         AnalysisError::Project(message) => format!("Project error: {message}"),
         AnalysisError::Internal(message) => format!("Internal error: {message}"),
+        AnalysisError::Cancelled => "Analysis cancelled".into(),
     }
 }
 
@@ -429,6 +579,35 @@ mod tests {
     use super::*;
     use wae_core::domain::Project;
 
+    #[test]
+    fn regression_summary_is_machine_readable_in_every_structured_report() {
+        let summary =
+            RegressionSummary { affected_modules: 4, existing: 2, introduced: 1, fixed: 3 };
+        let json = attach_regression_summary("{}".into(), Format::Json, Some(&summary)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["regression"]["fixed"],
+            3
+        );
+        let jsonl = attach_regression_summary(
+            r#"{"schemaVersion":1,"type":"analysis"}"#.into(),
+            Format::Jsonl,
+            Some(&summary),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&jsonl).unwrap()["regression"]["introduced"],
+            1
+        );
+        let sarif =
+            attach_regression_summary(r#"{"runs":[{}]}"#.into(), Format::Sarif, Some(&summary))
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sarif).unwrap()["runs"][0]["properties"]["waeRegression"]
+                ["existing"],
+            2
+        );
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let status = Command::new("git").arg("-C").arg(root).args(args).status().unwrap();
         assert!(status.success(), "git command failed: {args:?}");
@@ -456,6 +635,8 @@ mod tests {
             graph: Default::default(),
             project,
             diagnostics: Vec::new(),
+            incremental: Default::default(),
+            timings: Default::default(),
         };
         let affected = affected_modules(&root, &analysis, Some("HEAD")).unwrap();
         assert!(affected.contains("tracked.ts"));

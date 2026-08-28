@@ -24,16 +24,39 @@ pub struct Config {
     pub cache: CacheConfig,
     pub resolution: ResolutionConfig,
     pub suppressions: SuppressionConfig,
+    pub framework: FrameworkConfig,
+    pub runtime: RuntimeConfig,
     #[serde(skip)]
     pub configured: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let rules = ["ARCH-001", "ARCH-002", "ARCH-003", "ARCH-004", "ARCH-005"]
-            .into_iter()
-            .map(|id| (id.into(), RuleConfig::Severity(Severity::Error)))
-            .collect();
+        let rules = [
+            "ARCH-001",
+            "ARCH-002",
+            "ARCH-003",
+            "ARCH-004",
+            "ARCH-005",
+            "ARCH-006",
+            "ARCH-007",
+            "ARCH-008",
+            "ARCH-009",
+            "ARCH-010",
+            "PACKAGE-001",
+            "PACKAGE-002",
+            "PACKAGE-003",
+            "PACKAGE-004",
+            "RUNTIME-001",
+            "RUNTIME-002",
+            "RUNTIME-003",
+            "RUNTIME-004",
+            "RUNTIME-005",
+            "RUNTIME-006",
+        ]
+        .into_iter()
+        .map(|id| (id.into(), RuleConfig::Severity(Severity::Error)))
+        .collect();
         Self {
             version: CURRENT_CONFIG_VERSION,
             project: ProjectConfig::default(),
@@ -44,6 +67,8 @@ impl Default for Config {
             cache: CacheConfig::default(),
             resolution: ResolutionConfig::default(),
             suppressions: SuppressionConfig::default(),
+            framework: FrameworkConfig::default(),
+            runtime: RuntimeConfig::default(),
             configured: false,
         }
     }
@@ -159,7 +184,17 @@ pub struct ArchitectureConfig {
     pub layers: BTreeMap<String, LayerConfig>,
     pub features: FeatureConfig,
     pub forbidden_dependencies: Vec<ForbiddenDependency>,
+    pub forbidden_package_dependencies: Vec<ForbiddenDependency>,
     pub presets: ArchitecturePresets,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Package-name globs that must never be bundled into a browser dependency closure.
+    pub browser_incompatible_packages: Vec<String>,
+    /// Package-name globs unavailable in an Edge isolate (for example native Node packages).
+    pub edge_incompatible_packages: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +278,19 @@ pub struct SuppressionConfig {
     pub report_unused: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FrameworkConfig {
+    pub auto_detect: bool,
+    pub enabled: Vec<String>,
+}
+
+impl Default for FrameworkConfig {
+    fn default() -> Self {
+        Self { auto_detect: true, enabled: Vec::new() }
+    }
+}
+
 impl Default for SuppressionConfig {
     fn default() -> Self {
         Self { require_reason: true, report_unused: true }
@@ -271,6 +319,13 @@ impl RuleConfig {
             Self::Detailed(_) => None,
         }
     }
+
+    pub fn options(&self) -> Option<&RuleOptions> {
+        match self {
+            Self::Detailed(options) => Some(options),
+            Self::Severity(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,10 +333,25 @@ impl RuleConfig {
 pub struct RuleOptions {
     pub enabled: bool,
     pub severity: Severity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fan_out: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fan_in: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entrypoints: Vec<String>,
 }
 impl Default for RuleOptions {
     fn default() -> Self {
-        Self { enabled: true, severity: Severity::Error }
+        Self {
+            enabled: true,
+            severity: Severity::Error,
+            max_depth: None,
+            max_fan_out: None,
+            max_fan_in: None,
+            entrypoints: Vec::new(),
+        }
     }
 }
 
@@ -354,24 +424,41 @@ impl Default for CacheConfig {
 
 impl Config {
     pub fn load(root: &Path) -> Result<Self, ConfigError> {
-        let path = root.join(CONFIG_FILE);
+        Self::load_path(&root.join(CONFIG_FILE), true)
+    }
+
+    pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_path(path, false)
+    }
+
+    fn load_path(path: &Path, missing_is_default: bool) -> Result<Self, ConfigError> {
         if !path.exists() {
-            return Ok(Self::default());
+            if missing_is_default {
+                return Ok(Self::default());
+            }
+            return Err(config_error(
+                ConfigErrorKind::Io,
+                Some(path.display().to_string()),
+                "configuration file does not exist".into(),
+            ));
         }
-        let source = fs::read_to_string(&path).map_err(|e| {
+        let source = fs::read_to_string(path).map_err(|e| {
             config_error(ConfigErrorKind::Io, Some(path.display().to_string()), e.to_string())
         })?;
-        let mut config: Self = yaml_serde::from_str(&source).map_err(|e| {
-            config_error(
-                ConfigErrorKind::InvalidYaml,
-                Some(path.display().to_string()),
-                e.to_string(),
-            )
+        let mut config = Self::from_yaml(&source).map_err(|mut error| {
+            error.path = Some(path.display().to_string());
+            error
         })?;
+        config.configured = true;
+        Ok(config)
+    }
+
+    pub fn from_yaml(source: &str) -> Result<Self, ConfigError> {
+        let mut config: Self = yaml_serde::from_str(source)
+            .map_err(|e| config_error(ConfigErrorKind::InvalidYaml, None, e.to_string()))?;
         for (id, rule) in Self::default().rules {
             config.rules.entry(id).or_insert(rule);
         }
-        config.configured = true;
         config.validate()?;
         Ok(config)
     }
@@ -432,9 +519,31 @@ impl Config {
                 ));
             }
         }
+        let supported_frameworks = ["nextjs"];
+        if let Some((index, framework)) = self
+            .framework
+            .enabled
+            .iter()
+            .enumerate()
+            .find(|(_, framework)| !supported_frameworks.contains(&framework.as_str()))
+        {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some(format!("framework.enabled.{index}")),
+                format!("unsupported framework adapter `{framework}`"),
+            ));
+        }
         validate_patterns(
             &self.architecture.features.public_entrypoints,
             "architecture.features.public_entrypoints",
+        )?;
+        validate_patterns(
+            &self.runtime.browser_incompatible_packages,
+            "runtime.browser_incompatible_packages",
+        )?;
+        validate_patterns(
+            &self.runtime.edge_incompatible_packages,
+            "runtime.edge_incompatible_packages",
         )?;
         for (index, policy) in self.architecture.forbidden_dependencies.iter().enumerate() {
             validate_patterns(
@@ -445,6 +554,33 @@ impl Config {
                 std::slice::from_ref(&policy.to),
                 &format!("architecture.forbidden_dependencies.{index}.to"),
             )?;
+        }
+        for (index, policy) in self.architecture.forbidden_package_dependencies.iter().enumerate() {
+            validate_patterns(
+                std::slice::from_ref(&policy.from),
+                &format!("architecture.forbidden_package_dependencies.{index}.from"),
+            )?;
+            validate_patterns(
+                std::slice::from_ref(&policy.to),
+                &format!("architecture.forbidden_package_dependencies.{index}.to"),
+            )?;
+        }
+        for (id, rule) in &self.rules {
+            let Some(options) = rule.options() else { continue };
+            for (name, value) in [
+                ("max_depth", options.max_depth),
+                ("max_fan_out", options.max_fan_out),
+                ("max_fan_in", options.max_fan_in),
+            ] {
+                if value == Some(0) {
+                    return Err(config_error(
+                        ConfigErrorKind::ConflictingConfig,
+                        Some(format!("rules.{id}.{name}")),
+                        format!("`{name}` must be greater than zero"),
+                    ));
+                }
+            }
+            validate_patterns(&options.entrypoints, &format!("rules.{id}.entrypoints"))?;
         }
         Ok(())
     }
@@ -505,6 +641,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bundled_json_schema_lists_every_configurable_rule() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/wae.schema.json")).unwrap();
+        let properties = schema["properties"]["rules"]["properties"].as_object().unwrap();
+        let schema_rules = properties.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let registry_rules = rule_registry::configurable_ids().collect::<BTreeSet<_>>();
+        assert_eq!(schema_rules, registry_rules);
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         assert!(
             yaml_serde::from_str::<Config>("version: 1\nunknown: true\n")
@@ -528,7 +674,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(CONFIG_FILE), "version: 1\nrules:\n  ARCH-001: warning\n").unwrap();
         let config = Config::load(&root).unwrap();
-        assert_eq!(config.rules.len(), 5);
+        assert_eq!(config.rules.len(), 20);
         assert_eq!(config.rules["ARCH-001"].severity(), Some(Severity::Warning));
         assert_eq!(config.rules["ARCH-005"].severity(), Some(Severity::Error));
         assert!(config.configured);

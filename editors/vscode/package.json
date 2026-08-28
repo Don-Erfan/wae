@@ -1,0 +1,41 @@
+{
+  "name": "wae-vscode",
+  "displayName": "Web Architecture Engine",
+  "description": "Live WAE architecture diagnostics, hover context and quick fixes.",
+  "version": "0.0.13",
+  "publisher": "don-erfan",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Linters", "Programming Languages"],
+  "activationEvents": ["onLanguage:javascript", "onLanguage:typescript", "onLanguage:javascriptreact", "onLanguage:typescriptreact"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "WAE",
+      "properties": {
+        "wae.server.path": {
+          "type": "string",
+          "default": "wae-lsp",
+          "description": "Path to the wae-lsp executable."
+        }
+      }
+    },
+    "commands": [
+      { "command": "wae.check", "title": "WAE: Check Architecture" },
+      { "command": "wae.graph", "title": "WAE: Show Architecture Graph" },
+      { "command": "wae.reload", "title": "WAE: Reload Language Server" },
+      { "command": "wae.showSuggestion", "title": "WAE: Show Suggested Fix" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.0"
+  }
+}
