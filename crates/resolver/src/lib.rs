@@ -341,7 +341,7 @@ impl TsConfigIndex {
     fn paths_for(&self, importer: &Path) -> Option<&TsConfigPaths> {
         self.configs
             .iter()
-            .find(|config| importer.starts_with(&config.directory))
+            .find(|config| normalized_path_is_within(importer, &config.directory))
             .map(|config| &config.paths)
     }
 }
@@ -589,6 +589,15 @@ fn normalize(path: &Path) -> String {
     normalized.strip_prefix("//?/").unwrap_or(&normalized).to_string()
 }
 
+fn normalized_path_is_within(path: &Path, directory: &Path) -> bool {
+    let path = normalize(path);
+    let directory = normalize(directory);
+    path == directory
+        || path
+            .strip_prefix(directory.trim_end_matches('/'))
+            .is_some_and(|relative| relative.starts_with('/'))
+}
+
 fn package_name(specifier: &str) -> String {
     if specifier.starts_with('@') {
         specifier.split('/').take(2).collect::<Vec<_>>().join("/")
@@ -606,6 +615,16 @@ mod tests {
     #[test]
     fn normalized_paths_strip_windows_verbatim_prefixes() {
         assert_eq!(normalize(Path::new(r"\\?\C:\repo\src\app.ts")), "C:/repo/src/app.ts");
+    }
+
+    #[test]
+    fn tsconfig_scopes_match_equivalent_windows_verbatim_paths() {
+        let index = TsConfigIndex::single(
+            PathBuf::from(r"\\?\C:\repo"),
+            TsConfigPaths { base_url: PathBuf::new(), aliases: Vec::new() },
+        );
+        assert!(index.paths_for(Path::new(r"C:\repo\src\app.ts")).is_some());
+        assert!(index.paths_for(Path::new(r"C:\repository\app.ts")).is_none());
     }
 
     fn resolve_with(

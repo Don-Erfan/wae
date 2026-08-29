@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.16] - 2026-08-29
+
+### Fixed
+
+- Matched TypeScript configuration scopes using normalized path boundaries so
+  canonical Windows directories and normalized importer IDs resolve identically.
+
 ## [0.0.15] - 2026-08-29
 
 ### Fixed
@@ -120,7 +127,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.15...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.16...HEAD
+[0.0.16]: https://github.com/Don-Erfan/wae/compare/v0.0.15...v0.0.16
 [0.0.15]: https://github.com/Don-Erfan/wae/compare/v0.0.14...v0.0.15
 [0.0.14]: https://github.com/Don-Erfan/wae/compare/v0.0.13...v0.0.14
 [0.0.13]: https://github.com/Don-Erfan/wae/compare/v0.0.12...v0.0.13
