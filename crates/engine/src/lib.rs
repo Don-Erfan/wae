@@ -1037,7 +1037,7 @@ fn relative_path(root: &Path, path: &Path) -> String {
 
 fn relative_resolved_path(root: &Path, resolved: &str) -> String {
     let root = normalize(root);
-    let resolved = resolved.replace('\\', "/");
+    let resolved = normalize_text_path(resolved);
     if resolved == root {
         return String::new();
     }
@@ -1062,7 +1062,7 @@ fn resolution_text(root: &Path, resolution: &Resolution) -> String {
 
 fn normalized_path_is_within(resolved: &str, directory: &Path) -> bool {
     let directory = normalize(directory);
-    let resolved = resolved.replace('\\', "/");
+    let resolved = normalize_text_path(resolved);
     resolved == directory
         || resolved
             .strip_prefix(directory.trim_end_matches('/'))
@@ -1070,7 +1070,12 @@ fn normalized_path_is_within(resolved: &str, directory: &Path) -> bool {
 }
 
 fn normalize(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    normalize_text_path(&path.to_string_lossy())
+}
+
+fn normalize_text_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized.strip_prefix("//?/").unwrap_or(&normalized).to_string()
 }
 fn diagnostic_key(diagnostic: &Diagnostic) -> (&str, &str, usize, usize, &str) {
     let location = diagnostic.primary_location.as_ref();

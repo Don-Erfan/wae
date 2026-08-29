@@ -2,7 +2,7 @@
   "name": "wae-vscode",
   "displayName": "Web Architecture Engine",
   "description": "Live WAE architecture diagnostics, hover context and quick fixes.",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "publisher": "don-erfan",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Linters", "Programming Languages"],

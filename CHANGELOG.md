@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.15] - 2026-08-29
+
+### Fixed
+
+- Normalized Windows verbatim canonical paths before resolver matching, keeping
+  TypeScript aliases functional on Windows runners.
+- Compared jsconfig targets against canonical temporary directories so macOS
+  `/var` and `/private/var` aliases are handled consistently.
+
 ## [0.0.14] - 2026-08-29
 
 ### Fixed
@@ -111,7 +120,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.14...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.15...HEAD
+[0.0.15]: https://github.com/Don-Erfan/wae/compare/v0.0.14...v0.0.15
 [0.0.14]: https://github.com/Don-Erfan/wae/compare/v0.0.13...v0.0.14
 [0.0.13]: https://github.com/Don-Erfan/wae/compare/v0.0.12...v0.0.13
 [0.0.12]: https://github.com/Don-Erfan/wae/compare/v0.0.11...v0.0.12

@@ -585,7 +585,8 @@ fn normalize(path: &Path) -> String {
             other => result.push(other.as_os_str()),
         }
     }
-    result.to_string_lossy().replace('\\', "/")
+    let normalized = result.to_string_lossy().replace('\\', "/");
+    normalized.strip_prefix("//?/").unwrap_or(&normalized).to_string()
 }
 
 fn package_name(specifier: &str) -> String {
@@ -601,6 +602,11 @@ mod tests {
     use super::*;
     use std::fs;
     use wae_core::domain::DependencyKind;
+
+    #[test]
+    fn normalized_paths_strip_windows_verbatim_prefixes() {
+        assert_eq!(normalize(Path::new(r"\\?\C:\repo\src\app.ts")), "C:/repo/src/app.ts");
+    }
 
     fn resolve_with(
         resolver: &dyn ResolutionHandler,
@@ -757,7 +763,10 @@ mod tests {
         )
         .unwrap();
         let loaded = TsConfigLoader::load(&root).unwrap();
-        assert_eq!(loaded.aliases[0].targets[0], normalize(&root.join("src/js/*")));
+        assert_eq!(
+            loaded.aliases[0].targets[0],
+            normalize(&root.canonicalize().unwrap().join("src/js/*"))
+        );
 
         fs::write(
             root.join("tsconfig.json"),
