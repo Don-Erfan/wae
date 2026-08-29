@@ -60,9 +60,9 @@ steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.16
+  - uses: Don-Erfan/wae@v0.0.17
     with:
-      version: 0.0.16
+      version: 0.0.17
       changed: "true"
       base: origin/main
       format: human

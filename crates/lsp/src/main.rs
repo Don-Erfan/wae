@@ -318,8 +318,8 @@ mod tests {
 
     #[test]
     fn file_uris_round_trip_to_project_relative_module_ids() {
-        let root = Path::new("/tmp/wae-lsp-test");
-        let uri = file_uri(root, "src/a file.ts").unwrap();
-        assert_eq!(uri_path(root, &uri).unwrap(), "src/a file.ts");
+        let root = std::env::temp_dir().join("wae-lsp-test");
+        let uri = file_uri(&root, "src/a file.ts").unwrap();
+        assert_eq!(uri_path(&root, &uri).unwrap(), "src/a file.ts");
     }
 }
