@@ -8,7 +8,9 @@
 3. Keep Cargo, npm, and tag versions identical.
 4. Enable GitHub's immutable releases setting before publishing the first immutable release.
 
-The release workflow repeats formatting, Clippy, the complete test suite, dependency audit, installer tests, and package inspection before any platform binary is built. A failing verification job prevents GitHub Release and npm publication.
+The release workflow calls the same complete reusable readiness workflow as pull requests,
+including performance, IDE, MCP, fuzz and installer gates. A failing gate prevents GitHub Release
+and npm publication.
 
 ## Publish
 
@@ -20,7 +22,8 @@ git push origin master vX.Y.Z
 ```
 
 GitHub Actions builds the CLI, LSP and MCP server for every supported native target, verifies and publishes an aggregate
-`SHA256SUMS` manifest, signs that manifest through keyless Sigstore, generates an SPDX JSON SBOM,
+`SHA256SUMS` manifest, signs that manifest through keyless Sigstore, generates a separate SPDX
+asset inventory and CycloneDX dependency SBOM from the repository/Cargo.lock,
 and records GitHub SLSA build-provenance attestations for every binary. The curated section for the
 version in `CHANGELOG.md` is prepended to GitHub's generated pull-request notes. npm publication
 uses OIDC; no long-lived `NPM_TOKEN` or interactive OTP belongs in CI.
@@ -37,8 +40,8 @@ cosign verify-blob \
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
 ```
 
-Because the SPDX JSON file is listed in the signed checksum manifest, its verified digest binds
-the dependency inventory to the same workflow identity as the binaries.
+Both `wae-vX-assets.spdx.json` and `wae-vX-dependencies.cdx.json` are listed in the signed checksum
+manifest, binding the release inventory and dependency tree to the same workflow identity.
 
 ## Recovery
 

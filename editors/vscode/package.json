@@ -2,8 +2,9 @@
   "name": "wae-vscode",
   "displayName": "Web Architecture Engine",
   "description": "Live WAE architecture diagnostics, hover context and quick fixes.",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "publisher": "don-erfan",
+  "repository": { "type": "git", "url": "https://github.com/Don-Erfan/wae.git" },
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Linters", "Programming Languages"],
   "activationEvents": ["onLanguage:javascript", "onLanguage:typescript", "onLanguage:javascriptreact", "onLanguage:typescriptreact"],
@@ -27,7 +28,7 @@
     ]
   },
   "scripts": {
-    "compile": "tsc -p ./",
+    "compile": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=out/extension.js",
     "check": "tsc -p ./ --noEmit"
   },
   "dependencies": {
@@ -36,6 +37,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
+    "esbuild": "0.28.2",
     "typescript": "^5.5.0"
   }
 }

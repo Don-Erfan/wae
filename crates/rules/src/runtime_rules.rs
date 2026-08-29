@@ -77,8 +77,13 @@ impl Rule for BrowserIncompatiblePackageRule {
             context,
             &context.config.runtime.browser_incompatible_packages,
         )?;
+        let reachability = context.runtime_graph.reachability_index(&targets);
+        if !reachability.has_targets() {
+            return Ok(());
+        }
         for source in modules_with_runtime(context, Runtime::Browser) {
-            if let Some(path) = context.runtime_graph.shortest_path_to_any(&source, &targets) {
+            if let Some(path) = context.runtime_graph.shortest_path_in_index(&source, &reachability)
+            {
                 let package =
                     external_name(path.last().expect("non-empty runtime path")).to_owned();
                 let mut diagnostic = runtime_diagnostic(
@@ -111,11 +116,12 @@ impl Rule for EdgeIncompatibleDependencyRule {
             context,
             &context.config.runtime.edge_incompatible_packages,
         )?;
+        let external_reachability = context.runtime_graph.reachability_index(&external_targets);
         for source in modules_with_runtime(context, Runtime::Edge) {
             let node_path =
                 context.runtime_graph.shortest_path_to_runtime(&source, &[Runtime::Node]);
             let external_path =
-                context.runtime_graph.shortest_path_to_any(&source, &external_targets);
+                context.runtime_graph.shortest_path_in_index(&source, &external_reachability);
             if let Some(path) = shortest(node_path, external_path) {
                 sink.emit(runtime_diagnostic(
                     "RUNTIME-004",
@@ -141,6 +147,11 @@ impl Rule for AmbiguousUniversalRuntimeRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
+        if !context.runtime_graph.has_runtime_targets(&[Runtime::Browser])
+            || !context.runtime_graph.has_runtime_targets(&[Runtime::Server, Runtime::Node])
+        {
+            return Ok(());
+        }
         for source in modules_with_runtime(context, Runtime::Universal) {
             let browser =
                 context.runtime_graph.shortest_path_to_runtime(&source, &[Runtime::Browser]);

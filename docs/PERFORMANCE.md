@@ -4,8 +4,8 @@ WAE has two Criterion suites:
 
 - `wae-graph/graph_scaling` measures graph construction at 1k, 10k, 50k and 100k modules and
   SCC, reachability and estimated owned heap capacity at 1k, 10k and 50k.
-- `wae-engine/incremental` compares a cold 1k-module analysis with a warm analysis that must
-  restore all 1,000 module snapshots and the rule snapshot.
+- `wae-engine/incremental` measures cold, warm and single-edit complete-engine analysis at 1k and
+  10k modules. Single-edit runs must restore every unchanged module and analyze exactly one overlay.
 
 Run the complete measurement suite with:
 
@@ -16,6 +16,10 @@ cargo bench -p wae-engine --bench incremental --locked
 
 Criterion results belong in local/CI artifacts, not source control: processor model, runner load and
 toolchain affect absolute latency. Every benchmark target is compiled by CI to prevent silent rot.
+
+CI additionally runs a cold 10,000-module Universal TypeScript chain through the complete engine
+and default rule set. The gate prints independent phase timings and Linux peak RSS into a retained
+performance artifact, catching regressions that graph-only Criterion measurements cannot observe.
 
 ## Required CI gate
 

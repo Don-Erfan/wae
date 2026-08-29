@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
+use crossbeam_channel::{Sender, unbounded};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use serde_json::{Value, json};
 use url::Url;
 use wae_core::domain::{Diagnostic, ModuleKind, Severity};
-use wae_engine::{Analysis, AnalyzeRequest, Engine};
+use wae_engine::{Analysis, AnalysisError, AnalysisTicket, WorkspaceSession};
 
 fn main() {
     if let Err(error) = run() {
@@ -20,43 +23,65 @@ fn run() -> Result<(), String> {
     let root = workspace_root(&initialize_params)?;
     connection.initialize_finish(initialize_id, capabilities()).map_err(err)?;
     let mut state = ServerState::new(root);
-    state.analyze_and_publish(&connection)?;
+    let (analysis_sender, analysis_receiver) = unbounded();
+    state.schedule_analysis(analysis_sender.clone());
 
-    for message in &connection.receiver {
-        match message {
-            Message::Request(request) => {
-                if connection.handle_shutdown(&request).map_err(err)? {
-                    break;
+    loop {
+        crossbeam_channel::select! {
+            recv(connection.receiver) -> message => {
+                let message = message.map_err(err)?;
+                match message {
+                    Message::Request(request) => {
+                        if connection.handle_shutdown(&request).map_err(err)? {
+                            break;
+                        }
+                        handle_request(&connection, &state, request)?;
+                    }
+                    Message::Notification(notification) => {
+                        state.handle_notification(notification, analysis_sender.clone());
+                    }
+                    Message::Response(_) => {}
                 }
-                handle_request(&connection, &state, request)?;
             }
-            Message::Notification(notification) => {
-                state.handle_notification(&connection, notification)?;
+            recv(analysis_receiver) -> result => {
+                state.publish_result(&connection, result.map_err(err)?)?;
             }
-            Message::Response(_) => {}
         }
     }
+    drop(connection);
     io_threads.join().map_err(err)
 }
 
 struct ServerState {
     root: PathBuf,
+    session: Arc<WorkspaceSession>,
     analysis: Option<Analysis>,
     published: HashSet<String>,
     documents: BTreeMap<String, String>,
 }
 
+struct BackgroundAnalysis {
+    ticket: AnalysisTicket,
+    result: Result<Analysis, AnalysisError>,
+}
+
 impl ServerState {
     fn new(root: PathBuf) -> Self {
-        Self { root, analysis: None, published: HashSet::new(), documents: BTreeMap::new() }
+        Self {
+            session: Arc::new(WorkspaceSession::new(&root)),
+            root,
+            analysis: None,
+            published: HashSet::new(),
+            documents: BTreeMap::new(),
+        }
     }
 
     fn handle_notification(
         &mut self,
-        connection: &Connection,
         notification: Notification,
-    ) -> Result<(), String> {
-        match notification.method.as_str() {
+        sender: Sender<BackgroundAnalysis>,
+    ) {
+        let should_analyze = match notification.method.as_str() {
             "textDocument/didOpen" => {
                 if let (Some(uri), Some(text)) = (
                     notification.params.pointer("/textDocument/uri").and_then(Value::as_str),
@@ -66,7 +91,7 @@ impl ServerState {
                         self.documents.insert(path, text.into());
                     }
                 }
-                self.analyze_and_publish(connection)
+                true
             }
             "textDocument/didChange" => {
                 if let (Some(uri), Some(text)) = (
@@ -83,7 +108,7 @@ impl ServerState {
                         self.documents.insert(path, text.into());
                     }
                 }
-                self.analyze_and_publish(connection)
+                true
             }
             "textDocument/didClose" => {
                 if let Some(uri) =
@@ -93,23 +118,42 @@ impl ServerState {
                         self.documents.remove(&path);
                     }
                 }
-                self.analyze_and_publish(connection)
+                true
             }
             "textDocument/didSave"
             | "workspace/didChangeConfiguration"
-            | "workspace/didChangeWatchedFiles" => self.analyze_and_publish(connection),
-            _ => Ok(()),
+            | "workspace/didChangeWatchedFiles" => true,
+            _ => false,
+        };
+        if should_analyze {
+            self.schedule_analysis(sender);
         }
     }
 
-    fn analyze_and_publish(&mut self, connection: &Connection) -> Result<(), String> {
-        let request = self
-            .documents
-            .iter()
-            .fold(AnalyzeRequest::new(&self.root), |request, (module, source)| {
-                request.with_overlay(module.clone(), source.clone())
-            });
-        match Engine::default().analyze(request) {
+    fn schedule_analysis(&self, sender: Sender<BackgroundAnalysis>) {
+        let ticket = self.session.begin_analysis();
+        let worker_ticket = ticket.clone();
+        let session = Arc::clone(&self.session);
+        let overlays = self.documents.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            if !session.is_current(&worker_ticket) {
+                return;
+            }
+            let result = session.analyze(&worker_ticket, &overlays);
+            let _ = sender.send(BackgroundAnalysis { ticket, result });
+        });
+    }
+
+    fn publish_result(
+        &mut self,
+        connection: &Connection,
+        completed: BackgroundAnalysis,
+    ) -> Result<(), String> {
+        if !self.session.is_current(&completed.ticket) {
+            return Ok(());
+        }
+        match completed.result {
             Ok(analysis) => {
                 let mut by_file = std::collections::BTreeMap::<String, Vec<Value>>::new();
                 for diagnostic in &analysis.diagnostics {
@@ -137,6 +181,7 @@ impl ServerState {
                 self.published = current;
                 self.analysis = Some(analysis);
             }
+            Err(AnalysisError::Cancelled) => {}
             Err(error) => send_notification(
                 connection,
                 "window/showMessage",
@@ -198,6 +243,9 @@ fn hover(state: &ServerState, params: &Value) -> Value {
 }
 
 fn code_actions(params: &Value) -> Value {
+    let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) else {
+        return Value::Array(Vec::new());
+    };
     let actions = params
         .pointer("/context/diagnostics")
         .and_then(Value::as_array)
@@ -207,15 +255,22 @@ fn code_actions(params: &Value) -> Value {
             let data = diagnostic.get("data")?;
             let suggestion = data.get("suggestion")?.as_str()?;
             let rule = data.get("ruleId")?.as_str()?;
+            let line = diagnostic.pointer("/range/start/line").and_then(Value::as_u64)?;
             Some(json!({
-                "title": format!("WAE {rule}: {suggestion}"),
+                "title": format!("Suppress {rule} with a documented reason"),
                 "kind": "quickfix",
                 "diagnostics": [diagnostic],
-                "command": {
-                    "title": "Show WAE suggestion",
-                    "command": "wae.showSuggestion",
-                    "arguments": [suggestion]
-                }
+                "isPreferred": false,
+                "edit": { "changes": {
+                    (uri): [{
+                        "range": {
+                            "start": { "line": line, "character": 0 },
+                            "end": { "line": line, "character": 0 }
+                        },
+                        "newText": format!("// wae-ignore {rule} -- explain why this exception is safe\n")
+                    }]
+                }},
+                "data": { "suggestion": suggestion }
             }))
         })
         .collect::<Vec<_>>();
@@ -312,8 +367,16 @@ mod tests {
         assert_eq!(value["range"]["start"]["line"], 2);
         assert_eq!(value["range"]["start"]["character"], 4);
         assert_eq!(value["data"]["ruleId"], "ARCH-003");
-        let actions = code_actions(&json!({ "context": { "diagnostics": [value] } }));
+        let actions = code_actions(&json!({
+            "textDocument": { "uri": "file:///project/src/a.ts" },
+            "context": { "diagnostics": [value] }
+        }));
         assert_eq!(actions.as_array().unwrap().len(), 1);
+        assert_eq!(
+            actions[0]["edit"]["changes"]["file:///project/src/a.ts"][0]["range"]["start"]["line"],
+            2
+        );
+        assert!(actions[0]["command"].is_null());
     }
 
     #[test]

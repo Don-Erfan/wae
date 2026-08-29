@@ -36,6 +36,9 @@ runtime:
   edge_incompatible_packages: ["node:*", "*-native"]
 
 architecture:
+  coverage:
+    minimum: 90
+    allow_unassigned: ["scripts/**", "generated/**"]
   layers:
     app:
       patterns: ["src/app/**"]
@@ -127,9 +130,11 @@ framework:
   enabled: [nextjs]
 ```
 
-The Next.js adapter classifies App Router pages/layouts/loading/error/not-found/templates, route
-handlers, module-level client/server directives, middleware, Pages Router pages/API routes and
-custom `_app`/`_document`/`_error` files. It also records explicit `edge`/`nodejs` runtime exports.
+The parser emits framework-neutral `ModuleSemantics` from the JS/TS AST, including directive
+prologues and literal runtime exports. The Next.js adapter consumes those facts to classify App
+Router pages/layouts/loading/error/not-found/templates, route handlers, client/server directives,
+middleware, Pages Router pages/API routes and custom `_app`/`_document`/`_error` files. It also
+records explicit `edge`/`nodejs` runtime exports without regex rescanning source text.
 Classification is stored as open `FrameworkMetadata`, so core and rule APIs do not depend on a
 Next-specific enum.
 
@@ -182,11 +187,13 @@ wae init --preset fsd
 wae init --preset next
 wae init --preset nx
 wae config validate --show-overlaps
+wae config validate --show-coverage --show-unassigned
 ```
 
-The validation command lists every source file matching multiple layers and suggests anchored
-patterns or exclusions. `wae doctor` includes the same root cause instead of collapsing it into a
-generic analysis failure.
+The validation command lists every source file matching multiple layers, calculates layer coverage,
+enforces the optional minimum and can list every non-exempt unassigned module. A non-empty project
+with no configured layers emits an explicit warning. `wae doctor` includes the same root cause;
+Git is advisory because only `check --changed` requires it.
 
 For an existing repository, `wae discover` produces a read-only proposal with explicit evidence,
 confidence, detected config files and feature clusters. It recognizes authoritative Next.js
@@ -214,8 +221,9 @@ candidates invalidate the owning module. A graph-identity snapshot also reuses r
 when the complete semantic graph is unchanged. Any graph change reevaluates rules for correctness.
 
 Analysis reads an unlocked cache snapshot. Saving takes an operating-system advisory lock only for
-the short reload, merge, prune, atomic-write and rename transaction. The reload preserves entries
-written by concurrent processes, while pruning removes entries for deleted or renamed sources.
+the short reload, dirty-set merge, prune, atomic-write and replace transaction. Only entries
+produced by the current analysis are merged, so a stale process cannot overwrite a newer module
+entry. Unix rename and Windows `MoveFileExW` provide platform-native atomic replacement.
 The `.lock` path is a persistent coordination inode, not an ownership marker: its mere existence is
 harmless, and the OS releases ownership automatically after a crash. Payloads are also invalidated
 by parser behavior version.

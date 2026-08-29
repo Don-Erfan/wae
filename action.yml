@@ -8,7 +8,7 @@ inputs:
   version:
     description: Exact @don-erfan/wae version to install.
     required: false
-    default: "0.0.17"
+    default: "0.0.18"
   changed:
     description: Check only new fail-level violations in the Git affected closure.
     required: false
@@ -20,11 +20,19 @@ inputs:
   format:
     description: Reporter format (human, json, jsonl or sarif).
     required: false
-    default: human
+    default: sarif
   config:
     description: Optional path to wae.yaml.
     required: false
     default: ""
+  upload-sarif:
+    description: Upload SARIF to GitHub code scanning when security-events write permission is available.
+    required: false
+    default: "true"
+  sarif-file:
+    description: Path used for the generated SARIF report.
+    required: false
+    default: "wae-results.sarif"
 runs:
   using: composite
   steps:
@@ -34,6 +42,7 @@ runs:
         node-version: 24
         package-manager-cache: false
     - name: Run WAE architecture check
+      id: wae-check
       shell: bash
       env:
         WAE_ACTION_VERSION: ${{ inputs.version }}
@@ -41,6 +50,7 @@ runs:
         WAE_ACTION_BASE: ${{ inputs.base }}
         WAE_ACTION_FORMAT: ${{ inputs.format }}
         WAE_ACTION_CONFIG: ${{ inputs.config }}
+        WAE_ACTION_SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
         set -euo pipefail
         case "$WAE_ACTION_VERSION" in
@@ -58,4 +68,44 @@ runs:
         if [ "$WAE_ACTION_CHANGED" = "true" ]; then args+=(--changed); fi
         if [ -n "$WAE_ACTION_BASE" ]; then args+=(--base "$WAE_ACTION_BASE"); fi
         if [ -n "$WAE_ACTION_CONFIG" ]; then args+=(--config "$WAE_ACTION_CONFIG"); fi
-        npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "${args[@]}"
+        set +e
+        if [ "$WAE_ACTION_FORMAT" = "sarif" ]; then
+          npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "${args[@]}" > "$WAE_ACTION_SARIF_FILE"
+          status=$?
+          cat "$WAE_ACTION_SARIF_FILE"
+        else
+          npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "${args[@]}"
+          status=$?
+        fi
+        set -e
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+    - name: Generate SARIF annotations
+      if: inputs.upload-sarif == 'true' && inputs.format != 'sarif' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
+      shell: bash
+      env:
+        WAE_ACTION_VERSION: ${{ inputs.version }}
+        WAE_ACTION_CHANGED: ${{ inputs.changed }}
+        WAE_ACTION_BASE: ${{ inputs.base }}
+        WAE_ACTION_CONFIG: ${{ inputs.config }}
+        WAE_ACTION_SARIF_FILE: ${{ inputs.sarif-file }}
+      run: |
+        set -uo pipefail
+        args=(check --format sarif)
+        if [ "$WAE_ACTION_CHANGED" = "true" ]; then args+=(--changed); fi
+        if [ -n "$WAE_ACTION_BASE" ]; then args+=(--base "$WAE_ACTION_BASE"); fi
+        if [ -n "$WAE_ACTION_CONFIG" ]; then args+=(--config "$WAE_ACTION_CONFIG"); fi
+        npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "${args[@]}" > "$WAE_ACTION_SARIF_FILE"
+        status=$?
+        if [ "$status" -gt 1 ]; then exit "$status"; fi
+        test -s "$WAE_ACTION_SARIF_FILE"
+    - name: Upload WAE SARIF
+      if: inputs.upload-sarif == 'true' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: wae-architecture
+    - name: Propagate WAE exit status
+      shell: bash
+      env:
+        WAE_STATUS: ${{ steps.wae-check.outputs.status }}
+      run: exit "$WAE_STATUS"

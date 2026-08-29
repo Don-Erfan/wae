@@ -1,6 +1,7 @@
 use tree_sitter::{Node, Parser, Tree};
 use wae_core::domain::{
-    Import, ImportKind, ModuleId, ModulePath, ParseError, ParseErrorKind, SourceLocation,
+    Import, ImportKind, ModuleId, ModulePath, ModuleSemantics, ParseError, ParseErrorKind,
+    SourceLocation,
 };
 
 mod dependency_classifier;
@@ -8,14 +9,28 @@ use dependency_classifier::{classify_export, classify_import};
 
 /// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
 /// persist this value so parser upgrades can never reuse stale import IR.
-pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v4");
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v5");
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParsedModule {
+    pub imports: Vec<Import>,
+    pub semantics: ModuleSemantics,
+}
 
 pub trait ParserAdapter: Send + Sync {
+    fn parse_module(
+        &self,
+        module_path: &ModulePath,
+        source: &str,
+    ) -> Result<ParsedModule, ParseError>;
+
     fn parse_imports(
         &self,
         module_path: &ModulePath,
         source: &str,
-    ) -> Result<Vec<Import>, ParseError>;
+    ) -> Result<Vec<Import>, ParseError> {
+        self.parse_module(module_path, source).map(|module| module.imports)
+    }
 }
 
 /// Dependency-oriented JS/TS adapter backed entirely by the Tree-sitter AST.
@@ -23,11 +38,11 @@ pub trait ParserAdapter: Send + Sync {
 pub struct JsTsParser;
 
 impl ParserAdapter for JsTsParser {
-    fn parse_imports(
+    fn parse_module(
         &self,
         module_path: &ModulePath,
         source: &str,
-    ) -> Result<Vec<Import>, ParseError> {
+    ) -> Result<ParsedModule, ParseError> {
         let tree = parse_tree(module_path, source)?;
         let mut imports = Vec::new();
         collect_dependencies(tree.root_node(), module_path, source, &mut imports);
@@ -37,8 +52,54 @@ impl ParserAdapter for JsTsParser {
         imports.dedup_by(|a, b| {
             a.specifier == b.specifier && a.location == b.location && a.kind == b.kind
         });
-        Ok(imports)
+        Ok(ParsedModule { imports, semantics: collect_semantics(tree.root_node(), source) })
     }
+}
+
+fn collect_semantics(root: Node<'_>, source: &str) -> ModuleSemantics {
+    let mut semantics = ModuleSemantics::default();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "comment" {
+            continue;
+        }
+        if child.kind() == "expression_statement" {
+            let value = child.named_child(0).filter(|node| node.kind() == "string");
+            if let Some(directive) = value
+                .and_then(|node| node.utf8_text(source.as_bytes()).ok())
+                .and_then(decode_string_literal)
+            {
+                semantics.directives.push(directive);
+                continue;
+            }
+        }
+        break;
+    }
+    semantics.exported_runtime = find_exported_runtime(root, source);
+    semantics
+}
+
+fn find_exported_runtime(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "export_statement" {
+        if let Some(runtime) = runtime_declaration(node, source) {
+            return Some(runtime);
+        }
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| find_exported_runtime(child, source))
+}
+
+fn runtime_declaration(node: Node<'_>, source: &str) -> Option<String> {
+    let declarator = first_descendant_of_kind(node, "variable_declarator")?;
+    let name = declarator.child_by_field_name("name")?.utf8_text(source.as_bytes()).ok()?;
+    if name != "runtime" {
+        return None;
+    }
+    let value = declarator.child_by_field_name("value")?;
+    (value.kind() == "string")
+        .then(|| value.utf8_text(source.as_bytes()).ok().and_then(decode_string_literal))
+        .flatten()
+        .filter(|runtime| matches!(runtime.as_str(), "edge" | "nodejs"))
 }
 
 fn parse_tree(module_path: &ModulePath, source: &str) -> Result<Tree, ParseError> {
@@ -261,6 +322,26 @@ import legacyAlias = require('./legacy-alias');
         assert_eq!(imports[1].kind, ImportKind::TypeOnly);
         assert_eq!(imports[2].kind, ImportKind::ReExport);
         assert!(imports[7..].iter().all(|import| import.kind == ImportKind::Require));
+    }
+
+    #[test]
+    fn extracts_directives_and_next_runtime_from_ast_semantics() {
+        let parsed = JsTsParser
+            .parse_module(
+                &ModulePath("src/app/route.ts".into()),
+                "/* header */\n'use server';\nexport const runtime = 'edge';\nconst later = 'use client';",
+            )
+            .unwrap();
+        assert_eq!(parsed.semantics.directives, vec!["use server"]);
+        assert_eq!(parsed.semantics.exported_runtime.as_deref(), Some("edge"));
+
+        let nested = JsTsParser
+            .parse_module(
+                &ModulePath("src/not-runtime.ts".into()),
+                "function f() { const runtime = 'nodejs'; }",
+            )
+            .unwrap();
+        assert_eq!(nested.semantics.exported_runtime, None);
     }
 
     #[test]

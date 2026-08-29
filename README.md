@@ -28,6 +28,7 @@ cargo run -p wae-cli -- init
 cargo run -p wae-cli -- init --preset next
 cargo run -p wae-cli -- discover
 cargo run -p wae-cli -- config validate --show-overlaps
+cargo run -p wae-cli -- config validate --show-coverage --show-unassigned
 ```
 
 Ratchet mode never creates state implicitly. Review the current diagnostics, explicitly create and commit the baseline, then compare affected files and their importer closure against Git:
@@ -54,7 +55,8 @@ binary.
 
 ## Verify release assets
 
-Release binaries, the SPDX SBOM, and their aggregate manifest are covered by `SHA256SUMS`. Verify
+Release binaries, the SPDX asset inventory, the CycloneDX dependency SBOM, and their aggregate
+manifest are covered by `SHA256SUMS`. Verify
 the files first, then verify the manifest's keyless Sigstore identity:
 
 ```bash
@@ -65,11 +67,12 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.17.spdx.json
+jq '.packages | length' wae-v0.0.18-assets.spdx.json
+jq '.components | length' wae-v0.0.18-dependencies.cdx.json
 ```
 
-The checksum proves the downloaded SBOM is the one signed by the release workflow; the SBOM can
-then be inspected with any SPDX-compatible tool.
+The checksum proves both downloaded inventories are the files signed by the release workflow; use
+SPDX tooling for assets and CycloneDX tooling for the Cargo dependency tree.
 
 ## Development
 

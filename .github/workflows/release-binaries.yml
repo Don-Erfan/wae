@@ -24,8 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -39,51 +37,16 @@ jobs:
           tag_url=$(curl --fail --silent --show-error --location "$ref" | jq -r '.object | select(.type == "tag") | .url')
           test -n "$tag_url"
           test "$(curl --fail --silent --show-error --location "$tag_url" | jq -r '.verification.verified')" = "true"
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          components: rustfmt, clippy
-      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2
-        with:
-          tool: cargo-audit@0.22.2
-          fallback: none
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 24
-          package-manager-cache: false
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo audit --deny warnings
-      - working-directory: npm/wae
-        run: npm run test:installer
-      - working-directory: npm/wae
-        env:
-          WAE_SKIP_DOWNLOAD: "1"
-        run: npm pack --dry-run
-
-  test-matrix:
-    name: Test ${{ matrix.os }}
+  readiness:
+    name: Complete v1 readiness gate
     needs: verify
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    env:
-      RUSTUP_TOOLCHAIN: stable
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --workspace --locked
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [verify, test-matrix]
+    needs: [verify, readiness]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -190,8 +153,15 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
+          pattern: wae-*
           path: dist
           merge-multiple: true
+
+      - name: Download verified editor artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ide-clients
+          path: dist
 
       - name: Verify and aggregate binary checksums
         shell: bash
@@ -200,13 +170,26 @@ jobs:
           cd dist
           cat ./*.sha256 | LC_ALL=C sort -k2 > SHA256SUMS
           sha256sum --check SHA256SUMS
+          find . -type f \( -name '*.vsix' -o -name '*.zip' \) -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 -r sha256sum >> SHA256SUMS
+          LC_ALL=C sort -k2 -o SHA256SUMS SHA256SUMS
 
-      - name: Generate SPDX SBOM for release assets
+      - name: Generate SPDX inventory for release assets
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: dist
           format: spdx-json
-          output-file: wae-${{ env.RELEASE_TAG }}.spdx.json
+          output-file: wae-${{ env.RELEASE_TAG }}-assets.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate CycloneDX dependency SBOM from Cargo.lock
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: wae-${{ env.RELEASE_TAG }}-dependencies.cdx.json
           upload-artifact: false
           upload-release-assets: false
 
@@ -214,9 +197,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mv "wae-${RELEASE_TAG}.spdx.json" dist/
+          mv "wae-${RELEASE_TAG}-assets.spdx.json" dist/
+          mv "wae-${RELEASE_TAG}-dependencies.cdx.json" dist/
           cd dist
-          sha256sum "wae-${RELEASE_TAG}.spdx.json" >> SHA256SUMS
+          sha256sum "wae-${RELEASE_TAG}-assets.spdx.json" >> SHA256SUMS
+          sha256sum "wae-${RELEASE_TAG}-dependencies.cdx.json" >> SHA256SUMS
           LC_ALL=C sort -k2 -o SHA256SUMS SHA256SUMS
           sha256sum --check SHA256SUMS
 

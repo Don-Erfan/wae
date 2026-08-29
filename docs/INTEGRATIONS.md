@@ -16,6 +16,7 @@ identities and are parsed or registry-synchronized in the Rust test suite.
 - `dependency_path`: the deterministic shortest path between two resolved modules;
 - `architecture_model`: modules, packages, layers, runtimes, framework metadata, edges and
   diagnostics.
+- `dependency_policy`: whether an existing resolved edge is allowed and the diagnostics governing it.
 
 After installing the npm package, configure an MCP client to run the project-local executable:
 
@@ -30,6 +31,10 @@ After installing the npm package, configure an MCP client to run the project-loc
   }
 }
 ```
+
+The server is confined to its startup directory by default. Add another trusted tree with
+`--allow-root /absolute/path`, or use the intentionally explicit `--allow-any-root` only in an
+already sandboxed environment. Canonicalization prevents `..` and symlink escapes.
 
 Tool execution failures are returned as MCP tool results with `isError: true`; malformed or unknown
 JSON-RPC methods use protocol errors. The server writes only protocol messages to stdout.
@@ -55,18 +60,21 @@ The repository root contains a composite `action.yml`. Pin a release tag and an 
 ```yaml
 permissions:
   contents: read
+  security-events: write
 
 steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.17
+  - uses: Don-Erfan/wae@v0.0.18
     with:
-      version: 0.0.17
+      version: 0.0.18
       changed: "true"
       base: origin/main
-      format: human
+      format: sarif
+      upload-sarif: "true"
 ```
 
 Ratchet mode still requires a reviewed, committed `.wae/baseline.json`; the Action never creates
-one implicitly.
+one implicitly. The Action uploads WAE SARIF through GitHub CodeQL's upload adapter and then
+propagates the original WAE exit status, so annotations never hide a failed architecture gate.

@@ -2,9 +2,39 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use wae_core::domain::{ModuleId, ModuleKind};
-use wae_engine::{AnalyzeRequest, Engine};
+use wae_engine::{AnalyzeRequest, Engine, FailurePolicy};
+
+#[derive(Clone, Debug)]
+pub struct ServerPolicy {
+    allowed_roots: Vec<PathBuf>,
+    allow_any_root: bool,
+}
+
+impl ServerPolicy {
+    pub fn confined(default_root: &Path) -> Self {
+        Self { allowed_roots: vec![default_root.to_path_buf()], allow_any_root: false }
+    }
+
+    pub fn with_allowed_root(mut self, root: PathBuf) -> Self {
+        self.allowed_roots.push(root);
+        self
+    }
+
+    pub fn allow_any_root(mut self) -> Self {
+        self.allow_any_root = true;
+        self
+    }
+}
 
 pub fn handle_message(message: Value, default_root: &Path) -> Option<Value> {
+    handle_message_with_policy(message, default_root, &ServerPolicy::confined(default_root))
+}
+
+pub fn handle_message_with_policy(
+    message: Value,
+    default_root: &Path,
+    policy: &ServerPolicy,
+) -> Option<Value> {
     let id = message.get("id").cloned()?;
     let method = message.get("method").and_then(Value::as_str)?;
     let result = match method {
@@ -19,6 +49,7 @@ pub fn handle_message(message: Value, default_root: &Path) -> Option<Value> {
             message.pointer("/params/name").and_then(Value::as_str).unwrap_or_default(),
             message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({})),
             default_root,
+            policy,
         )),
         _ => return Some(error(id, -32601, format!("unknown method `{method}`"))),
     };
@@ -63,6 +94,20 @@ fn tools() -> Value {
             "name": "architecture_model",
             "description": "Return modules, packages, layers, runtimes, framework metadata, edges and violation counts.",
             "inputSchema": root_schema()
+        },
+        {
+            "name": "dependency_policy",
+            "description": "Report whether an existing dependency is allowed and return every policy diagnostic that governs it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string" },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" }
+                },
+                "required": ["from", "to"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -75,8 +120,8 @@ fn root_schema() -> Value {
     })
 }
 
-fn call_tool(name: &str, arguments: Value, default_root: &Path) -> Value {
-    match execute_tool(name, arguments, default_root) {
+fn call_tool(name: &str, arguments: Value, default_root: &Path, policy: &ServerPolicy) -> Value {
+    match execute_tool(name, arguments, default_root, policy) {
         Ok(structured) => {
             let text = serde_json::to_string_pretty(&structured)
                 .unwrap_or_else(|error| format!("could not serialize tool result: {error}"));
@@ -93,12 +138,21 @@ fn call_tool(name: &str, arguments: Value, default_root: &Path) -> Value {
     }
 }
 
-fn execute_tool(name: &str, arguments: Value, default_root: &Path) -> Result<Value, String> {
-    let root = arguments
+fn execute_tool(
+    name: &str,
+    arguments: Value,
+    default_root: &Path,
+    policy: &ServerPolicy,
+) -> Result<Value, String> {
+    let requested = arguments
         .get("root")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
+        .map(|root| {
+            let path = PathBuf::from(root);
+            if path.is_absolute() { path } else { default_root.join(path) }
+        })
         .unwrap_or_else(|| default_root.to_path_buf());
+    let root = confined_root(&requested, policy)?;
     let structured = match name {
         "architecture_check" => {
             let analysis = analyze(&root)?;
@@ -109,9 +163,14 @@ fn execute_tool(name: &str, arguments: Value, default_root: &Path) -> Result<Val
                 "diagnostics": analysis.diagnostics,
                 "timings": {
                     "discoveryMs": analysis.timings.discovery_ms,
-                    "moduleAnalysisMs": analysis.timings.module_analysis_ms,
-                    "graphMs": analysis.timings.graph_ms,
-                    "rulesMs": analysis.timings.rules_ms,
+                    "classificationMs": analysis.timings.classification_ms,
+                    "parsingMs": analysis.timings.parsing_ms,
+                    "resolutionMs": analysis.timings.resolution_ms,
+                    "graphBuildMs": analysis.timings.graph_build_ms,
+                    "ruleEvaluationMs": analysis.timings.rule_evaluation_ms,
+                    "cacheMs": analysis.timings.cache_ms,
+                    "reportingMs": analysis.timings.reporting_ms,
+                    "orchestrationMs": analysis.timings.orchestration_ms,
                     "totalMs": analysis.timings.total_ms
                 }
             })
@@ -173,9 +232,55 @@ fn execute_tool(name: &str, arguments: Value, default_root: &Path) -> Result<Val
                 "diagnostics": analysis.diagnostics
             })
         }
+        "dependency_policy" => {
+            let from = arguments.get("from").and_then(Value::as_str).ok_or("from is required")?;
+            let to = arguments.get("to").and_then(Value::as_str).ok_or("to is required")?;
+            let analysis = analyze(&root)?;
+            let edge_exists = analysis
+                .project
+                .dependencies
+                .iter()
+                .any(|edge| edge.from.0 == from && edge.to.0 == to);
+            let diagnostics = analysis
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.dependency_path.first().is_some_and(|module| module.0 == from)
+                        && diagnostic.dependency_path.last().is_some_and(|module| module.0 == to)
+                })
+                .collect::<Vec<_>>();
+            let allowed = edge_exists.then(|| {
+                diagnostics.iter().all(|diagnostic| !FailurePolicy::is_failure(diagnostic))
+            });
+            json!({
+                "from": from,
+                "to": to,
+                "edgeExists": edge_exists,
+                "allowed": allowed,
+                "diagnostics": diagnostics
+            })
+        }
         _ => return Err(format!("unknown tool `{name}`")),
     };
     Ok(structured)
+}
+
+fn confined_root(requested: &Path, policy: &ServerPolicy) -> Result<PathBuf, String> {
+    let requested = requested.canonicalize().map_err(|error| {
+        format!("cannot open requested root `{}`: {error}", requested.display())
+    })?;
+    if policy.allow_any_root {
+        return Ok(requested);
+    }
+    let allowed = policy.allowed_roots.iter().filter_map(|root| root.canonicalize().ok());
+    if allowed.into_iter().any(|root| requested.starts_with(root)) {
+        Ok(requested)
+    } else {
+        Err(format!(
+            "requested root `{}` is outside the MCP server allowed roots",
+            requested.display()
+        ))
+    }
 }
 
 fn analyze(root: &Path) -> Result<wae_engine::Analysis, String> {
@@ -204,7 +309,7 @@ mod tests {
             root,
         )
         .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 5);
     }
 
     #[test]
@@ -234,5 +339,63 @@ mod tests {
         .unwrap();
         assert_eq!(response["result"]["isError"], true);
         assert!(response.get("error").is_none());
+    }
+
+    #[test]
+    fn requested_roots_are_confined_by_default() {
+        let allowed = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/basic");
+        let outside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/circular");
+        let response = handle_message(
+            json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {
+                    "name": "architecture_check",
+                    "arguments": { "root": outside }
+                }
+            }),
+            &allowed,
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("outside the MCP server allowed roots")
+        );
+    }
+
+    #[test]
+    fn dependency_policy_returns_governing_diagnostics() {
+        let root = std::env::temp_dir().join(format!("wae-mcp-policy-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "import './b';").unwrap();
+        std::fs::write(root.join("src/b.ts"), "export const value = true;").unwrap();
+        std::fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nresolution:\n  mode: bundler\narchitecture:\n  forbidden_dependencies:\n    - from: 'src/a.ts'\n      to: 'src/b.ts'\n",
+        )
+        .unwrap();
+        let response = handle_message(
+            json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": { "name": "dependency_policy", "arguments": {
+                    "from": "src/a.ts", "to": "src/b.ts"
+                }}
+            }),
+            &root,
+        )
+        .unwrap();
+        let policy = &response["result"]["structuredContent"];
+        assert_eq!(policy["edgeExists"], true);
+        assert_eq!(policy["allowed"], false);
+        assert!(
+            policy["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| { diagnostic["rule_id"] == "ARCH-002" })
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

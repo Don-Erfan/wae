@@ -47,13 +47,20 @@ Diagnostics / Reporters / Integrations
 ### 4.1 الگوهای پیاده‌شده
 
 - `Facade`: `wae-engine::Engine` تنها API سطح‌بالای pipeline برای CLI و integrationهای آینده است.
+- `Pipeline`: `AnalysisContext` یک request immutable را از phaseهای discovery، semantic
+  classification، parse، resolution، graph build، rule evaluation و cache commit عبور می‌دهد؛
+  telemetry هر phase مستقل و قابل reconcile است.
 - `Strategy / Adapter`: قرارداد `ParserAdapter` جزئیات parser را از IR و engine جدا می‌کند.
 - `Strategy / Adapter`: قرارداد `FrameworkAdapter` تشخیص project و classification ماژول را از engine/core جدا نگه می‌دارد؛ `NextJsAdapter` اولین strategy اجرایی است.
 - `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias، workspace و external package را به‌ترتیب اجرا می‌کند.
 - `Strategy`: `ResolutionKindProvider` نوع `import`/`require` را از syntax و mode تعیین می‌کند و `ConditionSetProvider` conditionهای Node10، Node16، NodeNext و Bundler را مستقل و قابل‌آزمون نگه می‌دارد.
 - `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.
 - `Repository`: baseline storage پشت command صریح `baseline create` قرار دارد و `check --changed` هرگز آن را ایجاد نمی‌کند.
-- `Repository`: cache store snapshot را بدون قفل می‌خواند و قفل advisory را فقط برای reload→merge→prune→atomic-write می‌گیرد؛ پس از crash نیز نیازمند پاک‌کردن lock-file نیست.
+- `Repository / Unit of Work`: cache store snapshot را بدون قفل می‌خواند و قفل advisory را فقط
+  برای reload→dirty-merge→prune→atomic-replace می‌گیرد؛ stale writer فقط dirty set خودش را commit
+  می‌کند و پس از crash نیز نیازمند پاک‌کردن lock-file نیست.
+- `Actor / Stateful Session`: `WorkspaceSession` نسل تحلیل فعال و cancellation token را مالک است؛
+  LSP تغییرها را debounce و در worker پس‌زمینه اجرا می‌کند و result قدیمی را publish نمی‌کند.
 - `Ports & Adapters`: قرارداد `VcsPort` و `ChangeSet` در engine قرار دارد و Git/CLI در لبه می‌مانند؛ ruleها به command یا reporter وابسته نیستند.
 
 این انتخاب‌ها با تعریف‌های Refactoring.Guru هم‌راستا هستند: Facade سطح ساده‌ای روی subsystem می‌دهد، Strategy الگوریتم‌های قابل‌تعویض را جدا می‌کند، Chain درخواست را در handlerهای مرتب عبور می‌دهد، و Composite مجموعه‌ای از اجزا را پشت قرارداد مشترک قرار می‌دهد.
@@ -77,7 +84,8 @@ Diagnostics / Reporters / Integrations
 - cache ماژول‌محور مبتنی بر hash محتوا و fingerprint محیط resolution؛ parse، resolution، edge و diagnostic snapshot به‌صورت opt-in و atomic ذخیره می‌شوند
 - deterministic sorting برای diagnostics
 - اجرای parallel ruleها روی snapshot مشترک graph برای پروژه‌های بزرگ، با merge به ترتیب registry و خروجی deterministic (بدون parse مجدد)
-- propagation قابلیت‌های runtime با shortest-path evidence و RPC boundaryهای framework
+- propagation قابلیت‌های runtime با reverse multi-source reachability index، shortest-path
+  evidence و RPC boundaryهای framework در `O(V+E)` برای هر runtime class
 - incremental invalidation بر اساس dependency impact
 - `ProjectIndex` مبتنی بر hash set برای lookupهای O(1) هنگام ساخت graph
 - `TsConfigIndex` با انتخاب نزدیک‌ترین config والد برای monorepoها

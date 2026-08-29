@@ -7,7 +7,7 @@ use std::time::Duration;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use wae_config::Config;
-use wae_core::domain::{Dependency, Diagnostic, Import, ResolvedDependency};
+use wae_core::domain::{Dependency, Diagnostic, Import, ModuleSemantics, ResolvedDependency};
 use wae_parser::PARSER_CACHE_VERSION;
 
 use crate::AnalysisError;
@@ -20,6 +20,8 @@ pub(crate) struct CachedModuleAnalysis {
     pub(crate) dependencies: Vec<Dependency>,
     pub(crate) resolved_dependencies: Vec<ResolvedDependency>,
     pub(crate) diagnostics: Vec<Diagnostic>,
+    #[serde(default)]
+    pub(crate) semantics: ModuleSemantics,
     #[serde(default)]
     pub(crate) resolved_paths: Vec<String>,
 }
@@ -46,6 +48,9 @@ pub(crate) struct AnalysisCache {
     root: PathBuf,
     file: CacheFile,
     live_files: BTreeSet<String>,
+    dirty_files: BTreeMap<String, CachedModuleAnalysis>,
+    dirty_rules: Option<CachedRuleAnalysis>,
+    needs_prune: bool,
 }
 
 impl AnalysisCache {
@@ -66,6 +71,9 @@ impl AnalysisCache {
                 root: root.to_path_buf(),
                 file: fresh_cache(),
                 live_files,
+                dirty_files: BTreeMap::new(),
+                dirty_rules: None,
+                needs_prune: false,
             });
         }
         let parent = path
@@ -75,7 +83,17 @@ impl AnalysisCache {
             AnalysisError::Project(format!("cannot create cache directory: {error}"))
         })?;
         let file = read_cache(&path);
-        Ok(Self { enabled: true, path, root: root.to_path_buf(), file, live_files })
+        let needs_prune = file.files.keys().ne(live_files.iter());
+        Ok(Self {
+            enabled: true,
+            path,
+            root: root.to_path_buf(),
+            file,
+            live_files,
+            dirty_files: BTreeMap::new(),
+            dirty_rules: None,
+            needs_prune,
+        })
     }
 
     pub(crate) fn get(
@@ -103,20 +121,19 @@ impl AnalysisCache {
         analysis: CachedModuleAnalysis,
     ) {
         if self.enabled {
-            self.file.files.insert(
-                module,
-                CachedModuleAnalysis {
-                    hash,
-                    environment_hash,
-                    resolved_paths: analysis
-                        .dependencies
-                        .iter()
-                        .filter(|dependency| !dependency.to.0.starts_with("external:"))
-                        .map(|dependency| dependency.to.0.clone())
-                        .collect(),
-                    ..analysis
-                },
-            );
+            let cached = CachedModuleAnalysis {
+                hash,
+                environment_hash,
+                resolved_paths: analysis
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| !dependency.to.0.starts_with("external:"))
+                    .map(|dependency| dependency.to.0.clone())
+                    .collect(),
+                ..analysis
+            };
+            self.file.files.insert(module.clone(), cached.clone());
+            self.dirty_files.insert(module, cached);
         }
     }
 
@@ -130,12 +147,17 @@ impl AnalysisCache {
 
     pub(crate) fn set_rule_diagnostics(&mut self, graph_hash: u64, diagnostics: Vec<Diagnostic>) {
         if self.enabled {
-            self.file.rules = Some(CachedRuleAnalysis { graph_hash, diagnostics });
+            let cached = CachedRuleAnalysis { graph_hash, diagnostics };
+            self.file.rules = Some(cached.clone());
+            self.dirty_rules = Some(cached);
         }
     }
 
     pub(crate) fn save(&self) -> Result<(), AnalysisError> {
         if !self.enabled {
+            return Ok(());
+        }
+        if self.dirty_files.is_empty() && self.dirty_rules.is_none() && !self.needs_prune {
             return Ok(());
         }
         // Parsing and graph analysis happen without a global writer lock. The short transaction
@@ -144,13 +166,15 @@ impl AnalysisCache {
         let _lock = acquire_advisory_lock(&self.path.with_extension("lock"))?;
         let mut merged = read_cache(&self.path);
         merged.files.retain(|module, _| self.live_files.contains(module));
-        for (module, cached) in &self.file.files {
+        // Only publish entries produced by this analysis. Replaying the entire snapshot would
+        // overwrite newer entries written after this process loaded the cache.
+        for (module, cached) in &self.dirty_files {
             if self.live_files.contains(module) {
                 merged.files.insert(module.clone(), cached.clone());
             }
         }
-        if self.file.rules.is_some() {
-            merged.rules.clone_from(&self.file.rules);
+        if self.dirty_rules.is_some() {
+            merged.rules.clone_from(&self.dirty_rules);
         }
         static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
         let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
@@ -159,20 +183,42 @@ impl AnalysisCache {
             .map_err(|error| AnalysisError::Internal(error.to_string()))?;
         fs::write(&temporary, contents)
             .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            if self.path.exists() {
-                fs::remove_file(&self.path).map_err(|remove_error| {
-                    AnalysisError::Project(format!("cannot replace cache: {remove_error}"))
-                })?;
-                fs::rename(&temporary, &self.path).map_err(|rename_error| {
-                    AnalysisError::Project(format!("cannot install cache: {rename_error}"))
-                })?;
-            } else {
-                return Err(AnalysisError::Project(format!("cannot install cache: {error}")));
-            }
-        }
+        replace_file(&temporary, &self.path)?;
         Ok(())
     }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), AnalysisError> {
+    fs::rename(temporary, destination)
+        .map_err(|error| AnalysisError::Project(format!("cannot install cache: {error}")))
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), AnalysisError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = temporary.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let target =
+        destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated and remain alive for the duration of the call.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        return Err(AnalysisError::Project(format!(
+            "cannot atomically install cache: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn unresolved_candidate_became_live(
@@ -251,7 +297,13 @@ pub(crate) fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_lock_contended;
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    use wae_config::Config;
+    use wae_core::domain::ModuleSemantics;
+
+    use super::{AnalysisCache, CachedModuleAnalysis, is_lock_contended, read_cache};
 
     #[test]
     fn recognizes_the_platform_specific_lock_contention_error() {
@@ -260,5 +312,42 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "not lock contention",
         )));
+    }
+
+    #[test]
+    fn stale_writers_merge_only_their_dirty_modules() {
+        let root = std::env::temp_dir().join(format!(
+            "wae-cache-dirty-merge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = Config::default();
+        config.cache.enabled = true;
+        config.cache.directory = ".wae/cache".into();
+        let live = BTreeSet::from(["src/a.ts".into(), "src/b.ts".into()]);
+        let mut first = AnalysisCache::load(&root, &config, live.clone()).unwrap();
+        let mut stale = AnalysisCache::load(&root, &config, live).unwrap();
+        let analysis = |hash| CachedModuleAnalysis {
+            hash,
+            environment_hash: 7,
+            imports: vec![],
+            dependencies: vec![],
+            resolved_dependencies: vec![],
+            diagnostics: vec![],
+            semantics: ModuleSemantics::default(),
+            resolved_paths: vec![],
+        };
+
+        first.insert("src/a.ts".into(), 1, 7, analysis(1));
+        stale.insert("src/b.ts".into(), 2, 7, analysis(2));
+        first.save().unwrap();
+        stale.save().unwrap();
+
+        let cache = read_cache(&root.join(".wae/cache/analysis-v2.json"));
+        assert_eq!(cache.files.len(), 2);
+        assert_eq!(cache.files["src/a.ts"].hash, 1);
+        assert_eq!(cache.files["src/b.ts"].hash, 2);
+        fs::remove_dir_all(root).unwrap();
     }
 }

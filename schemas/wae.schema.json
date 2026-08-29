@@ -55,6 +55,7 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "layers": { "type": "object", "additionalProperties": { "$ref": "#/$defs/layer" } },
+        "coverage": { "$ref": "#/$defs/coverage" },
         "features": { "$ref": "#/$defs/features" },
         "forbidden_dependencies": { "$ref": "#/$defs/forbiddenList" },
         "forbidden_package_dependencies": { "$ref": "#/$defs/forbiddenList" },
@@ -62,6 +63,13 @@
           "type": "object", "additionalProperties": false,
           "properties": { "monorepo_boundaries": { "type": "boolean" } }
         }
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "minimum": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "allow_unassigned": { "$ref": "#/$defs/stringList" }
       }
     },
     "layer": {

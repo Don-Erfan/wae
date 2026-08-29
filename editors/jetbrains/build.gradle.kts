@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.donerfan.wae"
-version = "0.0.17"
+version = "0.0.18"
 
 repositories {
     mavenCentral()
@@ -14,8 +14,8 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        intellijIdeaCommunity("2024.2")
-        bundledPlugin("com.intellij.modules.lsp")
+        webstorm("2024.2")
+        bundledModule("com.intellij.modules.lsp")
         pluginVerifier()
     }
 }

@@ -399,11 +399,31 @@ pub struct RuntimeGraph {
     graph: ModuleGraph,
     runtimes: HashMap<ModuleId, Runtime>,
     rpc_boundaries: HashSet<ModuleId>,
+    runtime_reachability: HashMap<Runtime, RuntimeReachabilityIndex>,
+    server_or_node_reachability: RuntimeReachabilityIndex,
+}
+
+/// Reverse multi-source shortest-path index for a fixed set of runtime targets.
+///
+/// Building the index is O(V + E). Queries reconstruct only the selected evidence path, avoiding
+/// a fresh full-graph BFS for every rule source. The representation is intentionally opaque so an
+/// index cannot accidentally be used with a different graph.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeReachabilityIndex {
+    reachable: Vec<bool>,
+    next_hop: Vec<Option<usize>>,
+    target_count: usize,
+}
+
+impl RuntimeReachabilityIndex {
+    pub fn has_targets(&self) -> bool {
+        self.target_count > 0
+    }
 }
 
 impl RuntimeGraph {
     pub fn from_project(project: &Project) -> Self {
-        let runtimes =
+        let runtimes: HashMap<ModuleId, Runtime> =
             project.modules.iter().map(|module| (module.id.clone(), module.runtime)).collect();
         let rpc_boundaries = project
             .modules
@@ -414,7 +434,25 @@ impl RuntimeGraph {
             })
             .map(|module| module.id.clone())
             .collect();
-        Self { graph: ModuleGraph::from_project(project), runtimes, rpc_boundaries }
+        let graph = ModuleGraph::from_project(project);
+        let mut runtime_reachability = HashMap::new();
+        for runtime in [Runtime::Browser, Runtime::Server, Runtime::Edge, Runtime::Node] {
+            let targets = runtimes
+                .iter()
+                .filter(|(_, candidate)| **candidate == runtime)
+                .map(|(module, _)| module.clone())
+                .collect::<HashSet<_>>();
+            runtime_reachability
+                .insert(runtime, Self::build_reachability_index(&graph, &rpc_boundaries, &targets));
+        }
+        let server_or_node = runtimes
+            .iter()
+            .filter(|(_, runtime)| matches!(runtime, Runtime::Server | Runtime::Node))
+            .map(|(module, _)| module.clone())
+            .collect::<HashSet<_>>();
+        let server_or_node_reachability =
+            Self::build_reachability_index(&graph, &rpc_boundaries, &server_or_node);
+        Self { graph, runtimes, rpc_boundaries, runtime_reachability, server_or_node_reachability }
     }
 
     pub fn runtime_of(&self, module: &ModuleId) -> Option<Runtime> {
@@ -436,9 +474,43 @@ impl RuntimeGraph {
         start: &ModuleId,
         targets: &[Runtime],
     ) -> Option<Vec<ModuleId>> {
-        self.shortest_path_matching(start, |module| {
-            self.runtime_of(module).is_some_and(|runtime| targets.contains(&runtime))
-        })
+        let index = if targets.len() == 1 {
+            self.runtime_reachability.get(&targets[0])
+        } else if targets.len() == 2
+            && targets.contains(&Runtime::Server)
+            && targets.contains(&Runtime::Node)
+        {
+            Some(&self.server_or_node_reachability)
+        } else {
+            None
+        };
+        if let Some(index) = index {
+            return self.shortest_path_in_index(start, index);
+        }
+        let targets = self
+            .runtimes
+            .iter()
+            .filter(|(_, runtime)| targets.contains(runtime))
+            .map(|(module, _)| module.clone())
+            .collect::<HashSet<_>>();
+        let index = self.reachability_index(&targets);
+        self.shortest_path_in_index(start, &index)
+    }
+
+    pub fn has_runtime_targets(&self, targets: &[Runtime]) -> bool {
+        if targets.len() == 1 {
+            return self
+                .runtime_reachability
+                .get(&targets[0])
+                .is_some_and(RuntimeReachabilityIndex::has_targets);
+        }
+        if targets.len() == 2
+            && targets.contains(&Runtime::Server)
+            && targets.contains(&Runtime::Node)
+        {
+            return self.server_or_node_reachability.has_targets();
+        }
+        self.runtimes.values().any(|runtime| targets.contains(runtime))
     }
 
     pub fn shortest_path_to_any(
@@ -446,7 +518,29 @@ impl RuntimeGraph {
         start: &ModuleId,
         targets: &HashSet<ModuleId>,
     ) -> Option<Vec<ModuleId>> {
-        self.shortest_path_matching(start, |module| targets.contains(module))
+        let index = self.reachability_index(targets);
+        self.shortest_path_in_index(start, &index)
+    }
+
+    pub fn reachability_index(&self, targets: &HashSet<ModuleId>) -> RuntimeReachabilityIndex {
+        Self::build_reachability_index(&self.graph, &self.rpc_boundaries, targets)
+    }
+
+    pub fn shortest_path_in_index(
+        &self,
+        start: &ModuleId,
+        index: &RuntimeReachabilityIndex,
+    ) -> Option<Vec<ModuleId>> {
+        let mut cursor = self.graph.node_indices.get(start).copied()?;
+        if !index.reachable.get(cursor).copied().unwrap_or(false) {
+            return None;
+        }
+        let mut path = vec![self.graph.nodes[cursor].clone()];
+        while let Some(next) = index.next_hop.get(cursor).copied().flatten() {
+            cursor = next;
+            path.push(self.graph.nodes[cursor].clone());
+        }
+        Some(path)
     }
 
     pub fn cycles(&self) -> Vec<Vec<ModuleId>> {
@@ -457,40 +551,39 @@ impl RuntimeGraph {
             .collect()
     }
 
-    fn shortest_path_matching(
-        &self,
-        start: &ModuleId,
-        matches: impl Fn(&ModuleId) -> bool,
-    ) -> Option<Vec<ModuleId>> {
-        if !self.graph.has_node(start) {
-            return None;
+    fn build_reachability_index(
+        graph: &ModuleGraph,
+        rpc_boundaries: &HashSet<ModuleId>,
+        targets: &HashSet<ModuleId>,
+    ) -> RuntimeReachabilityIndex {
+        let mut reachable = vec![false; graph.nodes.len()];
+        let mut next_hop = vec![None; graph.nodes.len()];
+        let mut target_indices = targets
+            .iter()
+            .filter_map(|target| graph.node_indices.get(target).copied())
+            .collect::<Vec<_>>();
+        target_indices.sort_unstable();
+        target_indices.dedup();
+        let mut queue = VecDeque::new();
+        for target in &target_indices {
+            reachable[*target] = true;
+            queue.push_back(*target);
         }
-        let mut visited = HashSet::from([start.clone()]);
-        let mut previous = HashMap::<ModuleId, ModuleId>::new();
-        let mut queue = VecDeque::from([start.clone()]);
-        while let Some(module) = queue.pop_front() {
-            let reached_boundary = module != *start && self.rpc_boundaries.contains(&module);
-            if !reached_boundary && matches(&module) {
-                let mut path = vec![module.clone()];
-                let mut cursor = module;
-                while cursor != *start {
-                    cursor = previous.get(&cursor)?.clone();
-                    path.push(cursor.clone());
-                }
-                path.reverse();
-                return Some(path);
-            }
-            if reached_boundary {
+        while let Some(current) = queue.pop_front() {
+            // A boundary remains queryable as a start module, but its implementation runtime must
+            // not propagate to callers on the reverse traversal.
+            if rpc_boundaries.contains(&graph.nodes[current]) {
                 continue;
             }
-            for neighbor in self.graph.outgoing(&module) {
-                if visited.insert(neighbor.clone()) {
-                    previous.insert(neighbor.clone(), module.clone());
-                    queue.push_back(neighbor);
+            for &predecessor in &graph.incoming[current] {
+                if !reachable[predecessor] {
+                    reachable[predecessor] = true;
+                    next_hop[predecessor] = Some(current);
+                    queue.push_back(predecessor);
                 }
             }
         }
-        None
+        RuntimeReachabilityIndex { reachable, next_hop, target_count: target_indices.len() }
     }
 }
 

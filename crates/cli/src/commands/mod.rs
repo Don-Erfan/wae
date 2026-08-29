@@ -154,10 +154,12 @@ pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
         },
     };
     let has_failures = FailurePolicy::count(&analysis.diagnostics) > 0;
+    let reporting_started = std::time::Instant::now();
+    let rendered = render(&analysis, format)
+        .and_then(|output| attach_regression_summary(output, format, regression.as_ref()));
+    analysis.timings.record_reporting(reporting_started.elapsed());
     let verbose_report = verbose.then(|| verbose_analysis(&analysis));
-    let mut output = match render(&analysis, format)
-        .and_then(|output| attach_regression_summary(output, format, regression.as_ref()))
-    {
+    let mut output = match rendered {
         Ok(output) if has_failures => CliOutput::violations(output),
         Ok(output) => CliOutput::success(output),
         Err(error) => CliOutput::internal_error(error.to_string()),
@@ -203,11 +205,16 @@ fn attach_regression_summary(
 
 fn verbose_analysis(analysis: &Analysis) -> String {
     format!(
-        "WAE timing: discovery={}ms module-analysis={}ms graph={}ms rules={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={}",
+        "WAE timing: discovery={}ms classification={}ms parsing={}ms resolution={}ms graph={}ms rules={}ms cache={}ms reporting={}ms orchestration={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={}",
         analysis.timings.discovery_ms,
-        analysis.timings.module_analysis_ms,
-        analysis.timings.graph_ms,
-        analysis.timings.rules_ms,
+        analysis.timings.classification_ms,
+        analysis.timings.parsing_ms,
+        analysis.timings.resolution_ms,
+        analysis.timings.graph_build_ms,
+        analysis.timings.rule_evaluation_ms,
+        analysis.timings.cache_ms,
+        analysis.timings.reporting_ms,
+        analysis.timings.orchestration_ms,
         analysis.timings.total_ms,
         analysis.incremental.cache_enabled,
         analysis.incremental.restored_modules,
@@ -265,7 +272,14 @@ pub fn doctor(root: &Path, cancellation: &CancellationToken) -> CliOutput {
         report.push(format!("✖ project root: {} is not a directory", root.display()));
     }
     match Config::load(root) {
-        Ok(_) => report.push(format!("✓ configuration: {}", root.join(CONFIG_FILE).display())),
+        Ok(config) => {
+            report.push(format!("✓ configuration: {}", root.join(CONFIG_FILE).display()));
+            if config.architecture.layers.is_empty() {
+                report.push(
+                    "⚠ architecture: no layers configured; layer ownership is not enforced".into(),
+                );
+            }
+        }
         Err(error) => {
             ok = false;
             report.push(format!("✖ configuration\n  {}", config_error(&error)));
@@ -281,8 +295,7 @@ pub fn doctor(root: &Path, cancellation: &CancellationToken) -> CliOutput {
     if git_ok {
         report.push("✓ git: available for --changed".into());
     } else {
-        ok = false;
-        report.push("✖ git: required for --changed".into());
+        report.push("⚠ git: unavailable; only `wae check --changed` is disabled".into());
     }
     match Engine::default()
         .analyze(AnalyzeRequest::new(root).with_cancellation(cancellation.clone()))
@@ -301,13 +314,14 @@ pub fn doctor(root: &Path, cancellation: &CancellationToken) -> CliOutput {
     if ok { CliOutput::success(report) } else { CliOutput::project_error(report) }
 }
 
-pub fn config_validate(root: &Path, show_overlaps: bool) -> CliOutput {
+pub fn config_validate(
+    root: &Path,
+    show_overlaps: bool,
+    show_coverage: bool,
+    show_unassigned: bool,
+) -> CliOutput {
     match validate_project_config(root) {
-        Ok(validation) if validation.layer_overlaps.is_empty() => CliOutput::success(format!(
-            "✓ configuration valid: {} source modules, no layer overlaps",
-            validation.source_modules
-        )),
-        Ok(validation) => {
+        Ok(validation) if !validation.layer_overlaps.is_empty() => {
             let overlaps = if show_overlaps {
                 validation.layer_overlaps.as_slice()
             } else {
@@ -335,6 +349,53 @@ pub fn config_validate(root: &Path, show_overlaps: bool) -> CliOutput {
             }
             report.push("- Add an explicit exclude to the broader layer".into());
             CliOutput::project_error(report.join("\n"))
+        }
+        Ok(validation) => {
+            let below_minimum = validation
+                .minimum_coverage
+                .is_some_and(|minimum| validation.coverage_percent < minimum);
+            let mut report = vec![format!(
+                "{} configuration valid: {} source modules, no layer overlaps",
+                if below_minimum { "✖" } else { "✓" },
+                validation.source_modules
+            )];
+            if validation.blank_architecture && validation.source_modules > 0 {
+                report.push(
+                    "⚠ no architecture layers are configured; checks cannot enforce layer ownership"
+                        .into(),
+                );
+            }
+            if show_coverage || below_minimum {
+                report.push(format!(
+                    "Coverage: {}% ({} assigned, {} unassigned, {} exempt)",
+                    validation.coverage_percent,
+                    validation.assigned_modules,
+                    validation.unassigned_modules.len(),
+                    validation.exempted_modules
+                ));
+                if let Some(minimum) = validation.minimum_coverage {
+                    report.push(format!("Required minimum: {minimum}%"));
+                }
+            }
+            if show_unassigned {
+                if validation.unassigned_modules.is_empty() {
+                    report.push("Unassigned modules: none".into());
+                } else {
+                    report.push("Unassigned modules:".into());
+                    report.extend(
+                        validation.unassigned_modules.iter().map(|module| format!("  {module}")),
+                    );
+                }
+            }
+            if below_minimum {
+                report.push(
+                    "Assign modules to layers or explicitly exempt support paths in `architecture.coverage.allow_unassigned`."
+                        .into(),
+                );
+                CliOutput::project_error(report.join("\n"))
+            } else {
+                CliOutput::success(report.join("\n"))
+            }
         }
         Err(error) => CliOutput::project_error(format!(
             "{}{}",

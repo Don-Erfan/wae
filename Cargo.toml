@@ -19,7 +19,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.0.17"
+version = "0.0.18"
 license = "MIT"
 
 [workspace.dependencies]
@@ -36,3 +36,4 @@ criterion = { version = "=0.5.1", default-features = false, features = ["cargo_b
 lsp-server = "=0.7.9"
 url = "=2.5.4"
 ctrlc = "=3.4.7"
+crossbeam-channel = "=0.5.15"

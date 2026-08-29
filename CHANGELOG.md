@@ -8,6 +8,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.18] - 2026-08-29
+
+### Added
+
+- A shared reverse multi-source runtime reachability index with deterministic shortest-path
+  reconstruction, plus an engine-level 10,000-module cold/warm/single-edit performance gate that
+  records wall time and peak RSS.
+- A long-lived, cancellable `WorkspaceSession` for LSP analysis, debounced background diagnostics,
+  real suppression `WorkspaceEdit` code actions, and a framed stdio protocol integration test.
+- Semantic parser facts for directive prologues and exported runtime literals, architecture
+  coverage thresholds and reports, MCP dependency-policy queries, and workspace-root confinement.
+- Release-built VS Code and JetBrains artifacts, SARIF upload support in the composite action, and
+  separate SPDX asset and CycloneDX dependency SBOMs.
+
+### Changed
+
+- Split engine orchestration into an explicit analysis pipeline and replaced overlapping timing
+  buckets with reconcilable discovery, classification, parsing, resolution, graph, rule, cache,
+  reporting, and orchestration phases.
+- Made CI reusable at an exact commit or tag and made binary releases depend on the same complete
+  quality, compatibility, performance, fuzz, integration, installer, and IDE readiness workflow.
+
+### Fixed
+
+- Reduced `RUNTIME-005` from repeated per-module graph traversals to linear indexed reachability and
+  skip evaluation when either required runtime target set is absent.
+- Prevented concurrent cache writers from restoring stale entries by committing only dirty updates;
+  warm no-op analyses no longer rewrite the cache and Windows replacement is atomic.
+- Fixed the MCP contract artifact directory, pinned `cargo-fuzz` installation, corrected the
+  JetBrains WebStorm/LSP target, and downgraded missing Git in `doctor` to a changed-mode warning.
+
 ## [0.0.17] - 2026-08-29
 
 ### Fixed
@@ -134,7 +165,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.17...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.18...HEAD
+[0.0.18]: https://github.com/Don-Erfan/wae/compare/v0.0.17...v0.0.18
 [0.0.17]: https://github.com/Don-Erfan/wae/compare/v0.0.16...v0.0.17
 [0.0.16]: https://github.com/Don-Erfan/wae/compare/v0.0.15...v0.0.16
 [0.0.15]: https://github.com/Don-Erfan/wae/compare/v0.0.14...v0.0.15

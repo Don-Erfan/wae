@@ -182,10 +182,19 @@ impl Default for ProjectConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ArchitectureConfig {
     pub layers: BTreeMap<String, LayerConfig>,
+    pub coverage: ArchitectureCoverageConfig,
     pub features: FeatureConfig,
     pub forbidden_dependencies: Vec<ForbiddenDependency>,
     pub forbidden_package_dependencies: Vec<ForbiddenDependency>,
     pub presets: ArchitecturePresets,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArchitectureCoverageConfig {
+    /// Optional minimum percentage of non-exempt source modules assigned to exactly one layer.
+    pub minimum: Option<u8>,
+    pub allow_unassigned: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +517,17 @@ impl Config {
                 }
             }
         }
+        if self.architecture.coverage.minimum.is_some_and(|minimum| minimum > 100) {
+            return Err(config_error(
+                ConfigErrorKind::InvalidDependency,
+                Some("architecture.coverage.minimum".into()),
+                "architecture coverage minimum must be between 0 and 100".into(),
+            ));
+        }
+        validate_patterns(
+            &self.architecture.coverage.allow_unassigned,
+            "architecture.coverage.allow_unassigned",
+        )?;
         validate_patterns(&self.project.include, "project.include")?;
         validate_patterns(&self.project.exclude, "project.exclude")?;
         for (index, condition) in self.resolution.custom_conditions.iter().enumerate() {
@@ -729,6 +749,19 @@ mod tests {
                 .flat_map(|layer| &layer.patterns)
                 .all(|pattern| !pattern.starts_with("**/"))
         );
+    }
+
+    #[test]
+    fn architecture_coverage_is_strict_and_bounded() {
+        let config = Config::from_yaml(
+            "version: 1\narchitecture:\n  coverage:\n    minimum: 90\n    allow_unassigned: ['scripts/**']\n",
+        )
+        .unwrap();
+        assert_eq!(config.architecture.coverage.minimum, Some(90));
+        assert_eq!(config.architecture.coverage.allow_unassigned, ["scripts/**"]);
+        let error = Config::from_yaml("version: 1\narchitecture:\n  coverage:\n    minimum: 101\n")
+            .unwrap_err();
+        assert_eq!(error.path.as_deref(), Some("architecture.coverage.minimum"));
     }
 
     #[test]

@@ -149,6 +149,14 @@ pub mod domain {
         pub attributes: BTreeMap<String, String>,
     }
 
+    /// Framework-neutral facts extracted from syntax by a parser adapter. Framework adapters
+    /// consume this IR instead of rescanning source text with regular expressions.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ModuleSemantics {
+        pub directives: Vec<String>,
+        pub exported_runtime: Option<String>,
+    }
+
     /// Open layer identity; configured layer names remain first-class in the IR.
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct LayerId(pub String);
@@ -767,7 +775,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.17"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.18"]);
     }
 
     #[test]

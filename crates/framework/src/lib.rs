@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
-use regex::Regex;
-use wae_core::domain::{FrameworkMetadata, Runtime};
+use wae_core::domain::{FrameworkMetadata, ModuleSemantics, Runtime};
 
 #[derive(Clone, Debug, Default)]
 pub struct ProjectEvidence {
@@ -12,7 +11,7 @@ pub struct ProjectEvidence {
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleEvidence<'a> {
     pub path: &'a str,
-    pub source: &'a str,
+    pub semantics: &'a ModuleSemantics,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,10 +93,11 @@ impl FrameworkAdapter for NextJsAdapter {
         let pages_index = segments.iter().position(|part| *part == "pages");
         let file = segments.last().copied().unwrap_or_default();
         let stem = file.split('.').next().unwrap_or(file);
-        let directives = directive_prologue(module.source);
-        let use_client = directives.iter().any(|directive| directive == "use client");
-        let use_server = directives.iter().any(|directive| directive == "use server");
-        let explicit_runtime = explicit_runtime(module.source);
+        let use_client =
+            module.semantics.directives.iter().any(|directive| directive == "use client");
+        let use_server =
+            module.semantics.directives.iter().any(|directive| directive == "use server");
+        let explicit_runtime = explicit_runtime(module.semantics);
 
         let router = if app_index.is_some() {
             "app"
@@ -184,11 +184,8 @@ fn manifest_has_dependency(manifest: &serde_json::Value, dependency: &str) -> bo
         .any(|dependencies| dependencies.contains_key(dependency))
 }
 
-fn explicit_runtime(source: &str) -> Option<Runtime> {
-    let pattern = Regex::new(r#"(?m)\bexport\s+const\s+runtime\s*=\s*['\"](edge|nodejs)['\"]"#)
-        .expect("static Next.js runtime regex");
-    match pattern.captures(source).and_then(|captures| captures.get(1)).map(|value| value.as_str())
-    {
+fn explicit_runtime(semantics: &ModuleSemantics) -> Option<Runtime> {
+    match semantics.exported_runtime.as_deref() {
         Some("edge") => Some(Runtime::Edge),
         Some("nodejs") => Some(Runtime::Node),
         _ => None,
@@ -203,44 +200,6 @@ fn runtime_name(runtime: &Runtime) -> &'static str {
         Runtime::Node => "node",
         Runtime::Universal => "universal",
         Runtime::Unknown => "unknown",
-    }
-}
-
-/// Reads only the ECMAScript directive prologue. Strings later in a module are not directives.
-fn directive_prologue(source: &str) -> Vec<String> {
-    let mut rest = source.trim_start_matches('\u{feff}');
-    let mut directives = Vec::new();
-    loop {
-        rest = trim_leading_trivia(rest);
-        let Some(quote) =
-            rest.as_bytes().first().copied().filter(|byte| matches!(byte, b'\'' | b'"'))
-        else {
-            break;
-        };
-        let Some(end) = rest[1..].find(char::from(quote)) else { break };
-        let value = &rest[1..end + 1];
-        let after = rest[end + 2..].trim_start();
-        if !after.starts_with(';') {
-            break;
-        }
-        directives.push(value.to_string());
-        rest = &after[1..];
-    }
-    directives
-}
-
-fn trim_leading_trivia(mut source: &str) -> &str {
-    loop {
-        source = source.trim_start();
-        if let Some(end) = source.strip_prefix("//").and_then(|value| value.find('\n')) {
-            source = &source[end + 3..];
-            continue;
-        }
-        if let Some(end) = source.strip_prefix("/*").and_then(|value| value.find("*/")) {
-            source = &source[end + 4..];
-            continue;
-        }
-        return source;
     }
 }
 
@@ -272,20 +231,31 @@ mod tests {
     #[test]
     fn classifies_app_router_client_server_route_action_and_middleware_modules() {
         let adapter = NextJsAdapter;
-        let classify = |path, source| adapter.classify(ModuleEvidence { path, source });
-        let client =
-            classify("src/app/cart/client.tsx", "// lead\n'use client';\nexport default 1;");
+        let client_semantics =
+            ModuleSemantics { directives: vec!["use client".into()], exported_runtime: None };
+        let client = adapter.classify(ModuleEvidence {
+            path: "src/app/cart/client.tsx",
+            semantics: &client_semantics,
+        });
         assert_eq!(client.runtime, Runtime::Browser);
         assert_eq!(client.metadata.attributes["component"], "client");
-        let page = classify("src/app/cart/page.tsx", "export default function Page() {}");
+        let empty = ModuleSemantics::default();
+        let page =
+            adapter.classify(ModuleEvidence { path: "src/app/cart/page.tsx", semantics: &empty });
         assert_eq!(page.runtime, Runtime::Server);
         assert_eq!(page.metadata.attributes["role"], "page");
-        let route = classify("src/app/api/route.ts", "export const runtime = 'edge';");
+        let edge = ModuleSemantics { directives: vec![], exported_runtime: Some("edge".into()) };
+        let route =
+            adapter.classify(ModuleEvidence { path: "src/app/api/route.ts", semantics: &edge });
         assert_eq!(route.runtime, Runtime::Edge);
         assert_eq!(route.metadata.attributes["role"], "route-handler");
-        let action = classify("src/actions.ts", "'use server'; export async function save() {}");
+        let server_action =
+            ModuleSemantics { directives: vec!["use server".into()], exported_runtime: None };
+        let action =
+            adapter.classify(ModuleEvidence { path: "src/actions.ts", semantics: &server_action });
         assert_eq!(action.metadata.attributes["role"], "server-action-module");
-        let middleware = classify("src/middleware.ts", "export function middleware() {}");
+        let middleware =
+            adapter.classify(ModuleEvidence { path: "src/middleware.ts", semantics: &empty });
         assert_eq!(middleware.runtime, Runtime::Edge);
     }
 
@@ -294,13 +264,15 @@ mod tests {
         let adapter = NextJsAdapter;
         let api = adapter.classify(ModuleEvidence {
             path: "src/pages/api/user.ts",
-            source: "export default () => 'use client';",
+            semantics: &ModuleSemantics::default(),
         });
         assert_eq!(api.metadata.attributes["role"], "api-route");
         assert_eq!(api.metadata.attributes["useClient"], "false");
         assert_eq!(api.runtime, Runtime::Server);
-        let document = adapter
-            .classify(ModuleEvidence { path: "pages/_document.tsx", source: "export default 1;" });
+        let document = adapter.classify(ModuleEvidence {
+            path: "pages/_document.tsx",
+            semantics: &ModuleSemantics::default(),
+        });
         assert_eq!(document.metadata.attributes["role"], "custom-document");
     }
 }
