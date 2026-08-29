@@ -65,7 +65,7 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.13.spdx.json
+jq '.packages | length' wae-v0.0.14.spdx.json
 ```
 
 The checksum proves the downloaded SBOM is the one signed by the release workflow; the SBOM can

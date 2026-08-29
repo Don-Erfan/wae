@@ -65,23 +65,25 @@ impl FrameworkAdapter for NextJsAdapter {
     }
 
     fn detection_score(&self, project: &ProjectEvidence) -> u8 {
-        let manifest_score = project
+        let manifest_score = if project
             .package_manifest
             .as_ref()
             .is_some_and(|manifest| manifest_has_dependency(manifest, "next"))
-            .then_some(100)
-            .unwrap_or_default();
-        let config_score = project
-            .config_files
-            .iter()
-            .any(|path| {
-                matches!(
-                    path.as_str(),
-                    "next.config.js" | "next.config.mjs" | "next.config.cjs" | "next.config.ts"
-                )
-            })
-            .then_some(90)
-            .unwrap_or_default();
+        {
+            100
+        } else {
+            0
+        };
+        let config_score = if project.config_files.iter().any(|path| {
+            matches!(
+                path.as_str(),
+                "next.config.js" | "next.config.mjs" | "next.config.cjs" | "next.config.ts"
+            )
+        }) {
+            90
+        } else {
+            0
+        };
         manifest_score.max(config_score)
     }
 
