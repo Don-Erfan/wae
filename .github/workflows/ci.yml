@@ -195,7 +195,7 @@ jobs:
         with:
           toolchain: nightly
       - name: Install pinned cargo-fuzz
-        run: cargo install --locked cargo-fuzz --version 0.13.1
+        run: cargo install cargo-fuzz --version 0.13.1
       - run: cargo fuzz run parser_imports -- -max_total_time=10
       - run: cargo fuzz run config_yaml -- -max_total_time=10
 

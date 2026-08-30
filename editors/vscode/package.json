@@ -2,7 +2,7 @@
   "name": "wae-vscode",
   "displayName": "Web Architecture Engine",
   "description": "Live WAE architecture diagnostics, hover context and quick fixes.",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "publisher": "don-erfan",
   "repository": { "type": "git", "url": "https://github.com/Don-Erfan/wae.git" },
   "engines": { "vscode": "^1.90.0" },

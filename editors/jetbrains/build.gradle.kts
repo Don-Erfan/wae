@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.donerfan.wae"
-version = "0.0.19"
+version = "0.0.20"
 
 repositories {
     mavenCentral()
