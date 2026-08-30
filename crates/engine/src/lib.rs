@@ -186,8 +186,8 @@ pub fn validate_project_config(root: impl AsRef<Path>) -> Result<ConfigValidatio
     let architecture = CompiledArchitectureModel::compile(&config)?;
     let files = discover_modules(&root, &config)?;
     let allow_unassigned = discovery::build_globs(&config.architecture.coverage.allow_unassigned)?;
-    let mut assigned_modules = 0;
-    let mut exempted_modules = 0;
+    let mut assigned_modules = 0_usize;
+    let mut exempted_modules = 0_usize;
     let mut unassigned_modules = Vec::new();
     for path in &files {
         let module = relative_path(&root, path);
@@ -201,11 +201,11 @@ pub fn validate_project_config(root: impl AsRef<Path>) -> Result<ConfigValidatio
     }
     unassigned_modules.sort();
     let enforceable_modules = files.len().saturating_sub(exempted_modules);
-    let coverage_percent = if enforceable_modules == 0 {
-        100
-    } else {
-        ((assigned_modules * 100) / enforceable_modules).min(100) as u8
-    };
+    let coverage_percent = assigned_modules
+        .saturating_mul(100)
+        .checked_div(enforceable_modules)
+        .unwrap_or(100)
+        .min(100) as u8;
     let mut layer_overlaps = files
         .iter()
         .filter_map(|path| {
