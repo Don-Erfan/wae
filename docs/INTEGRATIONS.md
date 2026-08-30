@@ -66,9 +66,9 @@ steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.20
+  - uses: Don-Erfan/wae@v0.0.21
     with:
-      version: 0.0.20
+      version: 0.0.21
       changed: "true"
       base: origin/main
       format: sarif

@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
-## [0.0.20] - 2026-08-30
+## [0.0.21] - 2026-08-31
 
 ### Added
 
@@ -36,12 +36,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   skip evaluation when either required runtime target set is absent.
 - Prevented concurrent cache writers from restoring stale entries by committing only dirty updates;
   warm no-op analyses no longer rewrite the cache and Windows replacement is atomic.
-- Fixed the MCP contract artifact directory, pinned `cargo-fuzz` installation, corrected the
-  JetBrains WebStorm/LSP target, and downgraded missing Git in `doctor` to a changed-mode warning.
+- Fixed the MCP contract artifact directory, pinned `cargo-fuzz` installation, and downgraded
+  missing Git in `doctor` to a changed-mode warning.
 - Kept fuzz execution on nightly even when the repository toolchain file pins the MSRV toolchain.
 - Updated architecture coverage arithmetic for the stricter Rust 1.98 Clippy release gate.
 - Kept the `cargo-fuzz` version pinned while allowing Cargo to resolve transitive dependencies
   compatible with the current nightly compiler.
+- Built the pre-2025.2.1 JetBrains LSP client against IntelliJ IDEA Ultimate, declared the required
+  Ultimate module, imported the nested `LspServerStarter` API correctly, and configured explicit
+  Plugin Verifier coverage for the target IDE.
+
+## [0.0.20] - 2026-08-30
+
+### Release status
+
+- The signed source tag was retained for auditability, but publication was blocked when the IDE
+  readiness gate detected an invalid pre-2025.2.1 JetBrains LSP module dependency.
 
 ## [0.0.19] - 2026-08-30
 
@@ -183,7 +193,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.20...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.21...HEAD
+[0.0.21]: https://github.com/Don-Erfan/wae/compare/v0.0.20...v0.0.21
 [0.0.20]: https://github.com/Don-Erfan/wae/compare/v0.0.19...v0.0.20
 [0.0.19]: https://github.com/Don-Erfan/wae/compare/v0.0.18...v0.0.19
 [0.0.18]: https://github.com/Don-Erfan/wae/compare/v0.0.17...v0.0.18
