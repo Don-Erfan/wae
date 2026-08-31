@@ -254,7 +254,7 @@ jobs:
           git -C "$consumer" fetch --depth=1 origin 3761e52e60df9c6a316e067dbfd7032e494d3634
           git -C "$consumer" checkout --detach FETCH_HEAD
           set +e
-          (cd "$consumer" && "$GITHUB_WORKSPACE/target/debug/wae" check --no-cache --format json) \
+          (cd "$consumer" && "$GITHUB_WORKSPACE/target/debug/wae-cli" check --no-cache --format json) \
             > target/vercel-commerce-audit.json
           status=$?
           set -e

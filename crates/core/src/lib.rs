@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.22"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.23"]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
-## [0.0.22] - 2026-08-31
+## [0.0.23] - 2026-08-31
 
 ### Added
 
@@ -41,6 +41,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   diagnostics, and removed unsafe placeholder suppression edits that lacked a real justification.
 - Preserved nested or namespaced runtime-like syntax without misclassifying it as a module export,
   while retaining correct handling for direct, re-exported, and escaped runtime literals.
+- Corrected the VS Code Extension Host workspace root and the real-world consumer CLI binary path
+  exposed by the first execution of the new release-readiness gates.
+
+## [0.0.22] - 2026-08-31
+
+### Release status
+
+- The signed source tag is retained for auditability, but publication was blocked when the new IDE
+  and real-world consumer gates exposed incorrect test-harness paths. Both paths are fixed in
+  `0.0.23`; no npm package or GitHub Release was published for `0.0.22`.
 
 ## [0.0.21] - 2026-08-31
 
@@ -227,7 +237,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.22...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.23...HEAD
+[0.0.23]: https://github.com/Don-Erfan/wae/compare/v0.0.22...v0.0.23
 [0.0.22]: https://github.com/Don-Erfan/wae/compare/v0.0.21...v0.0.22
 [0.0.21]: https://github.com/Don-Erfan/wae/compare/v0.0.20...v0.0.21
 [0.0.20]: https://github.com/Don-Erfan/wae/compare/v0.0.19...v0.0.20

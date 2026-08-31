@@ -366,7 +366,6 @@ fn capabilities() -> Value {
             "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
             "hoverProvider": true,
             "codeActionProvider": true,
-            "executeCommandProvider": { "commands": ["wae.showSuggestion", "wae.suppressWithReason", "wae.reload"] },
             "workspace": { "workspaceFolders": { "supported": true, "changeNotifications": true } }
         },
         "serverInfo": { "name": "wae-lsp", "version": env!("CARGO_PKG_VERSION") }

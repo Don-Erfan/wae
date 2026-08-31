@@ -7,7 +7,7 @@ export async function run(): Promise<void> {
     assert.ok(serverPath, "WAE_LSP_PATH must point to the test language server");
     await vscode.workspace
       .getConfiguration("wae")
-      .update("server.path", serverPath, vscode.ConfigurationTarget.Workspace);
+      .update("server.path", serverPath, vscode.ConfigurationTarget.Global);
     const extension = vscode.extensions.getExtension("don-erfan.wae-vscode");
     assert.ok(extension, "development extension is installed");
     await extension.activate();
