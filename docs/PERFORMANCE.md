@@ -17,9 +17,11 @@ cargo bench -p wae-engine --bench incremental --locked
 Criterion results belong in local/CI artifacts, not source control: processor model, runner load and
 toolchain affect absolute latency. Every benchmark target is compiled by CI to prevent silent rot.
 
-CI additionally runs a cold 10,000-module Universal TypeScript chain through the complete engine
-and default rule set. The gate prints independent phase timings and Linux peak RSS into a retained
-performance artifact, catching regressions that graph-only Criterion measurements cannot observe.
+CI runs five complete 10,000-module cold, warm and single-edit samples and gates their median. It
+checks both tight absolute budgets and relative envelopes against the checked-in latest-release
+baseline in `performance/baselines/`. A 50,000-module full-engine gate runs on every change; a
+scheduled/manual workflow records the equivalent 100,000-module cold, warm, edit and peak-RSS
+contract. All results are retained as performance artifacts.
 
 ## Required CI gate
 

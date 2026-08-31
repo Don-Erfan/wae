@@ -79,14 +79,13 @@ fn collect_semantics(root: Node<'_>, source: &str) -> ModuleSemantics {
     semantics
 }
 
-fn find_exported_runtime(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() == "export_statement" {
-        if let Some(runtime) = runtime_declaration(node, source) {
-            return Some(runtime);
-        }
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find_map(|child| find_exported_runtime(child, source))
+fn find_exported_runtime(root: Node<'_>, source: &str) -> Option<String> {
+    // Next.js only recognizes a static export in the module body. Namespace/block/function
+    // descendants and re-exports must not classify the containing module's runtime.
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|child| child.kind() == "export_statement")
+        .find_map(|child| runtime_declaration(child, source))
 }
 
 fn runtime_declaration(node: Node<'_>, source: &str) -> Option<String> {
@@ -342,6 +341,23 @@ import legacyAlias = require('./legacy-alias');
             )
             .unwrap();
         assert_eq!(nested.semantics.exported_runtime, None);
+
+        for source in [
+            "namespace Internal { export const runtime = 'edge'; }",
+            "if (enabled) { const runtime = 'edge'; }",
+            "export { runtime } from './runtime-config';",
+        ] {
+            let parsed =
+                JsTsParser.parse_module(&ModulePath("src/app/page.ts".into()), source).unwrap();
+            assert_eq!(parsed.semantics.exported_runtime, None, "source: {source}");
+        }
+        let escaped = JsTsParser
+            .parse_module(
+                &ModulePath("src/app/route.ts".into()),
+                r#"export const runtime = "e\u0064ge";"#,
+            )
+            .unwrap();
+        assert_eq!(escaped.semantics.exported_runtime.as_deref(), Some("edge"));
     }
 
     #[test]

@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use wae_config::Config;
 use wae_core::domain::{
-    Dependency, DependencyTarget, Diagnostic, FeatureId, FrameworkMetadata, LayerId, Module,
-    ModuleId, ModuleKind, ModulePath, ModuleSemantics, Package, PackageName, Project,
-    ResolvedDependency, Runtime, Severity, SourceLocation,
+    ArchitectureOwnershipIndex, Dependency, DependencyTarget, Diagnostic, FeatureId,
+    FrameworkMetadata, LayerId, LayerOwnership, Module, ModuleId, ModuleKind, ModulePath,
+    ModuleSemantics, Package, PackageName, Project, ResolvedDependency, Runtime, Severity,
+    SourceLocation,
 };
 use wae_framework::{FrameworkAdapter, FrameworkRegistry, ModuleEvidence, ProjectEvidence};
 use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
@@ -45,6 +46,7 @@ pub struct AnalyzeRequest {
     pub config_path: Option<PathBuf>,
     pub cache_enabled: Option<bool>,
     pub overlays: BTreeMap<String, String>,
+    pub known_files: Option<Vec<PathBuf>>,
     pub cancellation: CancellationToken,
 }
 impl AnalyzeRequest {
@@ -54,6 +56,7 @@ impl AnalyzeRequest {
             config_path: None,
             cache_enabled: None,
             overlays: BTreeMap::new(),
+            known_files: None,
             cancellation: CancellationToken::default(),
         }
     }
@@ -67,6 +70,10 @@ impl AnalyzeRequest {
     }
     pub fn with_overlay(mut self, module: impl Into<String>, source: impl Into<String>) -> Self {
         self.overlays.insert(module.into(), source.into());
+        self
+    }
+    pub fn with_known_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.known_files = Some(files);
         self
     }
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -92,6 +99,7 @@ pub struct Analysis {
     pub schema_version: u32,
     pub project: Project,
     pub graph: ModuleGraph,
+    pub ownership: ArchitectureOwnershipIndex,
     pub diagnostics: Vec<Diagnostic>,
     pub incremental: IncrementalStats,
     pub timings: AnalysisTimings,
@@ -185,41 +193,31 @@ pub fn validate_project_config(root: impl AsRef<Path>) -> Result<ConfigValidatio
     let config = Config::load(&root).map_err(AnalysisError::Config)?;
     let architecture = CompiledArchitectureModel::compile(&config)?;
     let files = discover_modules(&root, &config)?;
-    let allow_unassigned = discovery::build_globs(&config.architecture.coverage.allow_unassigned)?;
-    let mut assigned_modules = 0_usize;
-    let mut exempted_modules = 0_usize;
-    let mut unassigned_modules = Vec::new();
+    let mut ownership = ArchitectureOwnershipIndex::default();
     for path in &files {
         let module = relative_path(&root, path);
-        if !architecture.matching_layers(&module).is_empty() {
-            assigned_modules += 1;
-        } else if allow_unassigned.is_match(&module) {
-            exempted_modules += 1;
-        } else {
-            unassigned_modules.push(module);
-        }
+        ownership.insert(ModuleId(module), architecture.ownership(&relative_path(&root, path)));
     }
-    unassigned_modules.sort();
-    let enforceable_modules = files.len().saturating_sub(exempted_modules);
-    let coverage_percent = assigned_modules
-        .saturating_mul(100)
-        .checked_div(enforceable_modules)
-        .unwrap_or(100)
-        .min(100) as u8;
-    let mut layer_overlaps = files
+    let unassigned_modules = ownership
+        .unassigned_modules()
+        .into_iter()
+        .map(|module| module.0.clone())
+        .collect::<Vec<_>>();
+    let layer_overlaps = ownership
         .iter()
-        .filter_map(|path| {
-            let module = relative_path(&root, path);
-            let layers = architecture.matching_layers(&module);
-            (layers.len() > 1).then_some(LayerOverlap { module, layers })
+        .filter_map(|(module, status)| {
+            let LayerOwnership::Overlap(layers) = status else { return None };
+            Some(LayerOverlap {
+                module: module.0.clone(),
+                layers: layers.iter().map(|layer| layer.0.clone()).collect(),
+            })
         })
         .collect::<Vec<_>>();
-    layer_overlaps.sort_by(|left, right| left.module.cmp(&right.module));
     Ok(ConfigValidation {
-        source_modules: files.len(),
-        assigned_modules,
-        exempted_modules,
-        coverage_percent,
+        source_modules: ownership.source_modules(),
+        assigned_modules: ownership.assigned_modules(),
+        exempted_modules: ownership.exempted_modules(),
+        coverage_percent: ownership.coverage_percent(),
         minimum_coverage: config.architecture.coverage.minimum,
         blank_architecture: config.architecture.layers.is_empty(),
         unassigned_modules,
@@ -557,7 +555,7 @@ fn analysis_environment_hash(root: &Path, config: &Config) -> Result<u64, Analys
         }
     }
     inputs.sort();
-    let mut identity = format!("wae-analysis-v2\n{config:?}").into_bytes();
+    let mut identity = format!("wae-analysis-v3\n{config:?}").into_bytes();
     for path in inputs {
         identity.extend_from_slice(relative_path(root, &path).as_bytes());
         identity.push(0);
@@ -828,6 +826,64 @@ mod tests {
                 analysis.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn ownership_exemptions_are_shared_by_validation_and_architecture_rules() {
+        let root =
+            std::env::temp_dir().join(format!("wae-ownership-exemption-{}", std::process::id()));
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(root.join("src/app/page.ts"), "export const page = true;").unwrap();
+        fs::write(root.join("scripts/tool.ts"), "export const tool = true;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\narchitecture:\n  coverage:\n    minimum: 100\n    allow_unassigned: ['scripts/**']\n  layers:\n    app:\n      patterns: ['src/app/**']\n",
+        )
+        .unwrap();
+
+        let validation = validate_project_config(&root).unwrap();
+        assert_eq!(validation.coverage_percent, 100);
+        assert_eq!(validation.exempted_modules, 1);
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert!(!analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule_id.0 == "ARCH-010"
+                && diagnostic
+                    .primary_location
+                    .as_ref()
+                    .is_some_and(|location| location.file == "scripts/tool.ts")
+        }));
+        assert!(!analysis.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "ARCH-011"));
+        assert!(matches!(
+            analysis.ownership.get(&ModuleId("scripts/tool.ts".into())),
+            Some(LayerOwnership::Exempt(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normal_analysis_enforces_the_aggregate_coverage_threshold() {
+        let root =
+            std::env::temp_dir().join(format!("wae-ownership-threshold-{}", std::process::id()));
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        fs::write(root.join("src/app/page.ts"), "export const page = true;").unwrap();
+        fs::write(root.join("src/orphan.ts"), "export const orphan = true;").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\narchitecture:\n  coverage:\n    minimum: 90\n  layers:\n    app:\n      patterns: ['src/app/**']\n",
+        )
+        .unwrap();
+
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let diagnostic = analysis
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.rule_id.0 == "ARCH-011")
+            .expect("coverage threshold diagnostic");
+        assert_eq!(diagnostic.metadata["actualPercent"], "50");
+        assert_eq!(diagnostic.metadata["minimumPercent"], "90");
+        assert_eq!(diagnostic.metadata["unassignedModules"], "1");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1143,6 +1199,61 @@ mod tests {
     }
 
     #[test]
+    fn rule_family_precision_and_recall_corpus_has_no_unexpected_diagnostics() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let cases: [(&str, &[&str]); 5] = [
+            ("basic", &[]),
+            ("circular", &["ARCH"]),
+            ("layers", &["ARCH"]),
+            ("policies", &["ARCH", "PACKAGE"]),
+            ("runtime", &["ARCH", "RUNTIME"]),
+        ];
+        let mut true_positives = HashMap::<&str, usize>::new();
+        let mut false_positives = HashMap::<String, usize>::new();
+        let mut false_negatives = HashMap::<&str, usize>::new();
+        for (fixture, expected_families) in cases {
+            let analysis =
+                Engine::default().analyze(AnalyzeRequest::new(fixtures.join(fixture))).unwrap();
+            let actual = analysis
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.rule_id.0.split('-').next().unwrap())
+                .collect::<HashSet<_>>();
+            for family in expected_families {
+                if actual.contains(family) {
+                    *true_positives.entry(family).or_default() += 1;
+                } else {
+                    *false_negatives.entry(family).or_default() += 1;
+                }
+            }
+            for family in actual {
+                if !expected_families.contains(&family) {
+                    *false_positives.entry(family.into()).or_default() += 1;
+                }
+            }
+        }
+
+        let clean = std::env::temp_dir().join(format!("wae-clean-corpus-{}", std::process::id()));
+        fs::create_dir_all(clean.join("src")).unwrap();
+        for index in 0..100 {
+            fs::write(
+                clean.join(format!("src/module-{index}.ts")),
+                format!("export const value{index} = {index};"),
+            )
+            .unwrap();
+        }
+        let clean_analysis = Engine::default().analyze(AnalyzeRequest::new(&clean)).unwrap();
+        assert!(clean_analysis.diagnostics.is_empty(), "{:?}", clean_analysis.diagnostics);
+        fs::remove_dir_all(clean).unwrap();
+
+        assert!(false_positives.is_empty(), "false positives by family: {false_positives:?}");
+        assert!(false_negatives.is_empty(), "false negatives by family: {false_negatives:?}");
+        assert_eq!(true_positives.get("ARCH"), Some(&4));
+        assert_eq!(true_positives.get("PACKAGE"), Some(&1));
+        assert_eq!(true_positives.get("RUNTIME"), Some(&1));
+    }
+
+    #[test]
     fn configured_roots_limit_discovery() {
         let root = std::env::temp_dir().join(format!("wae-roots-{}", std::process::id()));
         fs::create_dir_all(root.join("src")).unwrap();
@@ -1196,14 +1307,21 @@ mod tests {
         assert_eq!(warm.incremental.restored_modules, 1);
         assert!(warm.incremental.rule_snapshot_reused);
         assert_eq!(warm.diagnostics, cold.diagnostics);
-        let cache = root.join(".wae/cache/analysis-v2.json");
+        let cache = root.join(".wae/cache/analysis-v3/manifest.json");
         assert!(cache.is_file());
         let snapshot: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
-        assert_eq!(snapshot["schema_version"], 2);
-        assert!(snapshot["files"]["src/a.ts"]["resolved_dependencies"].is_array());
+        assert_eq!(snapshot["schema_version"], 3);
+        let shard_files = fs::read_dir(root.join(".wae/cache/analysis-v3/modules"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(shard_files.len(), 1);
+        let records: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&shard_files[0]).unwrap()).unwrap();
+        assert!(records["src/a.ts"]["resolved_dependencies"].is_array());
         assert!(snapshot["rules"]["diagnostics"].is_array());
-        let lock = root.join(".wae/cache/analysis-v2.lock");
+        let lock = root.join(".wae/cache/analysis-v3/manifest.lock");
         assert!(lock.is_file());
         fs::write(&lock, "stale lock file content from a killed process").unwrap();
         let mut stale: serde_json::Value =
@@ -1297,12 +1415,12 @@ mod tests {
         Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
         fs::rename(root.join("src/old.ts"), root.join("src/new.ts")).unwrap();
         Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
-        let cache: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join(".wae/cache/analysis-v2.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(cache["files"]["src/old.ts"].is_null());
-        assert!(cache["files"]["src/new.ts"].is_object());
+        let records = fs::read_dir(root.join(".wae/cache/analysis-v3/modules"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!records.contains("src/old.ts"));
+        assert!(records.contains("src/new.ts"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1325,7 +1443,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
-        let cache = fs::read_to_string(root.join(".wae/cache/analysis-v2.json")).unwrap();
+        let cache = fs::read_to_string(root.join(".wae/cache/analysis-v3/manifest.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&cache).unwrap();
         assert_eq!(parsed["parser_version"], PARSER_CACHE_VERSION);
         fs::remove_dir_all(root).unwrap();

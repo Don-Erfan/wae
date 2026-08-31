@@ -28,8 +28,14 @@ fn execute<P: ParserAdapter>(
 ) -> Result<Analysis, AnalysisError> {
     let total_started = std::time::Instant::now();
     let mut telemetry = PipelineTelemetry::default();
-    let AnalyzeRequest { root: requested_root, config_path, cache_enabled, overlays, cancellation } =
-        request;
+    let AnalyzeRequest {
+        root: requested_root,
+        config_path,
+        cache_enabled,
+        overlays,
+        known_files,
+        cancellation,
+    } = request;
     if cancellation.is_cancelled() {
         return Err(AnalysisError::Cancelled);
     }
@@ -48,7 +54,18 @@ fn execute<P: ParserAdapter>(
     }
     let discovery_started = std::time::Instant::now();
     let architecture = CompiledArchitectureModel::compile(&config)?;
-    let files = discover_modules(&root, &config)?;
+    let mut files = match known_files {
+        Some(files) => files,
+        None => discover_modules(&root, &config)?,
+    };
+    for module in overlays.keys() {
+        let path = root.join(module);
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files.dedup();
     let framework_registry = FrameworkRegistry::default();
     let framework_evidence = framework_project_evidence(&root)?;
     let framework_adapter = framework_registry.select(
@@ -87,6 +104,7 @@ fn execute<P: ParserAdapter>(
     let mut project = Project::default();
     let mut discovered_packages = HashMap::<PackageName, Package>::new();
     let mut layers = HashMap::new();
+    let mut ownership = ArchitectureOwnershipIndex::default();
     let mut features = HashMap::new();
     let mut feature_roots = HashMap::new();
     let live_cache_files = files.iter().map(|path| relative_path(&root, path)).collect();
@@ -104,6 +122,7 @@ fn execute<P: ParserAdapter>(
         }
         let relative = relative_path(&root, path);
         let id = ModuleId(relative.clone());
+        ownership.insert(id.clone(), architecture.ownership(&relative));
         let package = infer_package(&root, path, &workspace_packages, &default_package);
         discovered_packages.entry(package.name.clone()).or_insert_with(|| package.clone());
         let layer_name = architecture.layer(&relative)?;
@@ -461,6 +480,7 @@ fn execute<P: ParserAdapter>(
         runtime_graph: &runtime_graph,
         config: &config,
         module_layers: &layers,
+        ownership: &ownership,
         module_features: &features,
         module_feature_roots: &feature_roots,
         policies: &rule_policies,
@@ -500,6 +520,7 @@ fn execute<P: ParserAdapter>(
         schema_version: OUTPUT_SCHEMA_VERSION,
         project,
         graph,
+        ownership,
         diagnostics,
         incremental,
         timings,

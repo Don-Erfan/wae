@@ -7,7 +7,8 @@ fingerprint and suppression behavior with the CLI. The server supports:
 - live diagnostics for open unsaved JS/TS documents through content-hashed overlays (the source
   tree is never modified and stale cache entries cannot match different disk content);
 - architecture hover with package, layer, runtime and framework ownership;
-- rule-scoped quick fixes returning a real `WorkspaceEdit` with a documented suppression template;
+- a preferred refactoring suggestion plus a separate rule-scoped suppression command that requires
+  a concrete reason before applying a real `WorkspaceEdit` (placeholder suppressions are rejected);
 - configuration reload without restarting the editor.
 
 The server owns one long-lived `WorkspaceSession`. Document bursts are debounced for 75ms, each
@@ -31,8 +32,10 @@ JS/TS extensions. Set `WAE_LSP_PATH` when the binary is not on `PATH`.
 
 CI uses JDK 21 and Gradle 8.10.2 to run both `buildPlugin` and JetBrains `verifyPlugin`; a Kotlin API
 drift or incompatible plugin descriptor therefore blocks the aggregate readiness gate.
-CI also executes a framed stdio LSP test and packages installable VSIX/JetBrains ZIP artifacts;
-release checksums and the keyless Sigstore bundle cover both editor packages.
+CI also executes a framed stdio LSP test and a real VS Code Extension Host test that validates
+diagnostics, commands, and suppression `WorkspaceEdit` application. It packages installable
+VSIX/JetBrains ZIP artifacts; release checksums and the keyless Sigstore bundle cover both editor
+packages.
 
 Both clients treat `wae-lsp` as the single source of diagnostics; neither reimplements rules or
 resolution logic.

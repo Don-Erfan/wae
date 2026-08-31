@@ -213,17 +213,18 @@ either file supplies the nearest configured-project `baseUrl` and `paths` aliase
 
 ## Cache concurrency
 
-`analysis-v2.json` stores module-level parse results, normalized resolution records, graph edges
-and parser/resolver diagnostics. A resolution-environment fingerprint covers configuration,
+`analysis-v3/` stores module-level parse results in content-addressed JSON shards and keeps rule
+state in a small atomic manifest. A resolution-environment fingerprint covers configuration,
 workspace manifests, ts/jsconfig files and framework configs. Unchanged modules restore those
 fragments without parsing or resolving again; deleted targets and newly satisfiable unresolved
 candidates invalidate the owning module. A graph-identity snapshot also reuses rule diagnostics
 when the complete semantic graph is unchanged. Any graph change reevaluates rules for correctness.
 
 Analysis reads an unlocked cache snapshot. Saving takes an operating-system advisory lock only for
-the short reload, dirty-set merge, prune, atomic-write and replace transaction. Only entries
-produced by the current analysis are merged, so a stale process cannot overwrite a newer module
-entry. Unix rename and Windows `MoveFileExW` provide platform-native atomic replacement.
+the short dirty-shard merge, prune, manifest update and atomic replace transaction. A single-module
+edit no longer serializes one project-wide JSON payload. Only entries produced by the current
+analysis are merged, so a stale process cannot overwrite a newer module entry. Unix rename and
+Windows `MoveFileExW` provide platform-native atomic replacement.
 The `.lock` path is a persistent coordination inode, not an ownership marker: its mere existence is
 harmless, and the OS releases ownership automatically after a crash. Payloads are also invalidated
 by parser behavior version.

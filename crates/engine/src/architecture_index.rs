@@ -1,6 +1,6 @@
 use globset::GlobSet;
 use wae_config::Config;
-use wae_core::domain::{FeatureId, Package};
+use wae_core::domain::{FeatureId, LayerId, LayerOwnership, Package};
 
 use crate::AnalysisError;
 use crate::discovery::build_globs;
@@ -8,6 +8,7 @@ use crate::discovery::build_globs;
 pub(crate) struct CompiledArchitectureModel {
     layers: Vec<(String, GlobSet)>,
     feature_roots: Vec<String>,
+    allow_unassigned: GlobSet,
 }
 
 impl CompiledArchitectureModel {
@@ -27,6 +28,7 @@ impl CompiledArchitectureModel {
                 .into_iter()
                 .map(|root| root.replace('\\', "/").trim_matches('/').to_string())
                 .collect(),
+            allow_unassigned: build_globs(&config.architecture.coverage.allow_unassigned)?,
         })
     }
 
@@ -51,6 +53,18 @@ impl CompiledArchitectureModel {
             .filter(|(_, matcher)| matcher.is_match(path))
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    pub(crate) fn ownership(&self, path: &str) -> LayerOwnership {
+        let layers = self.matching_layers(path).into_iter().map(LayerId).collect::<Vec<_>>();
+        match layers.as_slice() {
+            [layer] => LayerOwnership::Assigned(layer.clone()),
+            [] if self.allow_unassigned.is_match(path) => {
+                LayerOwnership::Exempt("architecture.coverage.allow_unassigned".into())
+            }
+            [] => LayerOwnership::Unassigned,
+            _ => LayerOwnership::Overlap(layers),
+        }
     }
 
     pub(crate) fn feature(

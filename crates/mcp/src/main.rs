@@ -14,6 +14,13 @@ fn main() {
                 policy = policy.with_allowed_root(path.into());
             }
             "--allow-any-root" => policy = policy.allow_any_root(),
+            "--max-request-bytes" => {
+                let Some(bytes) = arguments.next().and_then(|value| value.parse().ok()) else {
+                    eprintln!("wae-mcp: --max-request-bytes requires a positive integer");
+                    std::process::exit(2);
+                };
+                policy = policy.with_max_request_bytes(bytes);
+            }
             _ => {
                 eprintln!("wae-mcp: unknown option `{argument}`");
                 std::process::exit(2);
@@ -27,9 +34,7 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let response = serde_json::from_str(&line)
-            .ok()
-            .and_then(|message| wae_mcp::handle_message_with_policy(message, &root, &policy));
+        let response = wae_mcp::handle_line(&line, &root, &policy);
         if let Some(response) = response {
             if serde_json::to_writer(&mut stdout, &response).is_err()
                 || writeln!(stdout).is_err()

@@ -694,6 +694,7 @@ mod tests {
         let analysis = Analysis {
             schema_version: 1,
             graph: Default::default(),
+            ownership: Default::default(),
             project,
             diagnostics: Vec::new(),
             incremental: Default::default(),

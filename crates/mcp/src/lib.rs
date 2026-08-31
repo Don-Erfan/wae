@@ -8,11 +8,16 @@ use wae_engine::{AnalyzeRequest, Engine, FailurePolicy};
 pub struct ServerPolicy {
     allowed_roots: Vec<PathBuf>,
     allow_any_root: bool,
+    max_request_bytes: usize,
 }
 
 impl ServerPolicy {
     pub fn confined(default_root: &Path) -> Self {
-        Self { allowed_roots: vec![default_root.to_path_buf()], allow_any_root: false }
+        Self {
+            allowed_roots: vec![default_root.to_path_buf()],
+            allow_any_root: false,
+            max_request_bytes: 1024 * 1024,
+        }
     }
 
     pub fn with_allowed_root(mut self, root: PathBuf) -> Self {
@@ -23,6 +28,21 @@ impl ServerPolicy {
     pub fn allow_any_root(mut self) -> Self {
         self.allow_any_root = true;
         self
+    }
+
+    pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes.max(1);
+        self
+    }
+}
+
+pub fn handle_line(line: &str, default_root: &Path, policy: &ServerPolicy) -> Option<Value> {
+    if line.len() > policy.max_request_bytes {
+        return Some(error(Value::Null, -32001, "request exceeds configured byte quota".into()));
+    }
+    match serde_json::from_str(line) {
+        Ok(message) => handle_message_with_policy(message, default_root, policy),
+        Err(parse_error) => Some(error(Value::Null, -32700, format!("parse error: {parse_error}"))),
     }
 }
 
@@ -36,6 +56,9 @@ pub fn handle_message_with_policy(
     policy: &ServerPolicy,
 ) -> Option<Value> {
     let id = message.get("id").cloned()?;
+    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(error(id, -32600, "invalid JSON-RPC version".into()));
+    }
     let method = message.get("method").and_then(Value::as_str)?;
     let result = match method {
         "initialize" => Ok(json!({
@@ -205,11 +228,13 @@ fn execute_tool(
                 .modules
                 .iter()
                 .map(|module| {
+                    let ownership = analysis.ownership.get(&module.id);
                     json!({
                         "id": module.id.0,
                         "package": module.package.0,
                         "kind": format!("{:?}", module.kind),
                         "layer": module.layer.as_ref().map(|layer| &layer.0),
+                        "ownership": ownership,
                         "runtime": format!("{:?}", module.runtime),
                         "framework": module.framework_metadata
                     })
@@ -310,6 +335,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn malformed_oversized_and_wrong_version_requests_are_bounded_protocol_errors() {
+        let root = std::env::current_dir().unwrap();
+        let policy = ServerPolicy::confined(&root).with_max_request_bytes(32);
+        assert_eq!(handle_line("{", &root, &policy).unwrap()["error"]["code"], -32700);
+        assert_eq!(handle_line(&"x".repeat(33), &root, &policy).unwrap()["error"]["code"], -32001);
+        let wrong = handle_message_with_policy(
+            json!({"jsonrpc":"1.0","id":7,"method":"ping"}),
+            &root,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], -32600);
     }
 
     #[test]

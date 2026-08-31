@@ -16,7 +16,7 @@ pub mod domain {
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct PackageName(pub String);
 
-    #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
     pub struct ModuleId(pub String);
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -160,6 +160,72 @@ pub mod domain {
     /// Open layer identity; configured layer names remain first-class in the IR.
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct LayerId(pub String);
+
+    /// The canonical ownership decision for a discovered source module. All architecture
+    /// consumers use this value instead of independently re-evaluating layer and exemption globs.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "status", content = "value", rename_all = "camelCase")]
+    pub enum LayerOwnership {
+        Assigned(LayerId),
+        Exempt(String),
+        Unassigned,
+        Overlap(Vec<LayerId>),
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ArchitectureOwnershipIndex {
+        entries: BTreeMap<ModuleId, LayerOwnership>,
+    }
+
+    impl ArchitectureOwnershipIndex {
+        pub fn insert(&mut self, module: ModuleId, ownership: LayerOwnership) {
+            self.entries.insert(module, ownership);
+        }
+
+        pub fn get(&self, module: &ModuleId) -> Option<&LayerOwnership> {
+            self.entries.get(module)
+        }
+
+        pub fn iter(&self) -> impl Iterator<Item = (&ModuleId, &LayerOwnership)> {
+            self.entries.iter()
+        }
+
+        pub fn source_modules(&self) -> usize {
+            self.entries.len()
+        }
+
+        pub fn assigned_modules(&self) -> usize {
+            self.entries
+                .values()
+                .filter(|ownership| matches!(ownership, LayerOwnership::Assigned(_)))
+                .count()
+        }
+
+        pub fn exempted_modules(&self) -> usize {
+            self.entries
+                .values()
+                .filter(|ownership| matches!(ownership, LayerOwnership::Exempt(_)))
+                .count()
+        }
+
+        pub fn unassigned_modules(&self) -> Vec<&ModuleId> {
+            self.entries
+                .iter()
+                .filter_map(|(module, ownership)| {
+                    matches!(ownership, LayerOwnership::Unassigned).then_some(module)
+                })
+                .collect()
+        }
+
+        pub fn coverage_percent(&self) -> u8 {
+            let enforceable = self.source_modules().saturating_sub(self.exempted_modules());
+            self.assigned_modules()
+                .saturating_mul(100)
+                .checked_div(enforceable)
+                .unwrap_or(100)
+                .min(100) as u8
+        }
+    }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct LayerPolicy {
@@ -657,6 +723,13 @@ pub mod rule_registry {
             configurable: true,
         },
         RuleDescriptor {
+            id: "ARCH-011",
+            title: "Architecture coverage threshold",
+            description: "Enforces the configured aggregate minimum for architecture layer ownership.",
+            category: "architecture",
+            configurable: true,
+        },
+        RuleDescriptor {
             id: "PACKAGE-001",
             title: "Package cycle",
             description: "Detects circular dependencies between workspace packages.",
@@ -775,7 +848,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.21"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.22"]);
     }
 
     #[test]

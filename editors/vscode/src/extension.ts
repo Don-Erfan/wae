@@ -26,11 +26,61 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("wae.reload", async () => {
       if (client) await client.restart(); else await start();
     }),
-    vscode.commands.registerCommand("wae.showSuggestion", (suggestion: string) => {
-      void vscode.window.showInformationMessage(suggestion);
-    })
+    vscode.commands.registerCommand("wae.showSuggestion", (payload: string | { suggestion?: string }) => {
+      const suggestion = typeof payload === "string" ? payload : payload?.suggestion;
+      void vscode.window.showInformationMessage(suggestion ?? "No WAE suggestion was provided.");
+    }),
+    vscode.commands.registerCommand("wae.suppressWithReason", addDocumentedSuppression)
   );
   await start();
+}
+
+interface SuppressionPayload {
+  uri: string;
+  line: number;
+  ruleId: string;
+  reason?: string;
+}
+
+async function addDocumentedSuppression(payload: SuppressionPayload): Promise<boolean> {
+  if (!payload?.uri || !payload.ruleId || !Number.isInteger(payload.line) || payload.line < 0) {
+    throw new Error("WAE suppression command received an invalid location");
+  }
+  const suppliedReason = payload.reason?.trim();
+  const reason = suppliedReason || await vscode.window.showInputBox({
+    prompt: `Why is suppressing ${payload.ruleId} safe?`,
+    placeHolder: "Reference an architecture decision, migration ticket, or concrete safety reason",
+    ignoreFocusOut: true,
+    validateInput: validateSuppressionReason
+  });
+  if (reason === undefined) return false;
+  const validationError = validateSuppressionReason(reason);
+  if (validationError) {
+    void vscode.window.showErrorMessage(validationError);
+    return false;
+  }
+  const uri = vscode.Uri.parse(payload.uri);
+  const document = await vscode.workspace.openTextDocument(uri);
+  if (payload.line >= document.lineCount) {
+    throw new Error(`WAE suppression line ${payload.line} is outside ${uri.fsPath}`);
+  }
+  const indentation = document.lineAt(payload.line).text.match(/^\s*/)?.[0] ?? "";
+  const edit = new vscode.WorkspaceEdit();
+  edit.insert(uri, new vscode.Position(payload.line, 0),
+    `${indentation}// wae-ignore ${payload.ruleId} -- ${reason.trim()}\n`);
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) void vscode.window.showErrorMessage("VS Code could not apply the WAE suppression edit.");
+  return applied;
+}
+
+function validateSuppressionReason(value: string): string | undefined {
+  const reason = value.trim();
+  if (reason.length < 8) return "Enter a specific reason of at least 8 characters.";
+  if (/\r|\n/.test(reason)) return "The reason must be a single line.";
+  if (/^(todo|fixme|reason|explain why|temporary|n\/a)$/i.test(reason)) {
+    return "Replace the placeholder with a concrete architecture or migration reason.";
+  }
+  return undefined;
 }
 
 function terminalCommand(command: string): void {

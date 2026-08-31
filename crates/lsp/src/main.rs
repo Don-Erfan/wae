@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Sender, bounded, unbounded};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use serde_json::{Value, json};
 use url::Url;
@@ -22,9 +23,9 @@ fn run() -> Result<(), String> {
     let (initialize_id, initialize_params) = connection.initialize_start().map_err(err)?;
     let root = workspace_root(&initialize_params)?;
     connection.initialize_finish(initialize_id, capabilities()).map_err(err)?;
-    let mut state = ServerState::new(root);
     let (analysis_sender, analysis_receiver) = unbounded();
-    state.schedule_analysis(analysis_sender.clone());
+    let mut state = ServerState::new(root, analysis_sender);
+    state.schedule_analysis(true);
 
     loop {
         crossbeam_channel::select! {
@@ -38,7 +39,7 @@ fn run() -> Result<(), String> {
                         handle_request(&connection, &state, request)?;
                     }
                     Message::Notification(notification) => {
-                        state.handle_notification(notification, analysis_sender.clone());
+                        state.handle_notification(notification);
                     }
                     Message::Response(_) => {}
                 }
@@ -58,6 +59,7 @@ struct ServerState {
     analysis: Option<Analysis>,
     published: HashSet<String>,
     documents: BTreeMap<String, String>,
+    scheduler: AnalysisScheduler,
 }
 
 struct BackgroundAnalysis {
@@ -65,23 +67,76 @@ struct BackgroundAnalysis {
     result: Result<Analysis, AnalysisError>,
 }
 
+struct PendingAnalysis {
+    ticket: AnalysisTicket,
+    overlays: BTreeMap<String, String>,
+    force: bool,
+}
+
+/// A single bounded worker coalesces typing bursts into the latest immutable overlay snapshot.
+/// New generations cancel in-flight engine work; no notification creates a new sleeping thread.
+struct AnalysisScheduler {
+    session: Arc<WorkspaceSession>,
+    pending: Arc<Mutex<Option<PendingAnalysis>>>,
+    wake: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AnalysisScheduler {
+    fn new(session: Arc<WorkspaceSession>, results: Sender<BackgroundAnalysis>) -> Self {
+        let pending = Arc::new(Mutex::new(None::<PendingAnalysis>));
+        let worker_pending = Arc::clone(&pending);
+        let worker_session = Arc::clone(&session);
+        let (wake, notifications) = bounded::<()>(1);
+        let worker = std::thread::spawn(move || {
+            while notifications.recv().is_ok() {
+                while notifications.recv_timeout(Duration::from_millis(75)).is_ok() {}
+                let job =
+                    worker_pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+                let Some(job) = job else { continue };
+                let result = worker_session.analyze_changes(&job.ticket, &job.overlays, job.force);
+                let _ = results.send(BackgroundAnalysis { ticket: job.ticket, result });
+            }
+        });
+        Self { session, pending, wake: Some(wake), worker: Some(worker) }
+    }
+
+    fn schedule(&self, ticket: AnalysisTicket, overlays: BTreeMap<String, String>, force: bool) {
+        *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(PendingAnalysis { ticket, overlays, force });
+        if let Some(wake) = &self.wake {
+            let _ = wake.try_send(());
+        }
+    }
+}
+
+impl Drop for AnalysisScheduler {
+    fn drop(&mut self) {
+        self.session.cancel_active();
+        self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        self.wake.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl ServerState {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, results: Sender<BackgroundAnalysis>) -> Self {
+        let session = Arc::new(WorkspaceSession::new(&root));
+        let scheduler = AnalysisScheduler::new(Arc::clone(&session), results);
         Self {
-            session: Arc::new(WorkspaceSession::new(&root)),
+            session,
             root,
             analysis: None,
             published: HashSet::new(),
             documents: BTreeMap::new(),
+            scheduler,
         }
     }
 
-    fn handle_notification(
-        &mut self,
-        notification: Notification,
-        sender: Sender<BackgroundAnalysis>,
-    ) {
-        let should_analyze = match notification.method.as_str() {
+    fn handle_notification(&mut self, notification: Notification) {
+        let analysis_force = match notification.method.as_str() {
             "textDocument/didOpen" => {
                 if let (Some(uri), Some(text)) = (
                     notification.params.pointer("/textDocument/uri").and_then(Value::as_str),
@@ -91,7 +146,7 @@ impl ServerState {
                         self.documents.insert(path, text.into());
                     }
                 }
-                true
+                Some(false)
             }
             "textDocument/didChange" => {
                 if let (Some(uri), Some(text)) = (
@@ -108,7 +163,7 @@ impl ServerState {
                         self.documents.insert(path, text.into());
                     }
                 }
-                true
+                Some(false)
             }
             "textDocument/didClose" => {
                 if let Some(uri) =
@@ -118,31 +173,21 @@ impl ServerState {
                         self.documents.remove(&path);
                     }
                 }
-                true
+                Some(false)
             }
             "textDocument/didSave"
             | "workspace/didChangeConfiguration"
-            | "workspace/didChangeWatchedFiles" => true,
-            _ => false,
+            | "workspace/didChangeWatchedFiles" => Some(true),
+            _ => None,
         };
-        if should_analyze {
-            self.schedule_analysis(sender);
+        if let Some(force) = analysis_force {
+            self.schedule_analysis(force);
         }
     }
 
-    fn schedule_analysis(&self, sender: Sender<BackgroundAnalysis>) {
+    fn schedule_analysis(&self, force: bool) {
         let ticket = self.session.begin_analysis();
-        let worker_ticket = ticket.clone();
-        let session = Arc::clone(&self.session);
-        let overlays = self.documents.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(75));
-            if !session.is_current(&worker_ticket) {
-                return;
-            }
-            let result = session.analyze(&worker_ticket, &overlays);
-            let _ = sender.send(BackgroundAnalysis { ticket, result });
-        });
+        self.scheduler.schedule(ticket, self.documents.clone(), force);
     }
 
     fn publish_result(
@@ -256,23 +301,32 @@ fn code_actions(params: &Value) -> Value {
             let suggestion = data.get("suggestion")?.as_str()?;
             let rule = data.get("ruleId")?.as_str()?;
             let line = diagnostic.pointer("/range/start/line").and_then(Value::as_u64)?;
-            Some(json!({
-                "title": format!("Suppress {rule} with a documented reason"),
-                "kind": "quickfix",
-                "diagnostics": [diagnostic],
-                "isPreferred": false,
-                "edit": { "changes": {
-                    (uri): [{
-                        "range": {
-                            "start": { "line": line, "character": 0 },
-                            "end": { "line": line, "character": 0 }
-                        },
-                        "newText": format!("// wae-ignore {rule} -- explain why this exception is safe\n")
-                    }]
-                }},
-                "data": { "suggestion": suggestion }
-            }))
+            Some(vec![
+                json!({
+                    "title": format!("Review suggested fix for {rule}"),
+                    "kind": "quickfix",
+                    "diagnostics": [diagnostic],
+                    "isPreferred": true,
+                    "command": {
+                        "title": "Show WAE architecture suggestion",
+                        "command": "wae.showSuggestion",
+                        "arguments": [{ "uri": uri, "line": line, "ruleId": rule, "suggestion": suggestion }]
+                    }
+                }),
+                json!({
+                    "title": format!("Suppress {rule} after documenting a reason"),
+                    "kind": "quickfix",
+                    "diagnostics": [diagnostic],
+                    "isPreferred": false,
+                    "command": {
+                        "title": "Add documented WAE suppression",
+                        "command": "wae.suppressWithReason",
+                        "arguments": [{ "uri": uri, "line": line, "ruleId": rule }]
+                    }
+                }),
+            ])
         })
+        .flatten()
         .collect::<Vec<_>>();
     Value::Array(actions)
 }
@@ -312,7 +366,7 @@ fn capabilities() -> Value {
             "textDocumentSync": { "openClose": true, "change": 1, "save": { "includeText": false } },
             "hoverProvider": true,
             "codeActionProvider": true,
-            "executeCommandProvider": { "commands": ["wae.showSuggestion", "wae.reload"] },
+            "executeCommandProvider": { "commands": ["wae.showSuggestion", "wae.suppressWithReason", "wae.reload"] },
             "workspace": { "workspaceFolders": { "supported": true, "changeNotifications": true } }
         },
         "serverInfo": { "name": "wae-lsp", "version": env!("CARGO_PKG_VERSION") }
@@ -371,12 +425,11 @@ mod tests {
             "textDocument": { "uri": "file:///project/src/a.ts" },
             "context": { "diagnostics": [value] }
         }));
-        assert_eq!(actions.as_array().unwrap().len(), 1);
-        assert_eq!(
-            actions[0]["edit"]["changes"]["file:///project/src/a.ts"][0]["range"]["start"]["line"],
-            2
-        );
-        assert!(actions[0]["command"].is_null());
+        assert_eq!(actions.as_array().unwrap().len(), 2);
+        assert_eq!(actions[0]["command"]["command"], "wae.showSuggestion");
+        assert!(actions[0]["edit"].is_null());
+        assert_eq!(actions[1]["command"]["command"], "wae.suppressWithReason");
+        assert!(actions[1]["edit"].is_null());
     }
 
     #[test]

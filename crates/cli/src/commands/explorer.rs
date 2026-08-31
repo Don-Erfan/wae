@@ -21,11 +21,13 @@ pub(super) fn write(root: &Path, output: &Path, analysis: &Analysis) -> CliOutpu
         .modules
         .iter()
         .map(|module| {
+            let ownership = analysis.ownership.get(&module.id);
             json!({
                 "id": module.id.0,
                 "package": module.package.0,
                 "kind": format!("{:?}", module.kind),
                 "layer": module.layer.as_ref().map(|layer| &layer.0),
+                "ownership": ownership,
                 "runtime": format!("{:?}", module.runtime),
                 "framework": module.framework_metadata.adapter_id,
                 "frameworkAttributes": module.framework_metadata.attributes,
@@ -111,6 +113,7 @@ mod tests {
         let analysis = Analysis {
             schema_version: 1,
             graph: Default::default(),
+            ownership: Default::default(),
             project,
             diagnostics: Vec::new(),
             incremental: Default::default(),

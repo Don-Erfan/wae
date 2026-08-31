@@ -43,6 +43,7 @@ impl Default for Config {
             "ARCH-008",
             "ARCH-009",
             "ARCH-010",
+            "ARCH-011",
             "PACKAGE-001",
             "PACKAGE-002",
             "PACKAGE-003",
@@ -694,7 +695,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(CONFIG_FILE), "version: 1\nrules:\n  ARCH-001: warning\n").unwrap();
         let config = Config::load(&root).unwrap();
-        assert_eq!(config.rules.len(), 20);
+        assert_eq!(config.rules.len(), 21);
         assert_eq!(config.rules["ARCH-001"].severity(), Some(Severity::Warning));
         assert_eq!(config.rules["ARCH-005"].severity(), Some(Severity::Error));
         assert!(config.configured);

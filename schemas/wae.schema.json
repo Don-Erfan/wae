@@ -20,6 +20,7 @@
         "ARCH-005": { "$ref": "#/$defs/rule" }, "ARCH-006": { "$ref": "#/$defs/rule" },
         "ARCH-007": { "$ref": "#/$defs/rule" }, "ARCH-008": { "$ref": "#/$defs/rule" },
         "ARCH-009": { "$ref": "#/$defs/rule" }, "ARCH-010": { "$ref": "#/$defs/rule" },
+        "ARCH-011": { "$ref": "#/$defs/rule" },
         "PACKAGE-001": { "$ref": "#/$defs/rule" }, "PACKAGE-002": { "$ref": "#/$defs/rule" },
         "PACKAGE-003": { "$ref": "#/$defs/rule" }, "PACKAGE-004": { "$ref": "#/$defs/rule" },
         "RUNTIME-001": { "$ref": "#/$defs/rule" }, "RUNTIME-002": { "$ref": "#/$defs/rule" },

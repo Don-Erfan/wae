@@ -38,7 +38,15 @@ at least one explicit entrypoint to avoid guessing framework roots.
 ## ARCH-010
 
 When layers are configured, reports every discovered source module not owned by exactly one layer.
-Multiple ownership remains a configuration error; zero ownership is this diagnostic.
+Multiple ownership remains a configuration error; zero ownership is this diagnostic. Paths matched
+by `architecture.coverage.allow_unassigned` are explicitly exempt and never reported by this rule.
+
+## ARCH-011
+
+Enforces `architecture.coverage.minimum` during every normal analysis. This aggregate rule reports
+the actual and required percentages plus assigned, exempt and unassigned counts. Keep `ARCH-010`
+enabled for strict per-module ownership, or disable it when a threshold-only adoption policy is
+intentional.
 
 ## PACKAGE-001
 

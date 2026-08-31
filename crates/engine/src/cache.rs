@@ -36,6 +36,15 @@ struct CacheFile {
     rules: Option<CachedRuleAnalysis>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+struct CacheManifest {
+    schema_version: u32,
+    #[serde(default)]
+    parser_version: String,
+    #[serde(default)]
+    rules: Option<CachedRuleAnalysis>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedRuleAnalysis {
     graph_hash: u64,
@@ -63,7 +72,7 @@ impl AnalysisCache {
         config: &Config,
         live_files: BTreeSet<String>,
     ) -> Result<Self, AnalysisError> {
-        let path = root.join(&config.cache.directory).join("analysis-v2.json");
+        let path = root.join(&config.cache.directory).join("analysis-v3/manifest.json");
         if !config.cache.enabled {
             return Ok(Self {
                 enabled: false,
@@ -161,31 +170,59 @@ impl AnalysisCache {
             return Ok(());
         }
         // Parsing and graph analysis happen without a global writer lock. The short transaction
-        // below locks, reloads the newest snapshot, merges this analysis, prunes deleted files and
-        // atomically replaces the cache.
+        // below rewrites only affected content-addressed shards and the small rule manifest.
         let _lock = acquire_advisory_lock(&self.path.with_extension("lock"))?;
-        let mut merged = read_cache(&self.path);
-        merged.files.retain(|module, _| self.live_files.contains(module));
-        // Only publish entries produced by this analysis. Replaying the entire snapshot would
-        // overwrite newer entries written after this process loaded the cache.
-        for (module, cached) in &self.dirty_files {
-            if self.live_files.contains(module) {
-                merged.files.insert(module.clone(), cached.clone());
+        let mut affected_shards =
+            self.dirty_files.keys().map(|module| shard_id(module)).collect::<BTreeSet<_>>();
+        affected_shards.extend(
+            self.file
+                .files
+                .keys()
+                .filter(|module| !self.live_files.contains(*module))
+                .map(|module| shard_id(module)),
+        );
+        for shard in affected_shards {
+            let path = shard_path(&self.path, shard);
+            let mut records = read_shard(&path);
+            records.retain(|module, _| self.live_files.contains(module));
+            for (module, cached) in
+                self.dirty_files.iter().filter(|(module, _)| shard_id(module) == shard)
+            {
+                if self.live_files.contains(module) {
+                    records.insert(module.clone(), cached.clone());
+                }
             }
+            write_json_atomic(&path, &records)?;
         }
+        let mut manifest = read_manifest(&self.path).unwrap_or(CacheManifest {
+            schema_version: 3,
+            parser_version: PARSER_CACHE_VERSION.into(),
+            rules: self.file.rules.clone(),
+        });
         if self.dirty_rules.is_some() {
-            merged.rules.clone_from(&self.dirty_rules);
+            manifest.rules.clone_from(&self.dirty_rules);
         }
-        static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
-        let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.path.with_extension(format!("tmp-{}-{write_id}", std::process::id()));
-        let contents = serde_json::to_vec(&merged)
-            .map_err(|error| AnalysisError::Internal(error.to_string()))?;
-        fs::write(&temporary, contents)
-            .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
-        replace_file(&temporary, &self.path)?;
+        manifest.schema_version = 3;
+        manifest.parser_version = PARSER_CACHE_VERSION.into();
+        write_json_atomic(&self.path, &manifest)?;
         Ok(())
     }
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), AnalysisError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AnalysisError::Project("cache path has no parent directory".into()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| AnalysisError::Project(format!("cannot create cache shard: {error}")))?;
+    static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
+    let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("tmp-{}-{write_id}", std::process::id()));
+    let contents =
+        serde_json::to_vec(value).map_err(|error| AnalysisError::Internal(error.to_string()))?;
+    fs::write(&temporary, contents)
+        .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
+    replace_file(&temporary, path)
 }
 
 #[cfg(not(windows))]
@@ -236,16 +273,54 @@ fn unresolved_candidate_became_live(
 }
 
 fn read_cache(path: &Path) -> CacheFile {
+    let Some(manifest) = read_manifest(path) else { return fresh_cache() };
+    let mut files = BTreeMap::new();
+    if let Some(directory) = path.parent().map(|parent| parent.join("modules")) {
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten().filter(|entry| {
+                entry.path().extension().is_some_and(|extension| extension == "json")
+            }) {
+                files.extend(read_shard(&entry.path()));
+            }
+        }
+    }
+    CacheFile {
+        schema_version: manifest.schema_version,
+        parser_version: manifest.parser_version,
+        files,
+        rules: manifest.rules,
+    }
+}
+
+fn read_manifest(path: &Path) -> Option<CacheManifest> {
     fs::read_to_string(path)
         .ok()
-        .and_then(|source| serde_json::from_str::<CacheFile>(&source).ok())
-        .filter(|cache| cache.schema_version == 2 && cache.parser_version == PARSER_CACHE_VERSION)
-        .unwrap_or_else(fresh_cache)
+        .and_then(|source| serde_json::from_str::<CacheManifest>(&source).ok())
+        .filter(|cache| cache.schema_version == 3 && cache.parser_version == PARSER_CACHE_VERSION)
+}
+
+fn read_shard(path: &Path) -> BTreeMap<String, CachedModuleAnalysis> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|source| serde_json::from_str(&source).ok())
+        .unwrap_or_default()
+}
+
+fn shard_id(module: &str) -> u8 {
+    (stable_hash(module.as_bytes()) & 0xff) as u8
+}
+
+fn shard_path(manifest: &Path, shard: u8) -> PathBuf {
+    manifest
+        .parent()
+        .expect("cache manifest parent")
+        .join("modules")
+        .join(format!("{shard:02x}.json"))
 }
 
 fn fresh_cache() -> CacheFile {
     CacheFile {
-        schema_version: 2,
+        schema_version: 3,
         parser_version: PARSER_CACHE_VERSION.into(),
         ..CacheFile::default()
     }
@@ -344,7 +419,7 @@ mod tests {
         first.save().unwrap();
         stale.save().unwrap();
 
-        let cache = read_cache(&root.join(".wae/cache/analysis-v2.json"));
+        let cache = read_cache(&root.join(".wae/cache/analysis-v3/manifest.json"));
         assert_eq!(cache.files.len(), 2);
         assert_eq!(cache.files["src/a.ts"].hash, 1);
         assert_eq!(cache.files["src/b.ts"].hash, 2);

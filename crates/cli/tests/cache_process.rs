@@ -20,8 +20,10 @@ fn independent_processes_serialize_cache_read_merge_write() {
     assert!(first.wait().unwrap().success());
     assert!(second.wait().unwrap().success());
 
-    let cache = fs::read_to_string(root.join(".wae/cache/analysis-v2.json")).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&cache).unwrap();
-    assert!(parsed["files"]["src/a.ts"].is_object());
+    let records = fs::read_dir(root.join(".wae/cache/analysis-v3/modules"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(records.contains("src/a.ts"));
     fs::remove_dir_all(root).unwrap();
 }

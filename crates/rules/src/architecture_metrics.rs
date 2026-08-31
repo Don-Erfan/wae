@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use globset::{GlobBuilder, GlobMatcher};
-use wae_core::domain::{Diagnostic, ModuleId, ModuleKind, SourceLocation};
+use wae_core::domain::{Diagnostic, LayerOwnership, ModuleId, ModuleKind, SourceLocation};
 use wae_core::rule_registry::{self, RuleDescriptor};
 
 use crate::{DiagnosticSink, Rule, RuleContext};
@@ -167,15 +167,70 @@ impl Rule for UnassignedLayerRule {
             return Ok(());
         }
         for module in source_modules(context) {
-            if !context.module_layers.contains_key(&module.id) {
-                sink.emit(module_diagnostic(
+            if matches!(context.ownership.get(&module.id), Some(LayerOwnership::Unassigned)) {
+                let mut diagnostic = module_diagnostic(
                     "ARCH-010",
                     &module.id,
                     "Source module is not assigned to any architecture layer".into(),
-                    "Anchor the module under a configured layer pattern or explicitly exclude it.",
-                ));
+                    "Anchor the module under a configured layer pattern or explicitly exempt it in architecture.coverage.allow_unassigned.",
+                );
+                diagnostic.metadata.insert("ownership".into(), "unassigned".into());
+                sink.emit(diagnostic);
             }
         }
+        Ok(())
+    }
+}
+
+pub struct ArchitectureCoverageRule;
+impl Rule for ArchitectureCoverageRule {
+    fn metadata(&self) -> &'static RuleDescriptor {
+        rule_registry::descriptor("ARCH-011").expect("registered built-in rule")
+    }
+
+    fn evaluate(
+        &self,
+        context: &RuleContext<'_>,
+        sink: &mut dyn DiagnosticSink,
+    ) -> Result<(), String> {
+        let Some(minimum) = context.config.architecture.coverage.minimum else {
+            return Ok(());
+        };
+        let actual = context.ownership.coverage_percent();
+        if actual >= minimum {
+            return Ok(());
+        }
+        let unassigned = context.ownership.unassigned_modules();
+        let mut diagnostic = Diagnostic::new(
+            "ARCH-011",
+            format!(
+                "Architecture layer coverage {actual}% is below the configured minimum {minimum}%"
+            ),
+        );
+        diagnostic.suggestion = Some(
+            "Assign unowned modules to layers, lower the intentional threshold, or explicitly exempt support paths."
+                .into(),
+        );
+        diagnostic.primary_location = unassigned.first().map(|module| SourceLocation {
+            file: module.0.clone(),
+            line: 1,
+            column: 1,
+        });
+        diagnostic.dependency_path = unassigned.into_iter().cloned().collect();
+        diagnostic.metadata.insert("coverageStatus".into(), "belowMinimum".into());
+        diagnostic.metadata.insert("actualPercent".into(), actual.to_string());
+        diagnostic.metadata.insert("minimumPercent".into(), minimum.to_string());
+        diagnostic
+            .metadata
+            .insert("assignedModules".into(), context.ownership.assigned_modules().to_string());
+        diagnostic
+            .metadata
+            .insert("exemptedModules".into(), context.ownership.exempted_modules().to_string());
+        diagnostic.metadata.insert(
+            "unassignedModules".into(),
+            context.ownership.unassigned_modules().len().to_string(),
+        );
+        sink.emit(diagnostic);
         Ok(())
     }
 }

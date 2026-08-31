@@ -229,6 +229,18 @@ mod tests {
     }
 
     #[test]
+    fn next_detection_is_stable_across_supported_manifest_versions() {
+        let adapter = NextJsAdapter;
+        for version in ["13.5.11", "14.2.35", "15.2.6", "16.0.0"] {
+            let evidence = ProjectEvidence {
+                package_manifest: Some(serde_json::json!({"dependencies":{"next":version}})),
+                config_files: Vec::new(),
+            };
+            assert_eq!(adapter.detection_score(&evidence), 100, "Next.js {version}");
+        }
+    }
+
+    #[test]
     fn classifies_app_router_client_server_route_action_and_middleware_modules() {
         let adapter = NextJsAdapter;
         let client_semantics =

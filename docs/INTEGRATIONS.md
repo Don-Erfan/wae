@@ -35,9 +35,16 @@ After installing the npm package, configure an MCP client to run the project-loc
 The server is confined to its startup directory by default. Add another trusted tree with
 `--allow-root /absolute/path`, or use the intentionally explicit `--allow-any-root` only in an
 already sandboxed environment. Canonicalization prevents `..` and symlink escapes.
+Requests are limited to 1 MiB by default; local deployments can lower the bounded stdio quota with
+`--max-request-bytes N`. WAE intentionally exposes no network transport, so authentication belongs
+to an explicitly configured remote proxy rather than being silently omitted from a public socket.
 
 Tool execution failures are returned as MCP tool results with `isError: true`; malformed or unknown
 JSON-RPC methods use protocol errors. The server writes only protocol messages to stdout.
+
+CI also launches a real VS Code Extension Host against the built `wae-lsp`, opens a TypeScript
+workspace and waits for an `ARCH-001` diagnostic. JetBrains packages are compiled and checked with
+the IntelliJ Plugin Verifier against the declared Ultimate/LSP platform.
 
 ## Architecture Explorer
 
@@ -66,9 +73,9 @@ steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.21
+  - uses: Don-Erfan/wae@v0.0.22
     with:
-      version: 0.0.21
+      version: 0.0.22
       changed: "true"
       base: origin/main
       format: sarif

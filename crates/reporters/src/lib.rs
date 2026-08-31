@@ -76,6 +76,12 @@ fn json_report(analysis: &Analysis) -> Result<String, serde_json::Error> {
         "excludedModules": counts.excluded_modules,
         "externalPackages": counts.external_packages,
         "dependencies": counts.dependencies,
+        "architectureCoverage": {
+            "percent": analysis.ownership.coverage_percent(),
+            "assignedModules": analysis.ownership.assigned_modules(),
+            "exemptedModules": analysis.ownership.exempted_modules(),
+            "unassignedModules": analysis.ownership.unassigned_modules().len()
+        },
         "failureCount": FailurePolicy::count(&analysis.diagnostics),
         "diagnostics": analysis.diagnostics
     }))
@@ -91,6 +97,12 @@ fn jsonl(analysis: &Analysis) -> Result<String, serde_json::Error> {
         "excludedModules": counts.excluded_modules,
         "externalPackages": counts.external_packages,
         "dependencies": counts.dependencies,
+        "architectureCoverage": {
+            "percent": analysis.ownership.coverage_percent(),
+            "assignedModules": analysis.ownership.assigned_modules(),
+            "exemptedModules": analysis.ownership.exempted_modules(),
+            "unassignedModules": analysis.ownership.unassigned_modules().len()
+        },
         "failureCount": FailurePolicy::count(&analysis.diagnostics),
     }))?];
     for diagnostic in &analysis.diagnostics {
@@ -227,6 +239,7 @@ mod tests {
             schema_version: 1,
             project: Default::default(),
             graph: Default::default(),
+            ownership: Default::default(),
             diagnostics: vec![],
             incremental: Default::default(),
             timings: Default::default(),
@@ -240,6 +253,7 @@ mod tests {
             schema_version: 1,
             project: Default::default(),
             graph: Default::default(),
+            ownership: Default::default(),
             diagnostics: vec![],
             incremental: Default::default(),
             timings: Default::default(),
@@ -255,6 +269,7 @@ mod tests {
             schema_version: 1,
             project: Default::default(),
             graph: Default::default(),
+            ownership: Default::default(),
             diagnostics: vec![Diagnostic::new("ARCH-001", "cycle")],
             incremental: Default::default(),
             timings: Default::default(),
@@ -275,6 +290,7 @@ mod tests {
             schema_version: 1,
             project: Default::default(),
             graph: Default::default(),
+            ownership: Default::default(),
             diagnostics: vec![diagnostic],
             incremental: Default::default(),
             timings: Default::default(),
@@ -301,6 +317,7 @@ mod tests {
             schema_version: 1,
             project: Default::default(),
             graph: Default::default(),
+            ownership: Default::default(),
             diagnostics: vec![Diagnostic::new("ARCH-001", "failure"), info, suppressed],
             incremental: Default::default(),
             timings: Default::default(),

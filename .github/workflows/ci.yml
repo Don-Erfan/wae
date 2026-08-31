@@ -99,8 +99,9 @@ jobs:
         run: cargo test -p wae-engine --release --locked --test real_world_scale five_hundred_module_next_project_supports_warm_analysis_and_fault_injection -- --ignored --exact
       - name: Enforce 10k Universal all-rules cold-path budget
         env:
-          WAE_ENGINE_10K_BUDGET_MS: "15000"
-          WAE_ENGINE_10K_EDIT_BUDGET_MS: "1000"
+          WAE_ENGINE_10K_BUDGET_MS: "3000"
+          WAE_ENGINE_10K_WARM_BUDGET_MS: "650"
+          WAE_ENGINE_10K_EDIT_BUDGET_MS: "750"
           WAE_ENGINE_10K_RSS_BUDGET_KB: "262144"
         shell: bash
         run: |
@@ -109,12 +110,25 @@ jobs:
           cargo test -p wae-engine --release --locked --test real_world_scale \
             ten_thousand_universal_modules_keep_cold_analysis_near_linear \
             -- --ignored --exact --nocapture 2>&1 | tee target/performance/engine-10k.txt
+      - name: Enforce 50k full-engine cold, warm and edit budgets
+        env:
+          WAE_ENGINE_LARGE_MODULES: "50000"
+          WAE_ENGINE_LARGE_COLD_BUDGET_MS: "30000"
+          WAE_ENGINE_LARGE_WARM_BUDGET_MS: "5000"
+          WAE_ENGINE_LARGE_EDIT_BUDGET_MS: "5000"
+          WAE_ENGINE_LARGE_RSS_BUDGET_KB: "786432"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p wae-engine --release --locked --test real_world_scale \
+            large_full_engine_cold_warm_and_edit_are_bounded \
+            -- --ignored --exact --nocapture 2>&1 | tee target/performance/engine-50k.txt
       - name: Retain performance timing and peak-RSS history
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: performance-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/performance/engine-10k.txt
+          path: target/performance/engine-*.txt
           if-no-files-found: error
 
   npm-installer:
@@ -154,8 +168,10 @@ jobs:
       - working-directory: editors/vscode
         run: |
           npm ci
+          npm audit --audit-level=moderate
           npm run check
           npm run compile
+          WAE_LSP_PATH="$GITHUB_WORKSPACE/target/debug/wae-lsp" xvfb-run -a npm run test:e2e
           npx --yes @vscode/vsce@3.6.0 package --out ../../target/wae-vscode.vsix
       - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
@@ -228,6 +244,34 @@ jobs:
           cargo run --quiet -p wae-cli -- explore --output target/architecture-explorer.html
           grep -q 'WAE Architecture Explorer' target/architecture-explorer.html
           grep -q 'application/json' target/architecture-explorer.html
+      - name: Audit a pinned real-world Next.js consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/vercel-commerce"
+          git init "$consumer"
+          git -C "$consumer" remote add origin https://github.com/vercel/commerce.git
+          git -C "$consumer" fetch --depth=1 origin 3761e52e60df9c6a316e067dbfd7032e494d3634
+          git -C "$consumer" checkout --detach FETCH_HEAD
+          set +e
+          (cd "$consumer" && "$GITHUB_WORKSPACE/target/debug/wae" check --no-cache --format json) \
+            > target/vercel-commerce-audit.json
+          status=$?
+          set -e
+          test "$status" = 1
+          test "$(jq -r '.sourceModules' target/vercel-commerce-audit.json)" = 66
+          test "$(jq -r '.dependencies' target/vercel-commerce-audit.json)" = 210
+          test "$(jq -r '.failureCount' target/vercel-commerce-audit.json)" = 1
+          jq -e '
+            .diagnostics | length == 1 and
+            .[0].rule_id == "ARCH-001" and
+            .[0].fingerprint == "734895f168870444" and
+            .[0].dependency_path == [
+              "components/layout/search/filter/index.tsx",
+              "components/layout/search/filter/dropdown.tsx",
+              "components/layout/search/filter/index.tsx"
+            ]
+          ' target/vercel-commerce-audit.json
       - name: Validate npm sidecar installer contract
         working-directory: npm/wae
         run: npm run test:installer

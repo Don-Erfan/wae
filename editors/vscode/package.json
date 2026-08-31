@@ -2,7 +2,7 @@
   "name": "wae-vscode",
   "displayName": "Web Architecture Engine",
   "description": "Live WAE architecture diagnostics, hover context and quick fixes.",
-  "version": "0.0.21",
+  "version": "0.0.22",
   "publisher": "don-erfan",
   "repository": { "type": "git", "url": "https://github.com/Don-Erfan/wae.git" },
   "engines": { "vscode": "^1.90.0" },
@@ -24,12 +24,15 @@
       { "command": "wae.check", "title": "WAE: Check Architecture" },
       { "command": "wae.graph", "title": "WAE: Show Architecture Graph" },
       { "command": "wae.reload", "title": "WAE: Reload Language Server" },
-      { "command": "wae.showSuggestion", "title": "WAE: Show Suggested Fix" }
+      { "command": "wae.showSuggestion", "title": "WAE: Show Suggested Fix" },
+      { "command": "wae.suppressWithReason", "title": "WAE: Suppress with Documented Reason" }
     ]
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=out/extension.js",
-    "check": "tsc -p ./ --noEmit"
+    "compile:test": "esbuild src/test/runTest.ts --bundle --platform=node --outfile=out/test/runTest.js && esbuild src/test/suite/index.ts --bundle --platform=node --external:vscode --outfile=out/test/suite/index.js",
+    "check": "tsc -p ./ --noEmit",
+    "test:e2e": "npm run compile && npm run compile:test && node out/test/runTest.js"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -37,6 +40,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "3.1.0",
     "esbuild": "0.28.2",
     "typescript": "^5.5.0"
   }

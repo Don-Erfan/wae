@@ -8,6 +8,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.22] - 2026-08-31
+
+### Added
+
+- Added canonical architecture ownership snapshots and aggregate `ARCH-011` coverage enforcement,
+  with the same assigned, exempt, unassigned, and overlapping classifications shared by config
+  validation, rules, reporters, Explorer, and MCP consumers.
+- Added a bounded, cancellable LSP analysis scheduler, incremental workspace snapshots and change
+  sets, a real VS Code Extension Host test, and adversarial MCP protocol and request-size tests.
+- Added checked-in median performance baselines, a 50,000-module CI gate, a weekly 100,000-module
+  scale gate, and a pinned real-world Vercel Commerce integration contract.
+- Added a rule-family precision/recall corpus covering architecture, package, and runtime policies,
+  including one hundred generated clean modules used to detect false positives.
+
+### Changed
+
+- Replaced the monolithic analysis cache with versioned, content-addressed module shards and a
+  small manifest so incremental analyses only rewrite affected cache segments.
+- Reused known workspace files and the latest analysis snapshot for editor changes, reducing the
+  measured 10,000-module single-edit median from the previous 397 ms baseline to 205 ms locally.
+- Tightened performance regression ratios, pinned the SARIF upload action by commit digest, and
+  expanded the Next.js compatibility matrix across supported major versions.
+- Limited parser runtime-export detection to module-body exports and documented the stdio-only MCP
+  trust boundary, including the configurable one-mebibyte request quota.
+
+### Fixed
+
+- Made `coverage.allow_unassigned` exemptions behave consistently in validation, coverage totals,
+  ordinary analysis, architecture reports, and diagnostics.
+- Prevented LSP notification bursts from spawning unbounded sleeping threads or publishing stale
+  diagnostics, and removed unsafe placeholder suppression edits that lacked a real justification.
+- Preserved nested or namespaced runtime-like syntax without misclassifying it as a module export,
+  while retaining correct handling for direct, re-exported, and escaped runtime literals.
+
 ## [0.0.21] - 2026-08-31
 
 ### Added
@@ -193,7 +227,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.21...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.22...HEAD
+[0.0.22]: https://github.com/Don-Erfan/wae/compare/v0.0.21...v0.0.22
 [0.0.21]: https://github.com/Don-Erfan/wae/compare/v0.0.20...v0.0.21
 [0.0.20]: https://github.com/Don-Erfan/wae/compare/v0.0.19...v0.0.20
 [0.0.19]: https://github.com/Don-Erfan/wae/compare/v0.0.18...v0.0.19

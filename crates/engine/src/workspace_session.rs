@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Analysis, AnalysisError, AnalyzeRequest, CancellationToken, Engine};
+use crate::{Analysis, AnalysisError, AnalyzeRequest, CancellationToken, ChangeSet, Engine};
 
 /// Generation-scoped work issued by a long-lived editor session.
 #[derive(Clone, Debug)]
@@ -25,6 +25,13 @@ pub struct WorkspaceSession {
     engine: Engine,
     generation: AtomicU64,
     active: Mutex<Option<CancellationToken>>,
+    snapshot: Mutex<Option<WorkspaceSnapshot>>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceSnapshot {
+    overlays: BTreeMap<String, String>,
+    analysis: Analysis,
 }
 
 impl WorkspaceSession {
@@ -34,6 +41,7 @@ impl WorkspaceSession {
             engine: Engine::default(),
             generation: AtomicU64::new(0),
             active: Mutex::new(None),
+            snapshot: Mutex::new(None),
         }
     }
 
@@ -52,29 +60,104 @@ impl WorkspaceSession {
             && !ticket.cancellation.is_cancelled()
     }
 
+    pub fn cancel_active(&self) {
+        if let Some(token) =
+            self.active.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref()
+        {
+            token.cancel();
+        }
+    }
+
+    pub fn changes_since_snapshot(&self, overlays: &BTreeMap<String, String>) -> ChangeSet {
+        let snapshot = self.snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = snapshot.as_ref().map(|snapshot| &snapshot.overlays);
+        let changed = overlays
+            .iter()
+            .filter(|(module, source)| previous.and_then(|old| old.get(*module)) != Some(*source))
+            .map(|(module, _)| module.clone())
+            .collect();
+        let deleted = previous
+            .into_iter()
+            .flat_map(|old| old.keys())
+            .filter(|module| !overlays.contains_key(*module))
+            .cloned()
+            .collect();
+        ChangeSet { changed, deleted }
+    }
+
+    pub fn snapshot(&self) -> Option<Analysis> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|snapshot| snapshot.analysis.clone())
+    }
+
     pub fn analyze(
         &self,
         ticket: &AnalysisTicket,
         overlays: &BTreeMap<String, String>,
     ) -> Result<Analysis, AnalysisError> {
+        self.analyze_changes(ticket, overlays, true)
+    }
+
+    pub fn analyze_changes(
+        &self,
+        ticket: &AnalysisTicket,
+        overlays: &BTreeMap<String, String>,
+        force: bool,
+    ) -> Result<Analysis, AnalysisError> {
         if !self.is_current(ticket) {
             return Err(AnalysisError::Cancelled);
         }
-        let request = overlays.iter().fold(
+        if !force && self.changes_since_snapshot(overlays) == ChangeSet::default() {
+            if let Some(mut analysis) = self.snapshot() {
+                analysis.incremental.analyzed_modules = 0;
+                analysis.incremental.restored_modules = analysis
+                    .project
+                    .modules
+                    .iter()
+                    .filter(|module| module.kind == wae_core::domain::ModuleKind::Source)
+                    .count();
+                analysis.incremental.rule_snapshot_reused = true;
+                analysis.timings = Default::default();
+                return Ok(analysis);
+            }
+        }
+        let mut request = overlays.iter().fold(
             AnalyzeRequest::new(&self.root).with_cancellation(ticket.cancellation.clone()),
             |request, (module, source)| request.with_overlay(module.clone(), source.clone()),
         );
-        self.engine.analyze(request)
+        if !force {
+            let known_files =
+                self.snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(
+                    |snapshot| {
+                        snapshot
+                            .analysis
+                            .project
+                            .modules
+                            .iter()
+                            .filter(|module| module.kind == wae_core::domain::ModuleKind::Source)
+                            .map(|module| self.root.join(&module.id.0))
+                            .collect::<Vec<_>>()
+                    },
+                );
+            if let Some(known_files) = known_files {
+                request = request.with_known_files(known_files);
+            }
+        }
+        let analysis = self.engine.analyze(request)?;
+        if self.is_current(ticket) {
+            *self.snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(WorkspaceSnapshot { overlays: overlays.clone(), analysis: analysis.clone() });
+        }
+        Ok(analysis)
     }
 }
 
 impl Drop for WorkspaceSession {
     fn drop(&mut self) {
-        if let Ok(active) = self.active.lock() {
-            if let Some(token) = active.as_ref() {
-                token.cancel();
-            }
-        }
+        self.cancel_active();
     }
 }
 
@@ -117,6 +200,11 @@ mod tests {
         let edited = session.analyze(&session.begin_analysis(), &overlays).unwrap();
         assert_eq!(edited.incremental.analyzed_modules, 1);
         assert_eq!(edited.incremental.restored_modules, 1);
+        assert_eq!(session.changes_since_snapshot(&overlays), ChangeSet::default());
+        assert_eq!(session.snapshot().unwrap().project.modules.len(), 2);
+        let no_op = session.analyze_changes(&session.begin_analysis(), &overlays, false).unwrap();
+        assert_eq!(no_op.incremental.analyzed_modules, 0);
+        assert_eq!(no_op.incremental.restored_modules, 2);
         fs::remove_dir_all(root).unwrap();
     }
 }

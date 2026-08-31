@@ -8,7 +8,7 @@ inputs:
   version:
     description: Exact @don-erfan/wae version to install.
     required: false
-    default: "0.0.21"
+    default: "0.0.22"
   changed:
     description: Check only new fail-level violations in the Git affected closure.
     required: false
@@ -100,7 +100,7 @@ runs:
         test -s "$WAE_ACTION_SARIF_FILE"
     - name: Upload WAE SARIF
       if: inputs.upload-sarif == 'true' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
-      uses: github/codeql-action/upload-sarif@v4
+      uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
       with:
         sarif_file: ${{ inputs.sarif-file }}
         category: wae-architecture

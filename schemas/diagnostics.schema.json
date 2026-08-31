@@ -12,11 +12,22 @@
     "excludedModules": { "type": "integer", "minimum": 0 },
     "externalPackages": { "type": "integer", "minimum": 0 },
     "dependencies": { "type": "integer", "minimum": 0 },
+    "architectureCoverage": { "$ref": "#/$defs/architectureCoverage" },
     "failureCount": { "type": "integer", "minimum": 0 },
     "regression": { "$ref": "#/$defs/regression" },
     "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
   },
   "$defs": {
+    "architectureCoverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["percent", "assignedModules", "exemptedModules", "unassignedModules"],
+      "properties": {
+        "percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "assignedModules": { "type": "integer", "minimum": 0 },
+        "exemptedModules": { "type": "integer", "minimum": 0 },
+        "unassignedModules": { "type": "integer", "minimum": 0 }
+      }
+    },
     "location": {
       "type": "object", "additionalProperties": false,
       "required": ["file", "line", "column"],

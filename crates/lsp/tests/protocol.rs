@@ -67,6 +67,50 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
             .any(|diagnostic| { diagnostic["code"] == "RESOLVE-001" })
     );
 
+    let document_uri = Url::from_file_path(root.join("src/a.ts")).unwrap().to_string();
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0", "method":"textDocument/didOpen",
+            "params":{"textDocument":{"uri":document_uri.clone(),"languageId":"typescript","version":1,"text":"import './missing';"}}
+        }),
+    );
+    for version in 2..=25 {
+        let text = if version == 25 { "export const fixed = true;" } else { "import './missing';" };
+        send(
+            &mut stdin,
+            &json!({
+                "jsonrpc":"2.0", "method":"textDocument/didChange",
+                "params":{"textDocument":{"uri":document_uri.clone(),"version":version},"contentChanges":[{"text":text}]}
+            }),
+        );
+    }
+    let settled = loop {
+        let message = receive(&mut stdout);
+        if message["method"] == "textDocument/publishDiagnostics"
+            && message["params"]["uri"] == document_uri
+            && message["params"]["diagnostics"].as_array().is_some_and(Vec::is_empty)
+        {
+            break message;
+        }
+    };
+    assert_eq!(settled["params"]["diagnostics"], json!([]));
+
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0", "id":3, "method":"textDocument/hover",
+            "params":{"textDocument":{"uri":document_uri.clone()},"position":{"line":0,"character":0}}
+        }),
+    );
+    let hover = loop {
+        let message = receive(&mut stdout);
+        if message["id"] == 3 {
+            break message;
+        }
+    };
+    assert!(hover["result"]["contents"]["value"].as_str().unwrap().contains("WAE architecture"));
+
     send(&mut stdin, &json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit","params":null}));
     assert_eq!(receive(&mut stdout)["id"], 2);

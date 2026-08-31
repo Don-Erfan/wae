@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
-use wae_core::domain::{Diagnostic, FeatureId, ModuleId, PackageName, Project, SourceLocation};
+use wae_core::domain::{
+    ArchitectureOwnershipIndex, Diagnostic, FeatureId, ModuleId, PackageName, Project,
+    SourceLocation,
+};
 use wae_core::rule_registry::{self, RuleDescriptor};
 use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
 
@@ -10,8 +13,8 @@ mod architecture_metrics;
 mod package_rules;
 mod runtime_rules;
 use architecture_metrics::{
-    DependencyDepthRule, IncomingCouplingRule, OrphanModuleRule, OutgoingCouplingRule,
-    UnassignedLayerRule,
+    ArchitectureCoverageRule, DependencyDepthRule, IncomingCouplingRule, OrphanModuleRule,
+    OutgoingCouplingRule, UnassignedLayerRule,
 };
 use package_rules::{
     CrossPackageRelativeImportRule, ForbiddenPackageDependencyRule, PackageCycleRule,
@@ -29,6 +32,7 @@ pub struct RuleContext<'a> {
     pub runtime_graph: &'a RuntimeGraph,
     pub config: &'a Config,
     pub module_layers: &'a HashMap<ModuleId, String>,
+    pub ownership: &'a ArchitectureOwnershipIndex,
     pub module_features: &'a HashMap<ModuleId, FeatureId>,
     pub module_feature_roots: &'a HashMap<ModuleId, String>,
     pub policies: &'a CompiledRulePolicies,
@@ -101,6 +105,7 @@ impl RuleSet {
             .with_rule(IncomingCouplingRule)
             .with_rule(OrphanModuleRule)
             .with_rule(UnassignedLayerRule)
+            .with_rule(ArchitectureCoverageRule)
             .with_rule(PackageCycleRule)
             .with_rule(ForbiddenPackageDependencyRule)
             .with_rule(UndeclaredWorkspaceDependencyRule)
@@ -437,6 +442,7 @@ mod tests {
             runtime_graph: Box::leak(Box::new(RuntimeGraph::from_project(project))),
             config,
             module_layers: Box::leak(Box::new(HashMap::new())),
+            ownership: Box::leak(Box::new(ArchitectureOwnershipIndex::default())),
             module_features: features,
             module_feature_roots: Box::leak(Box::new(HashMap::new())),
             policies: Box::leak(Box::new(CompiledRulePolicies::compile(config).unwrap())),
@@ -521,6 +527,7 @@ mod tests {
                     runtime_graph: &RuntimeGraph::from_project(&project),
                     config: &config,
                     module_layers: &HashMap::new(),
+                    ownership: &ArchitectureOwnershipIndex::default(),
                     module_features: &features,
                     module_feature_roots: &roots,
                     policies: &CompiledRulePolicies::compile(&config).unwrap(),
