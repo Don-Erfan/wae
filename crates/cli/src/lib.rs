@@ -1,7 +1,7 @@
 mod commands;
 
 use std::path::{Path, PathBuf};
-use wae_config::ConfigPreset;
+use wae_config::{ConfigPreset, FailOn};
 use wae_core::domain::DependencyKind;
 use wae_engine::CancellationToken;
 use wae_reporters::Format;
@@ -58,8 +58,14 @@ enum Command {
         config: Option<PathBuf>,
         no_cache: bool,
         verbose: bool,
+        fail_on: Option<FailOn>,
+        max_warnings: Option<usize>,
     },
     BaselineCreate,
+    BaselineList {
+        rule: Option<String>,
+    },
+    BaselinePrune,
     Graph,
     Explore {
         output: PathBuf,
@@ -98,7 +104,16 @@ pub fn run_with_cancellation(
         Command::Init { preset } => commands::init(cwd, preset),
         Command::Scan => commands::scan(cwd, cancellation),
         Command::Discover { json, write, force } => commands::discover(cwd, json, write, force),
-        Command::Check { changed, format, base, config, no_cache, verbose } => commands::check(
+        Command::Check {
+            changed,
+            format,
+            base,
+            config,
+            no_cache,
+            verbose,
+            fail_on,
+            max_warnings,
+        } => commands::check(
             cwd,
             commands::CheckOptions {
                 changed,
@@ -107,10 +122,14 @@ pub fn run_with_cancellation(
                 config_path: config,
                 no_cache,
                 verbose,
+                fail_on,
+                max_warnings,
                 cancellation: cancellation.clone(),
             },
         ),
         Command::BaselineCreate => commands::baseline_create(cwd, cancellation),
+        Command::BaselineList { rule } => commands::baseline_list(cwd, rule.as_deref()),
+        Command::BaselinePrune => commands::baseline_prune(cwd, cancellation),
         Command::Graph => commands::graph(cwd, cancellation),
         Command::Explore { output } => commands::explore(cwd, output, cancellation),
         Command::Doctor => commands::doctor(cwd, cancellation),
@@ -140,6 +159,17 @@ fn parse(args: &[String]) -> Result<Command, String> {
         }
         "baseline" if args.get(1).map(String::as_str) == Some("create") && args.len() == 2 => {
             Ok(Command::BaselineCreate)
+        }
+        "baseline" if args.get(1).map(String::as_str) == Some("prune") && args.len() == 2 => {
+            Ok(Command::BaselinePrune)
+        }
+        "baseline" if args.get(1).map(String::as_str) == Some("list") => {
+            let rule = match &args[2..] {
+                [] => None,
+                [flag, rule] if flag == "--rule" => Some(rule.clone()),
+                _ => return Err("baseline list accepts only `--rule RULE_ID`".into()),
+            };
+            Ok(Command::BaselineList { rule })
         }
         "explain" if args.len() == 2 => Ok(Command::Explain(args[1].clone())),
         "resolve" => parse_resolve(&args[1..]),
@@ -207,6 +237,8 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
     let mut config = None;
     let mut no_cache = false;
     let mut verbose = false;
+    let mut fail_on = None;
+    let mut max_warnings = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -228,11 +260,27 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
             }
             "--no-cache" => no_cache = true,
             "--verbose" | "-v" => verbose = true,
+            "--fail-on" => {
+                index += 1;
+                let value = args.get(index).ok_or("--fail-on requires a value")?;
+                fail_on = Some(FailOn::parse(value).ok_or_else(|| {
+                    format!("unsupported failure threshold `{value}`; expected error or warning")
+                })?);
+            }
+            "--max-warnings" => {
+                index += 1;
+                let value = args.get(index).ok_or("--max-warnings requires a value")?;
+                max_warnings = Some(value.parse::<usize>().map_err(|_| {
+                    format!(
+                        "invalid --max-warnings value `{value}`; expected a non-negative integer"
+                    )
+                })?);
+            }
             value => return Err(format!("unknown check option `{value}`")),
         }
         index += 1;
     }
-    Ok(Command::Check { changed, format, base, config, no_cache, verbose })
+    Ok(Command::Check { changed, format, base, config, no_cache, verbose, fail_on, max_warnings })
 }
 
 fn parse_resolve(args: &[String]) -> Result<Command, String> {
@@ -279,8 +327,12 @@ fn parse_explore(args: &[String]) -> Result<Command, String> {
     }
 }
 
-fn usage() -> &'static str {
-    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  config validate [--show-overlaps] [--show-coverage] [--show-unassigned]\n                               Validate config, ownership and coverage\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
+fn usage() -> String {
+    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n        [--fail-on error|warning] [--max-warnings N]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  config validate [--show-overlaps] [--show-coverage] [--show-unassigned]\n                               Validate config, ownership and coverage\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
+    .replace(
+        "baseline create              Explicitly record current violations",
+        "baseline create|list|prune   Create, inspect, or remove stale baseline entries",
+    )
 }
 
 #[cfg(test)]
@@ -308,6 +360,28 @@ mod tests {
     #[test]
     fn basic_fixture_passes() {
         assert_eq!(run(&["check".into()], &fixture("basic")).exit_code, EXIT_PASSED);
+    }
+
+    #[test]
+    fn warnings_are_visible_but_only_fail_when_configured_or_over_budget() {
+        let root = std::env::temp_dir().join(format!("wae-warning-policy-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "import './b';").unwrap();
+        std::fs::write(root.join("src/b.ts"), "import './a';").unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\nrules:\n  ARCH-001: warning\n").unwrap();
+
+        let visible = run(&["check".into(), "--format".into(), "json".into()], &root);
+        assert_eq!(visible.exit_code, EXIT_PASSED);
+        assert!(visible.stdout.contains("\"warningCount\": 1"));
+        assert_eq!(
+            run(&["check".into(), "--fail-on".into(), "warning".into()], &root).exit_code,
+            EXIT_VIOLATIONS
+        );
+        assert_eq!(
+            run(&["check".into(), "--max-warnings".into(), "0".into()], &root).exit_code,
+            EXIT_VIOLATIONS
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

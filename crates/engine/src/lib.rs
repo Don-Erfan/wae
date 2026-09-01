@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use wae_config::Config;
+use wae_config::{Config, FailOn, OutputConfig};
 use wae_core::domain::{
     ArchitectureOwnershipIndex, Dependency, DependencyTarget, Diagnostic, FeatureId,
     FrameworkMetadata, LayerId, LayerOwnership, Module, ModuleId, ModuleKind, ModulePath,
@@ -101,6 +101,7 @@ pub struct Analysis {
     pub graph: ModuleGraph,
     pub ownership: ArchitectureOwnershipIndex,
     pub diagnostics: Vec<Diagnostic>,
+    pub failure_policy: FailurePolicy,
     pub incremental: IncrementalStats,
     pub timings: AnalysisTimings,
 }
@@ -117,6 +118,13 @@ pub struct AnalysisTimings {
     pub reporting_ms: u128,
     pub orchestration_ms: u128,
     pub total_ms: u128,
+    pub rules: BTreeMap<String, RuleTiming>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuleTiming {
+    pub elapsed_ns: u128,
+    pub diagnostics: usize,
 }
 
 impl AnalysisTimings {
@@ -308,16 +316,78 @@ pub fn trace_resolution(request: TraceResolutionRequest) -> Result<ResolutionTra
     })
 }
 
-/// Single failure policy shared by exit codes and machine-readable reporting.
-pub struct FailurePolicy;
+/// Failure threshold shared by exit codes and machine-readable reporting. Warnings are visible by
+/// default without breaking a build; teams can opt into warning-fatal or warning-budget modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FailurePolicy {
+    fail_on: FailOn,
+    max_warnings: Option<usize>,
+}
 
 impl FailurePolicy {
-    pub fn is_failure(diagnostic: &Diagnostic) -> bool {
-        !diagnostic.suppressed && matches!(diagnostic.severity, Severity::Error | Severity::Warning)
+    pub fn from_output(output: &OutputConfig) -> Self {
+        Self { fail_on: output.fail_on, max_warnings: output.max_warnings }
     }
 
-    pub fn count(diagnostics: &[Diagnostic]) -> usize {
-        diagnostics.iter().filter(|diagnostic| Self::is_failure(diagnostic)).count()
+    pub fn with_overrides(mut self, fail_on: Option<FailOn>, max_warnings: Option<usize>) -> Self {
+        if let Some(fail_on) = fail_on {
+            self.fail_on = fail_on;
+        }
+        if max_warnings.is_some() {
+            self.max_warnings = max_warnings;
+        }
+        self
+    }
+
+    pub fn fail_on(&self) -> FailOn {
+        self.fail_on
+    }
+
+    pub fn fail_on_name(&self) -> &'static str {
+        match self.fail_on {
+            FailOn::Error => "error",
+            FailOn::Warning => "warning",
+        }
+    }
+
+    pub fn max_warnings(&self) -> Option<usize> {
+        self.max_warnings
+    }
+
+    pub fn is_failure(&self, diagnostic: &Diagnostic) -> bool {
+        !diagnostic.suppressed
+            && (diagnostic.severity == Severity::Error
+                || (self.fail_on == FailOn::Warning && diagnostic.severity == Severity::Warning))
+    }
+
+    pub fn count(&self, diagnostics: &[Diagnostic]) -> usize {
+        let fail_level =
+            diagnostics.iter().filter(|diagnostic| self.is_failure(diagnostic)).count();
+        if self.fail_on == FailOn::Warning {
+            return fail_level;
+        }
+        let warning_excess = self
+            .max_warnings
+            .map(|maximum| self.warning_count(diagnostics).saturating_sub(maximum))
+            .unwrap_or_default();
+        fail_level + warning_excess
+    }
+
+    pub fn warning_count(&self, diagnostics: &[Diagnostic]) -> usize {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| !diagnostic.suppressed && diagnostic.severity == Severity::Warning)
+            .count()
+    }
+
+    pub fn has_failures(&self, diagnostics: &[Diagnostic]) -> bool {
+        self.count(diagnostics) > 0
+    }
+}
+
+impl Default for FailurePolicy {
+    fn default() -> Self {
+        Self { fail_on: FailOn::Error, max_warnings: None }
     }
 }
 
@@ -483,6 +553,22 @@ fn restore_cached_module(
             });
             continue;
         }
+        if let DependencyTarget::Builtin(name) = &resolved.target {
+            let package = Package { name: PackageName("node".into()), root_path: String::new() };
+            if project_index.insert_package(package.name.clone()) {
+                project.packages.push(package.clone());
+            }
+            project.modules.push(Module {
+                id: dependency.to.clone(),
+                path: ModulePath(format!("builtin:{name}")),
+                package: package.name,
+                kind: ModuleKind::External,
+                runtime: Runtime::Node,
+                layer: None,
+                framework_metadata: FrameworkMetadata::default(),
+            });
+            continue;
+        }
 
         let target_path = root.join(&dependency.to.0);
         let package = infer_package(root, &target_path, workspace_packages, default_package);
@@ -523,37 +609,11 @@ fn restore_cached_module(
     Ok(())
 }
 
-fn analysis_environment_hash(root: &Path, config: &Config) -> Result<u64, AnalysisError> {
-    let mut inputs = Vec::<PathBuf>::new();
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true).filter_entry(
-        |entry| {
-            !entry.file_type().is_some_and(|kind| kind.is_dir())
-                || !matches!(
-                    entry.file_name().to_string_lossy().as_ref(),
-                    "node_modules" | ".git" | ".wae" | ".next" | "dist" | "build" | "target"
-                )
-        },
-    );
-    for entry in builder.build() {
-        let entry = entry.map_err(|error| AnalysisError::Project(error.to_string()))?;
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            "package.json"
-                | "tsconfig.json"
-                | "jsconfig.json"
-                | "next.config.js"
-                | "next.config.mjs"
-                | "next.config.cjs"
-                | "next.config.ts"
-        ) {
-            inputs.push(entry.into_path());
-        }
-    }
+fn analysis_environment_hash(
+    root: &Path,
+    config: &Config,
+    mut inputs: Vec<PathBuf>,
+) -> Result<u64, AnalysisError> {
     inputs.sort();
     let mut identity = format!("wae-analysis-v3\n{config:?}").into_bytes();
     for path in inputs {
@@ -571,14 +631,31 @@ fn analysis_environment_hash(root: &Path, config: &Config) -> Result<u64, Analys
 }
 
 fn analysis_graph_hash(project: &Project, environment_hash: u64) -> Result<u64, AnalysisError> {
-    let identity = serde_json::to_vec(&(
-        environment_hash,
-        &project.modules,
-        &project.dependencies,
-        &project.resolved_dependencies,
-    ))
+    struct HashWriter(u64);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for byte in bytes {
+                self.0 ^= u64::from(*byte);
+                self.0 = self.0.wrapping_mul(0x100000001b3);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(0xcbf29ce484222325);
+    serde_json::to_writer(
+        &mut writer,
+        &(
+            environment_hash,
+            &project.modules,
+            &project.dependencies,
+            &project.resolved_dependencies,
+        ),
+    )
     .map_err(|error| AnalysisError::Internal(error.to_string()))?;
-    Ok(stable_hash(&identity))
+    Ok(writer.0)
 }
 
 fn framework_project_evidence(root: &Path) -> Result<ProjectEvidence, AnalysisError> {
@@ -661,6 +738,7 @@ fn resolution_text(root: &Path, resolution: &Resolution) -> String {
             format!("module:{}", relative_resolved_path(root, &module.0))
         }
         Resolution::External(package) => format!("external:{package}"),
+        Resolution::Builtin(name) => format!("builtin:{name}"),
         Resolution::Redirect(target) => format!("redirect:{target}"),
         Resolution::Invalid(reason) => format!("invalid:{reason}"),
         Resolution::Unresolved => "unresolved".into(),
@@ -826,6 +904,39 @@ mod tests {
                 analysis.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn every_configurable_rule_has_an_end_to_end_positive_fixture() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut observed = HashSet::new();
+        for fixture in ["circular", "layers", "features", "monorepo", "policies", "runtime"] {
+            let analysis =
+                Engine::default().analyze(AnalyzeRequest::new(fixtures.join(fixture))).unwrap();
+            for diagnostic in analysis.diagnostics {
+                observed.insert(diagnostic.rule_id.0);
+                if let Some(related) = diagnostic.metadata.get("related_rules") {
+                    observed.extend(related.split(',').map(str::to_owned));
+                }
+            }
+        }
+        let coverage =
+            std::env::temp_dir().join(format!("wae-rule-harness-coverage-{}", std::process::id()));
+        fs::create_dir_all(coverage.join("src/app")).unwrap();
+        fs::write(coverage.join("src/app/page.ts"), "export const page = true;").unwrap();
+        fs::write(coverage.join("src/unowned.ts"), "export const value = true;").unwrap();
+        fs::write(
+            coverage.join("wae.yaml"),
+            "version: 1\narchitecture:\n  coverage:\n    minimum: 100\n  layers:\n    app:\n      patterns: ['src/app/**']\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&coverage)).unwrap();
+        observed.extend(analysis.diagnostics.into_iter().map(|diagnostic| diagnostic.rule_id.0));
+        fs::remove_dir_all(coverage).unwrap();
+        let missing = wae_core::rule_registry::configurable_ids()
+            .filter(|rule| !observed.contains(*rule))
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "rules without a real-source positive fixture: {missing:?}");
     }
 
     #[test]

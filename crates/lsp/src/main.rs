@@ -56,7 +56,7 @@ fn run() -> Result<(), String> {
 struct ServerState {
     root: PathBuf,
     session: Arc<WorkspaceSession>,
-    analysis: Option<Analysis>,
+    analysis: Option<Arc<Analysis>>,
     published: HashSet<String>,
     documents: BTreeMap<String, String>,
     scheduler: AnalysisScheduler,
@@ -64,7 +64,7 @@ struct ServerState {
 
 struct BackgroundAnalysis {
     ticket: AnalysisTicket,
-    result: Result<Analysis, AnalysisError>,
+    result: Result<Arc<Analysis>, AnalysisError>,
 }
 
 struct PendingAnalysis {
@@ -102,8 +102,10 @@ impl AnalysisScheduler {
     }
 
     fn schedule(&self, ticket: AnalysisTicket, overlays: BTreeMap<String, String>, force: bool) {
-        *self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(PendingAnalysis { ticket, overlays, force });
+        let mut pending = self.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let force = force || pending.as_ref().is_some_and(|job| job.force);
+        *pending = Some(PendingAnalysis { ticket, overlays, force });
+        drop(pending);
         if let Some(wake) = &self.wake {
             let _ = wake.try_send(());
         }
@@ -404,6 +406,36 @@ fn err(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_force_is_monotonic_while_latest_ticket_and_overlays_win() {
+        let session = Arc::new(WorkspaceSession::new(std::env::temp_dir()));
+        let pending = Arc::new(Mutex::new(Some(PendingAnalysis {
+            ticket: session.begin_analysis(),
+            overlays: BTreeMap::from([("old.ts".into(), "old".into())]),
+            force: true,
+        })));
+        let (wake, _notifications) = bounded(1);
+        let scheduler = AnalysisScheduler {
+            session: Arc::clone(&session),
+            pending: Arc::clone(&pending),
+            wake: Some(wake),
+            worker: None,
+        };
+        let latest = session.begin_analysis();
+        let latest_generation = latest.generation();
+        scheduler.schedule(
+            latest.clone(),
+            BTreeMap::from([("latest.ts".into(), "latest".into())]),
+            false,
+        );
+        let merged = pending.lock().unwrap();
+        let merged = merged.as_ref().unwrap();
+        assert!(merged.force);
+        assert_eq!(merged.ticket.generation(), latest_generation);
+        assert_eq!(merged.overlays.get("latest.ts").map(String::as_str), Some("latest"));
+        assert!(!merged.overlays.contains_key("old.ts"));
+    }
     use wae_core::domain::{RuleId, SourceLocation};
 
     #[test]

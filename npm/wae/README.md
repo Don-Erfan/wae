@@ -18,6 +18,9 @@ wae config validate --show-overlaps
 wae scan
 wae check
 wae check --changed
+wae check --fail-on error --max-warnings 20
+wae baseline list --rule ARCH-003
+wae baseline prune
 wae explore
 wae-lsp
 wae-mcp

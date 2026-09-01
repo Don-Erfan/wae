@@ -111,6 +111,7 @@ mod tests {
             ..Project::default()
         };
         let analysis = Analysis {
+            failure_policy: Default::default(),
             schema_version: 1,
             graph: Default::default(),
             ownership: Default::default(),

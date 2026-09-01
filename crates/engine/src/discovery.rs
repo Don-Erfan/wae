@@ -6,13 +6,38 @@ use wae_config::Config;
 
 use crate::AnalysisError;
 
+pub(crate) struct DiscoveryResult {
+    pub(crate) modules: Vec<PathBuf>,
+    pub(crate) analysis_inputs: Vec<PathBuf>,
+}
+
 pub(crate) fn discover_modules(
     root: &Path,
     config: &Config,
 ) -> Result<Vec<PathBuf>, AnalysisError> {
+    Ok(discover_project(root, config)?.modules)
+}
+
+pub(crate) fn discover_project(
+    root: &Path,
+    config: &Config,
+) -> Result<DiscoveryResult, AnalysisError> {
     let include = build_globs(&config.project.include)?;
     let exclude = build_globs(&config.project.exclude)?;
     let mut files = Vec::new();
+    let mut analysis_inputs = [
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.cjs",
+        "next.config.ts",
+    ]
+    .into_iter()
+    .map(|name| root.join(name))
+    .filter(|path| path.is_file())
+    .collect::<Vec<_>>();
     for configured_root in &config.project.roots {
         let scan_root = root.join(configured_root).canonicalize().map_err(|error| {
             AnalysisError::Project(format!(
@@ -42,6 +67,9 @@ pub(crate) fn discover_modules(
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .replace('\\', "/");
+            if is_analysis_input(entry.file_name().to_string_lossy().as_ref()) {
+                analysis_inputs.push(entry.path().to_path_buf());
+            }
             if !include.is_match(&relative) || exclude.is_match(&relative) {
                 continue;
             }
@@ -55,7 +83,29 @@ pub(crate) fn discover_modules(
     }
     files.sort();
     files.dedup();
-    Ok(files)
+    analysis_inputs.sort();
+    analysis_inputs.dedup();
+    Ok(DiscoveryResult { modules: files, analysis_inputs })
+}
+
+pub(crate) fn discover_analysis_inputs(
+    root: &Path,
+    config: &Config,
+) -> Result<Vec<PathBuf>, AnalysisError> {
+    Ok(discover_project(root, config)?.analysis_inputs)
+}
+
+fn is_analysis_input(name: &str) -> bool {
+    matches!(
+        name,
+        "package.json"
+            | "tsconfig.json"
+            | "jsconfig.json"
+            | "next.config.js"
+            | "next.config.mjs"
+            | "next.config.cjs"
+            | "next.config.ts"
+    )
 }
 
 pub(crate) fn build_globs(patterns: &[String]) -> Result<GlobSet, AnalysisError> {

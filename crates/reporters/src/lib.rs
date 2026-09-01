@@ -1,7 +1,7 @@
 use serde_json::json;
 pub use wae_config::OutputFormat as Format;
 use wae_core::domain::{Diagnostic, ModuleKind, Severity};
-use wae_engine::{Analysis, FailurePolicy};
+use wae_engine::Analysis;
 
 pub fn render(analysis: &Analysis, format: Format) -> Result<String, serde_json::Error> {
     match format {
@@ -61,7 +61,7 @@ fn human(analysis: &Analysis) -> String {
         }
         output.push('\n');
     }
-    if FailurePolicy::count(&analysis.diagnostics) == 0 {
+    if !analysis.failure_policy.has_failures(&analysis.diagnostics) {
         output.push_str("\n✓ Passed\n");
     }
     output.trim_end().to_string()
@@ -82,7 +82,12 @@ fn json_report(analysis: &Analysis) -> Result<String, serde_json::Error> {
             "exemptedModules": analysis.ownership.exempted_modules(),
             "unassignedModules": analysis.ownership.unassigned_modules().len()
         },
-        "failureCount": FailurePolicy::count(&analysis.diagnostics),
+        "failureCount": analysis.failure_policy.count(&analysis.diagnostics),
+        "warningCount": analysis.failure_policy.warning_count(&analysis.diagnostics),
+        "failurePolicy": {
+            "failOn": analysis.failure_policy.fail_on_name(),
+            "maxWarnings": analysis.failure_policy.max_warnings()
+        },
         "diagnostics": analysis.diagnostics
     }))
 }
@@ -103,7 +108,12 @@ fn jsonl(analysis: &Analysis) -> Result<String, serde_json::Error> {
             "exemptedModules": analysis.ownership.exempted_modules(),
             "unassignedModules": analysis.ownership.unassigned_modules().len()
         },
-        "failureCount": FailurePolicy::count(&analysis.diagnostics),
+        "failureCount": analysis.failure_policy.count(&analysis.diagnostics),
+        "warningCount": analysis.failure_policy.warning_count(&analysis.diagnostics),
+        "failurePolicy": {
+            "failOn": analysis.failure_policy.fail_on_name(),
+            "maxWarnings": analysis.failure_policy.max_warnings()
+        },
     }))?];
     for diagnostic in &analysis.diagnostics {
         events.push(serde_json::to_string(&json!({
@@ -241,6 +251,7 @@ mod tests {
             graph: Default::default(),
             ownership: Default::default(),
             diagnostics: vec![],
+            failure_policy: Default::default(),
             incremental: Default::default(),
             timings: Default::default(),
         };
@@ -255,6 +266,7 @@ mod tests {
             graph: Default::default(),
             ownership: Default::default(),
             diagnostics: vec![],
+            failure_policy: Default::default(),
             incremental: Default::default(),
             timings: Default::default(),
         };
@@ -271,6 +283,7 @@ mod tests {
             graph: Default::default(),
             ownership: Default::default(),
             diagnostics: vec![Diagnostic::new("ARCH-001", "cycle")],
+            failure_policy: Default::default(),
             incremental: Default::default(),
             timings: Default::default(),
         };
@@ -292,6 +305,7 @@ mod tests {
             graph: Default::default(),
             ownership: Default::default(),
             diagnostics: vec![diagnostic],
+            failure_policy: Default::default(),
             incremental: Default::default(),
             timings: Default::default(),
         };
@@ -319,6 +333,7 @@ mod tests {
             graph: Default::default(),
             ownership: Default::default(),
             diagnostics: vec![Diagnostic::new("ARCH-001", "failure"), info, suppressed],
+            failure_policy: Default::default(),
             incremental: Default::default(),
             timings: Default::default(),
         };

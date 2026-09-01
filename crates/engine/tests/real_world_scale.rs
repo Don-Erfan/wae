@@ -263,7 +263,7 @@ fn release_baseline(key: &str, override_name: &str, default_ms: u64) -> Duration
         return duration_env(override_name, default_ms);
     }
     let value: serde_json::Value =
-        serde_json::from_str(include_str!("../../../performance/baselines/v0.0.21.json"))
+        serde_json::from_str(include_str!("../../../performance/baselines/v0.0.24.json"))
             .expect("valid checked-in release performance baseline");
     Duration::from_millis(value[key].as_u64().unwrap_or(default_ms))
 }

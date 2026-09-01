@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "release": "0.0.24",
+  "runner": "release-validation-linux-x86_64",
+  "modules": 10000,
+  "coldMedianMs": 586,
+  "warmMedianMs": 280,
+  "editMedianMs": 247,
+  "peakRssKiB": 152760,
+  "coldEnvelopePercent": 125,
+  "warmEnvelopePercent": 125,
+  "editEnvelopePercent": 120
+}

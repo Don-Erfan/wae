@@ -35,8 +35,11 @@ Ratchet mode never creates state implicitly. Review the current diagnostics, exp
 
 ```bash
 cargo run -p wae-cli -- baseline create
+cargo run -p wae-cli -- baseline list --rule ARCH-003
+cargo run -p wae-cli -- baseline prune
 WAE_BASE_REF=origin/master cargo run -p wae-cli -- check --changed
 cargo run -p wae-cli -- check --changed --base origin/main
+cargo run -p wae-cli -- check --fail-on error --max-warnings 20
 ```
 
 Supported reporters are `human`, `json`, `jsonl`, and `sarif`. Exit codes are stable: `0` passed, `1` violations, `2` project/config error, and `3` internal error.
@@ -67,8 +70,8 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.23-assets.spdx.json
-jq '.components | length' wae-v0.0.23-dependencies.cdx.json
+jq '.packages | length' wae-v0.0.24-assets.spdx.json
+jq '.components | length' wae-v0.0.24-dependencies.cdx.json
 ```
 
 The checksum proves both downloaded inventories are the files signed by the release workflow; use

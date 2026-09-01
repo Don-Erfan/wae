@@ -152,9 +152,13 @@ pub mod domain {
     /// Framework-neutral facts extracted from syntax by a parser adapter. Framework adapters
     /// consume this IR instead of rescanning source text with regular expressions.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(default)]
     pub struct ModuleSemantics {
         pub directives: Vec<String>,
         pub exported_runtime: Option<String>,
+        /// Framework marker packages imported for their side effects, such as Next.js
+        /// `server-only` and `client-only`. The parser records syntax facts; adapters own meaning.
+        pub marker_imports: Vec<String>,
     }
 
     /// Open layer identity; configured layer names remain first-class in the IR.
@@ -402,6 +406,7 @@ pub mod domain {
     pub enum DependencyTarget {
         Internal(ModuleId),
         WorkspacePackage { package: PackageName, module: ModuleId },
+        Builtin(String),
         ExternalPackage(PackageName),
         Unresolved { specifier: String, reason: String },
     }
@@ -643,12 +648,32 @@ pub mod domain {
 
 pub mod rule_registry {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RuleScope {
+        Edge,
+        Closure,
+        Global,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct RuleDescriptor {
         pub id: &'static str,
         pub title: &'static str,
         pub description: &'static str,
         pub category: &'static str,
         pub configurable: bool,
+    }
+
+    impl RuleDescriptor {
+        pub fn scope(&self) -> RuleScope {
+            match self.id {
+                "ARCH-002" | "ARCH-003" | "ARCH-004" | "ARCH-005" | "ARCH-007" | "ARCH-008"
+                | "ARCH-010" | "PACKAGE-002" | "PACKAGE-003" | "PACKAGE-004" => RuleScope::Edge,
+                "RUNTIME-001" | "RUNTIME-002" | "RUNTIME-003" | "RUNTIME-004" | "RUNTIME-005" => {
+                    RuleScope::Closure
+                }
+                _ => RuleScope::Global,
+            }
+        }
     }
 
     pub static RULES: &[RuleDescriptor] = &[
@@ -848,7 +873,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.23"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.24"]);
     }
 
     #[test]
@@ -1001,5 +1026,16 @@ mod tests {
             diagnostic
         };
         assert_ne!(diagnostic("alpha").fingerprint, diagnostic("beta").fingerprint);
+    }
+
+    #[test]
+    fn every_configurable_rule_declares_an_incremental_scope() {
+        use crate::rule_registry::{RuleScope, configurable_ids, descriptor};
+        let scopes =
+            configurable_ids().map(|id| descriptor(id).unwrap().scope()).collect::<Vec<_>>();
+        assert_eq!(scopes.len(), 21);
+        assert!(scopes.contains(&RuleScope::Edge));
+        assert!(scopes.contains(&RuleScope::Closure));
+        assert!(scopes.contains(&RuleScope::Global));
     }
 }

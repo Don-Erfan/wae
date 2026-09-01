@@ -10,7 +10,7 @@ const binaryPath = path.join(__dirname, binaryName);
 
 if (!fs.existsSync(binaryPath)) {
   console.error(
-    "WAE binary was not found. Reinstall the package or run `npm rebuild @don-erfan/wae`."
+    "WAE binary was not found. Package lifecycle scripts may have been disabled; reinstall without `--ignore-scripts` or run `npm rebuild @don-erfan/wae`."
   );
   process.exit(1);
 }

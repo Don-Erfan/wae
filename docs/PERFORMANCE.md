@@ -23,6 +23,12 @@ baseline in `performance/baselines/`. A 50,000-module full-engine gate runs on e
 scheduled/manual workflow records the equivalent 100,000-module cold, warm, edit and peak-RSS
 contract. All results are retained as performance artifacts.
 
+`wae check --verbose` includes a per-rule profile (nanoseconds and emitted diagnostic count), so
+slow rules can be attributed rather than hidden inside an aggregate rules bucket. Cache module
+shards are loaded on demand; discovered file membership avoids per-dependency filesystem stats;
+semantic graph hashing streams directly into the hasher without constructing a project-sized JSON
+buffer.
+
 ## Required CI gate
 
 The release-mode gate constructs a 100,000-module chain, computes all strongly connected

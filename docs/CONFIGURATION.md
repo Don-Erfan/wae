@@ -61,6 +61,18 @@ rules:
 suppressions:
   require_reason: true
   report_unused: true
+  paths:
+    - pattern: "src/legacy/**"
+      rules: [ARCH-003, ARCH-004]
+      reason: "migration ARC-142"
+  fingerprints:
+    - fingerprint: "stable-diagnostic-fingerprint"
+      reason: "accepted exception ARC-199"
+
+output:
+  format: human
+  fail_on: error
+  max_warnings: 20
 
 baseline:
   file: .wae/baseline.json
@@ -161,20 +173,30 @@ diagnostics in that line scope; text inside strings, templates and block comment
 import { legacyClient } from "../legacy/client";
 ```
 
+Use `// wae-ignore-file ARCH-003 -- reason` for a whole-file exception. Config-level `paths`
+support migration globs, while `fingerprints` are appropriate for graph-wide diagnostics whose
+primary source line is only representational. Every form is validated and carries an auditable
+reason.
+
 Suppressed diagnostics stay visible in human, JSON, JSONL, and SARIF output, but do not fail the
 check. SARIF records them as accepted in-source suppressions. Missing reasons, unknown rule IDs,
 and unused directives produce `SUPPRESS-001` warnings when the corresponding options are enabled.
 
 ## Baselines
 
-`wae baseline create` records only unsuppressed error/warning diagnostics. Informational and
-suppressed diagnostics remain visible in reports but are excluded from the ratchet file; the
-command prints the recorded and excluded counts.
+`wae baseline create` records diagnostics at the configured failure threshold (errors by default).
+Warnings stay visible without breaking builds unless `output.fail_on: warning`, `max_warnings`,
+`--fail-on warning`, or `--max-warnings N` opts into stricter behavior. Suppressed and
+informational diagnostics are excluded from the ratchet file.
+
+Schema-v3 entries retain rule, source, target, reason and optional numeric `expiresAt` Unix time.
+Use `wae baseline list [--rule ARCH-003]` for review and `wae baseline prune` to remove expired or
+resolved entries. `check --changed` refuses an expired baseline until it is pruned.
 
 Fingerprint identity is structural: rule ID, canonical source/target and stable file identity.
 Messages, severity, suggestions, line/column movement and `related_rules` presentation metadata do
 not change it. The baseline reader accepts the old `0.0.10` and `0.0.11` fingerprint forms as
-migration aliases, so existing committed baselines remain valid after upgrading to `0.0.12`.
+migration aliases, and schema-v1/v2 files remain readable after upgrading.
 
 ## Safe initialization and ownership validation
 

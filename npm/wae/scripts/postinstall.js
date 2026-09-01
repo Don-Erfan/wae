@@ -179,6 +179,8 @@ async function installVerifiedBinary(options = {}) {
   const nonce = `${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
   const temporaryBinaryPath = path.join(binDir, `.wae-${nonce}.tmp`);
   const temporaryChecksumPath = path.join(binDir, `.wae-${nonce}.sha256.tmp`);
+  const embeddedChecksumsPath = path.join(__dirname, "..", "checksums.json");
+  const embeddedChecksums = JSON.parse(fs.readFileSync(embeddedChecksumsPath, "utf8"));
 
   fs.mkdirSync(binDir, { recursive: true });
 
@@ -186,9 +188,13 @@ async function installVerifiedBinary(options = {}) {
     console.log(`Downloading ${assetName} from ${downloadUrl}`);
     const download = options.download || downloadFile;
     await download(downloadUrl, temporaryBinaryPath);
-    await download(`${downloadUrl}.sha256`, temporaryChecksumPath);
-
-    const expected = fs.readFileSync(temporaryChecksumPath, "utf8").trim().split(/\s+/)[0];
+    let expected = embeddedChecksums[assetName];
+    if (!expected) {
+      // Source checkouts keep an empty manifest. Published packages embed release hashes so the
+      // trust root is npm package integrity, independent of the GitHub release origin.
+      await download(`${downloadUrl}.sha256`, temporaryChecksumPath);
+      expected = fs.readFileSync(temporaryChecksumPath, "utf8").trim().split(/\s+/)[0];
+    }
     const actual = sha256(temporaryBinaryPath);
     if (!/^[a-f0-9]{64}$/i.test(expected) || actual !== expected.toLowerCase()) {
       throw new Error(`SHA-256 verification failed for ${assetName}`);

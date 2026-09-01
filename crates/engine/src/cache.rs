@@ -43,6 +43,8 @@ struct CacheManifest {
     parser_version: String,
     #[serde(default)]
     rules: Option<CachedRuleAnalysis>,
+    #[serde(default)]
+    modules: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +62,8 @@ pub(crate) struct AnalysisCache {
     dirty_files: BTreeMap<String, CachedModuleAnalysis>,
     dirty_rules: Option<CachedRuleAnalysis>,
     needs_prune: bool,
+    stale_files: BTreeSet<String>,
+    loaded_shards: BTreeSet<u8>,
 }
 
 impl AnalysisCache {
@@ -83,6 +87,8 @@ impl AnalysisCache {
                 dirty_files: BTreeMap::new(),
                 dirty_rules: None,
                 needs_prune: false,
+                stale_files: BTreeSet::new(),
+                loaded_shards: BTreeSet::new(),
             });
         }
         let parent = path
@@ -91,8 +97,16 @@ impl AnalysisCache {
         fs::create_dir_all(parent).map_err(|error| {
             AnalysisError::Project(format!("cannot create cache directory: {error}"))
         })?;
-        let file = read_cache(&path);
-        let needs_prune = file.files.keys().ne(live_files.iter());
+        let manifest = read_manifest(&path).unwrap_or_default();
+        let stale_files =
+            manifest.modules.difference(&live_files).cloned().collect::<BTreeSet<_>>();
+        let needs_prune = manifest.modules != live_files;
+        let file = CacheFile {
+            schema_version: manifest.schema_version,
+            parser_version: manifest.parser_version,
+            files: BTreeMap::new(),
+            rules: manifest.rules,
+        };
         Ok(Self {
             enabled: true,
             path,
@@ -102,21 +116,32 @@ impl AnalysisCache {
             dirty_files: BTreeMap::new(),
             dirty_rules: None,
             needs_prune,
+            stale_files,
+            loaded_shards: BTreeSet::new(),
         })
     }
 
     pub(crate) fn get(
-        &self,
+        &mut self,
         module: &str,
         hash: u64,
         environment_hash: u64,
     ) -> Option<CachedModuleAnalysis> {
+        if self.enabled {
+            let shard = shard_id(module);
+            if self.loaded_shards.insert(shard) {
+                self.file.files.extend(read_shard(&shard_path(&self.path, shard)));
+            }
+        }
         self.enabled
             .then(|| self.file.files.get(module))
             .flatten()
             .filter(|cached| cached.hash == hash && cached.environment_hash == environment_hash)
             .filter(|cached| {
-                cached.resolved_paths.iter().all(|path| self.root.join(path).is_file())
+                cached
+                    .resolved_paths
+                    .iter()
+                    .all(|path| self.live_files.contains(path) || self.root.join(path).is_file())
             })
             .filter(|cached| !unresolved_candidate_became_live(cached, &self.live_files))
             .cloned()
@@ -174,13 +199,7 @@ impl AnalysisCache {
         let _lock = acquire_advisory_lock(&self.path.with_extension("lock"))?;
         let mut affected_shards =
             self.dirty_files.keys().map(|module| shard_id(module)).collect::<BTreeSet<_>>();
-        affected_shards.extend(
-            self.file
-                .files
-                .keys()
-                .filter(|module| !self.live_files.contains(*module))
-                .map(|module| shard_id(module)),
-        );
+        affected_shards.extend(self.stale_files.iter().map(|module| shard_id(module)));
         for shard in affected_shards {
             let path = shard_path(&self.path, shard);
             let mut records = read_shard(&path);
@@ -198,12 +217,14 @@ impl AnalysisCache {
             schema_version: 3,
             parser_version: PARSER_CACHE_VERSION.into(),
             rules: self.file.rules.clone(),
+            modules: BTreeSet::new(),
         });
         if self.dirty_rules.is_some() {
             manifest.rules.clone_from(&self.dirty_rules);
         }
         manifest.schema_version = 3;
         manifest.parser_version = PARSER_CACHE_VERSION.into();
+        manifest.modules.clone_from(&self.live_files);
         write_json_atomic(&self.path, &manifest)?;
         Ok(())
     }
@@ -272,6 +293,7 @@ fn unresolved_candidate_became_live(
     })
 }
 
+#[cfg(test)]
 fn read_cache(path: &Path) -> CacheFile {
     let Some(manifest) = read_manifest(path) else { return fresh_cache() };
     let mut files = BTreeMap::new();

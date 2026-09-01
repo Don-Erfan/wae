@@ -89,6 +89,18 @@ pub struct RuleSet {
     rules: Vec<Box<dyn Rule>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleProfile {
+    pub rule_id: &'static str,
+    pub elapsed_ns: u128,
+    pub diagnostics: usize,
+}
+
+pub struct RuleEvaluation {
+    pub diagnostics: Vec<Diagnostic>,
+    pub profiles: Vec<RuleProfile>,
+}
+
 impl RuleSet {
     pub fn new() -> Self {
         Self::default()
@@ -122,6 +134,10 @@ impl RuleSet {
         self
     }
     pub fn evaluate(&self, context: &RuleContext<'_>) -> Result<Vec<Diagnostic>, String> {
+        Ok(self.evaluate_profiled(context)?.diagnostics)
+    }
+
+    pub fn evaluate_profiled(&self, context: &RuleContext<'_>) -> Result<RuleEvaluation, String> {
         let enabled = self
             .rules
             .iter()
@@ -162,10 +178,13 @@ impl RuleSet {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut diagnostics = Vec::new();
-        for batch in batches {
+        let mut profiles = Vec::new();
+        for (batch, profile) in batches {
             diagnostics.extend(batch);
+            profiles.push(profile);
         }
-        Ok(diagnostics)
+        profiles.sort_by_key(|profile| profile.rule_id);
+        Ok(RuleEvaluation { diagnostics, profiles })
     }
 }
 
@@ -173,14 +192,20 @@ fn evaluate_one(
     rule: &dyn Rule,
     severity: wae_core::domain::Severity,
     context: &RuleContext<'_>,
-) -> Result<Vec<Diagnostic>, String> {
+) -> Result<(Vec<Diagnostic>, RuleProfile), String> {
+    let started = std::time::Instant::now();
     let mut diagnostics = Vec::new();
     rule.evaluate(context, &mut diagnostics)?;
     for diagnostic in &mut diagnostics {
         diagnostic.severity = severity.clone();
         diagnostic.refresh_fingerprint();
     }
-    Ok(diagnostics)
+    let profile = RuleProfile {
+        rule_id: rule.metadata().id,
+        elapsed_ns: started.elapsed().as_nanos(),
+        diagnostics: diagnostics.len(),
+    };
+    Ok((diagnostics, profile))
 }
 
 pub struct CircularDependencyRule;

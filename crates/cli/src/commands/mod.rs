@@ -8,11 +8,11 @@ use std::process::Command;
 
 use serde::Serialize;
 use serde_json::json;
-use wae_config::{CONFIG_FILE, Config, ConfigPreset};
+use wae_config::{CONFIG_FILE, Config, ConfigPreset, FailOn};
 use wae_core::domain::{DependencyKind, Diagnostic, ModuleKind};
 use wae_engine::{
-    Analysis, AnalysisError, AnalyzeRequest, CancellationToken, ChangeSet, Engine, FailurePolicy,
-    ImpactAnalyzer, TraceResolutionRequest, VcsPort, trace_resolution, validate_project_config,
+    Analysis, AnalysisError, AnalyzeRequest, CancellationToken, ChangeSet, Engine, ImpactAnalyzer,
+    TraceResolutionRequest, VcsPort, trace_resolution, validate_project_config,
 };
 use wae_reporters::{Format, render};
 
@@ -77,6 +77,8 @@ pub struct CheckOptions {
     pub config_path: Option<PathBuf>,
     pub no_cache: bool,
     pub verbose: bool,
+    pub fail_on: Option<FailOn>,
+    pub max_warnings: Option<usize>,
     pub cancellation: CancellationToken,
 }
 
@@ -90,8 +92,17 @@ struct RegressionSummary {
 }
 
 pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
-    let CheckOptions { changed, format, base, config_path, no_cache, verbose, cancellation } =
-        options;
+    let CheckOptions {
+        changed,
+        format,
+        base,
+        config_path,
+        no_cache,
+        verbose,
+        fail_on,
+        max_warnings,
+        cancellation,
+    } = options;
     let mut request = AnalyzeRequest::new(root).with_cancellation(cancellation);
     if let Some(path) = &config_path {
         request = request.with_config(path);
@@ -103,35 +114,43 @@ pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
         Ok(result) => result,
         Err(output) => return output,
     };
+    analysis.failure_policy = analysis.failure_policy.with_overrides(fail_on, max_warnings);
     let mut regression = None;
     if changed {
         let signatures = match baseline::load(root) {
             Ok(value) => value,
             Err(error) => return CliOutput::project_error(error),
         };
-        let affected = match affected_modules(root, &analysis, base.as_deref()) {
+        if signatures.expired_count() > 0 {
+            return CliOutput::project_error(format!(
+                "baseline contains {} expired entries; run `wae baseline prune`",
+                signatures.expired_count()
+            ));
+        }
+        let (changes, affected) = match affected_modules(root, &analysis, base.as_deref()) {
             Ok(value) => value,
             Err(error) => return CliOutput::project_error(error),
         };
         let current_failures = analysis
             .diagnostics
             .iter()
-            .filter(|diagnostic| FailurePolicy::is_failure(diagnostic))
+            .filter(|diagnostic| analysis.failure_policy.is_failure(diagnostic))
             .cloned()
             .collect::<Vec<_>>();
         let existing = current_failures
             .iter()
             .filter(|diagnostic| {
-                diagnostic_affects(diagnostic, &affected) && signatures.matches(diagnostic)
+                diagnostic_affects(diagnostic, &changes, &affected)
+                    && signatures.matches(diagnostic)
             })
             .count();
         analysis.diagnostics.retain(|diagnostic| {
-            diagnostic_affects(diagnostic, &affected) && !signatures.matches(diagnostic)
+            diagnostic_affects(diagnostic, &changes, &affected) && !signatures.matches(diagnostic)
         });
         regression = Some(RegressionSummary {
             affected_modules: affected.len(),
             existing,
-            introduced: FailurePolicy::count(&analysis.diagnostics),
+            introduced: analysis.failure_policy.count(&analysis.diagnostics),
             fixed: signatures.len().saturating_sub(signatures.matched_count(&current_failures)),
         });
     }
@@ -153,7 +172,7 @@ pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
             Err(error) => return CliOutput::project_error(error),
         },
     };
-    let has_failures = FailurePolicy::count(&analysis.diagnostics) > 0;
+    let has_failures = analysis.failure_policy.has_failures(&analysis.diagnostics);
     let reporting_started = std::time::Instant::now();
     let rendered = render(&analysis, format)
         .and_then(|output| attach_regression_summary(output, format, regression.as_ref()));
@@ -204,7 +223,7 @@ fn attach_regression_summary(
 }
 
 fn verbose_analysis(analysis: &Analysis) -> String {
-    format!(
+    let mut report = format!(
         "WAE timing: discovery={}ms classification={}ms parsing={}ms resolution={}ms graph={}ms rules={}ms cache={}ms reporting={}ms orchestration={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={}",
         analysis.timings.discovery_ms,
         analysis.timings.classification_ms,
@@ -220,7 +239,18 @@ fn verbose_analysis(analysis: &Analysis) -> String {
         analysis.incremental.restored_modules,
         analysis.incremental.analyzed_modules,
         analysis.incremental.rule_snapshot_reused,
-    )
+    );
+    if !analysis.timings.rules.is_empty() {
+        report.push_str("\nRule profile:");
+        for (rule, timing) in &analysis.timings.rules {
+            report.push_str(&format!(
+                "\n  {rule}: {:.3}ms ({} diagnostics)",
+                timing.elapsed_ns as f64 / 1_000_000.0,
+                timing.diagnostics
+            ));
+        }
+    }
+    report
 }
 
 pub fn baseline_create(root: &Path, cancellation: &CancellationToken) -> CliOutput {
@@ -235,6 +265,29 @@ pub fn baseline_create(root: &Path, cancellation: &CancellationToken) -> CliOutp
             result.path.display(),
             result.suppressed,
             result.informational,
+        )),
+        Err(error) => CliOutput::project_error(error),
+    }
+}
+
+pub fn baseline_list(root: &Path, rule: Option<&str>) -> CliOutput {
+    match baseline::list(root, rule).and_then(|entries| {
+        serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())
+    }) {
+        Ok(entries) => CliOutput::success(entries),
+        Err(error) => CliOutput::project_error(error),
+    }
+}
+
+pub fn baseline_prune(root: &Path, cancellation: &CancellationToken) -> CliOutput {
+    let analysis = match analyze(root, cancellation) {
+        Ok(result) => result,
+        Err(output) => return output,
+    };
+    match baseline::prune(root, &analysis.diagnostics) {
+        Ok((path, removed, remaining)) => CliOutput::success(format!(
+            "Pruned {removed} expired or resolved baseline entries from {}; {remaining} remain.",
+            path.display()
         )),
         Err(error) => CliOutput::project_error(error),
     }
@@ -484,7 +537,7 @@ fn affected_modules(
     root: &Path,
     analysis: &Analysis,
     explicit_base: Option<&str>,
-) -> Result<HashSet<String>, String> {
+) -> Result<(ChangeSet, HashSet<String>), String> {
     let mut changes = GitVcsAdapter { root }.changes(explicit_base)?;
     for diagnostic in &analysis.diagnostics {
         if diagnostic.rule_id.0 == "RESOLVE-001" {
@@ -506,7 +559,8 @@ fn affected_modules(
             }
         }
     }
-    Ok(ImpactAnalyzer::affected(analysis, &changes))
+    let affected = ImpactAnalyzer::affected(analysis, &changes);
+    Ok((changes, affected))
 }
 
 struct GitVcsAdapter<'a> {
@@ -630,9 +684,24 @@ fn normalize_relative(path: &Path) -> String {
     normalized.to_string_lossy().replace('\\', "/")
 }
 
-fn diagnostic_affects(diagnostic: &Diagnostic, affected: &HashSet<String>) -> bool {
-    diagnostic.primary_location.as_ref().is_some_and(|l| affected.contains(&l.file))
-        || diagnostic.dependency_path.iter().any(|m| affected.contains(&m.0))
+fn diagnostic_affects(
+    diagnostic: &Diagnostic,
+    changes: &ChangeSet,
+    affected: &HashSet<String>,
+) -> bool {
+    use wae_core::rule_registry::RuleScope;
+    let direct = |file: &str| changes.changed.contains(file) || changes.deleted.contains(file);
+    match wae_core::rule_registry::descriptor(&diagnostic.rule_id.0).map(|rule| rule.scope()) {
+        Some(RuleScope::Edge) | None => {
+            diagnostic.primary_location.as_ref().is_some_and(|location| direct(&location.file))
+                || diagnostic.dependency_path.iter().any(|module| direct(&module.0))
+        }
+        Some(RuleScope::Closure) => {
+            diagnostic.primary_location.as_ref().is_some_and(|l| affected.contains(&l.file))
+                || diagnostic.dependency_path.iter().any(|m| affected.contains(&m.0))
+        }
+        Some(RuleScope::Global) => !changes.changed.is_empty() || !changes.deleted.is_empty(),
+    }
 }
 
 #[cfg(test)]
@@ -692,6 +761,7 @@ mod tests {
 
         let project = Project::default();
         let analysis = Analysis {
+            failure_policy: Default::default(),
             schema_version: 1,
             graph: Default::default(),
             ownership: Default::default(),
@@ -700,7 +770,7 @@ mod tests {
             incremental: Default::default(),
             timings: Default::default(),
         };
-        let affected = affected_modules(&root, &analysis, Some("HEAD")).unwrap();
+        let (_, affected) = affected_modules(&root, &analysis, Some("HEAD")).unwrap();
         assert!(affected.contains("tracked.ts"));
         assert!(affected.contains("staged.ts"));
         assert!(affected.contains("untracked.ts"));

@@ -4,6 +4,7 @@ use wae_core::domain::{DependencyKind, ModulePath};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution {
     Module(ModulePath),
+    Builtin(String),
     External(String),
     Redirect(String),
     Invalid(String),

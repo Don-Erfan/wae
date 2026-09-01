@@ -52,7 +52,15 @@ impl ParserAdapter for JsTsParser {
         imports.dedup_by(|a, b| {
             a.specifier == b.specifier && a.location == b.location && a.kind == b.kind
         });
-        Ok(ParsedModule { imports, semantics: collect_semantics(tree.root_node(), source) })
+        let mut semantics = collect_semantics(tree.root_node(), source);
+        semantics.marker_imports = imports
+            .iter()
+            .filter(|import| matches!(import.specifier.as_str(), "server-only" | "client-only"))
+            .map(|import| import.specifier.clone())
+            .collect();
+        semantics.marker_imports.sort();
+        semantics.marker_imports.dedup();
+        Ok(ParsedModule { imports, semantics })
     }
 }
 

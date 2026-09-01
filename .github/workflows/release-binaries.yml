@@ -272,6 +272,33 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
+      - name: Download release checksums for npm trust root
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: wae-*
+          path: npm-assets
+          merge-multiple: true
+
+      - name: Embed platform checksums in the npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const output = {};
+          for (const file of fs.readdirSync('npm-assets').filter(name => name.endsWith('.sha256')).sort()) {
+            const contents = fs.readFileSync(path.join('npm-assets', file), 'utf8').trim();
+            const [hash, asset] = contents.split(/\s+/);
+            if (!/^[a-f0-9]{64}$/i.test(hash) || !asset) throw new Error(`Invalid checksum ${file}`);
+            output[path.basename(asset)] = hash.toLowerCase();
+          }
+          if (Object.keys(output).length !== 15) {
+            throw new Error(`Expected 15 component/platform hashes, got ${Object.keys(output).length}`);
+          }
+          fs.writeFileSync('npm/wae/checksums.json', `${JSON.stringify(output, null, 2)}\n`);
+          NODE
+
       - name: Verify npm package contents
         working-directory: npm/wae
         env:

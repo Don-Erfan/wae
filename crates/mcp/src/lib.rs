@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use wae_core::domain::{ModuleId, ModuleKind};
-use wae_engine::{AnalyzeRequest, Engine, FailurePolicy};
+use wae_engine::{AnalyzeRequest, Engine};
 
 #[derive(Clone, Debug)]
 pub struct ServerPolicy {
@@ -18,6 +18,10 @@ impl ServerPolicy {
             allow_any_root: false,
             max_request_bytes: 1024 * 1024,
         }
+    }
+
+    pub fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
     }
 
     pub fn with_allowed_root(mut self, root: PathBuf) -> Self {
@@ -275,7 +279,7 @@ fn execute_tool(
                 })
                 .collect::<Vec<_>>();
             let allowed = edge_exists.then(|| {
-                diagnostics.iter().all(|diagnostic| !FailurePolicy::is_failure(diagnostic))
+                diagnostics.iter().all(|diagnostic| !analysis.failure_policy.is_failure(diagnostic))
             });
             json!({
                 "from": from,

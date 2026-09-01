@@ -89,14 +89,18 @@ impl FrameworkAdapter for NextJsAdapter {
     fn classify(&self, module: ModuleEvidence<'_>) -> FrameworkClassification {
         let path = module.path.replace('\\', "/");
         let segments = path.split('/').collect::<Vec<_>>();
-        let app_index = segments.iter().position(|part| *part == "app");
-        let pages_index = segments.iter().position(|part| *part == "pages");
+        let app_index = router_root_index(&segments, "app");
+        let pages_index = router_root_index(&segments, "pages");
         let file = segments.last().copied().unwrap_or_default();
         let stem = file.split('.').next().unwrap_or(file);
         let use_client =
             module.semantics.directives.iter().any(|directive| directive == "use client");
         let use_server =
             module.semantics.directives.iter().any(|directive| directive == "use server");
+        let server_only =
+            module.semantics.marker_imports.iter().any(|specifier| specifier == "server-only");
+        let client_only =
+            module.semantics.marker_imports.iter().any(|specifier| specifier == "client-only");
         let explicit_runtime = explicit_runtime(module.semantics);
 
         let router = if app_index.is_some() {
@@ -137,7 +141,13 @@ impl FrameworkAdapter for NextJsAdapter {
             "module"
         };
 
-        let (runtime, runtime_source) = if let Some(runtime) = explicit_runtime {
+        let (runtime, runtime_source) = if server_only && client_only {
+            (Runtime::Unknown, "conflicting-marker")
+        } else if server_only {
+            (Runtime::Server, "marker-package")
+        } else if client_only {
+            (Runtime::Browser, "marker-package")
+        } else if let Some(runtime) = explicit_runtime {
             (runtime, "explicit")
         } else if use_client {
             (Runtime::Browser, "directive")
@@ -169,12 +179,24 @@ impl FrameworkAdapter for NextJsAdapter {
             ("runtimeSource".into(), runtime_source.into()),
             ("useClient".into(), use_client.to_string()),
             ("useServer".into(), use_server.to_string()),
+            ("serverOnly".into(), server_only.to_string()),
+            ("clientOnly".into(), client_only.to_string()),
         ]);
         FrameworkClassification {
             metadata: FrameworkMetadata { adapter_id: Some(self.id().into()), attributes },
             runtime,
         }
     }
+}
+
+fn router_root_index(segments: &[&str], router: &str) -> Option<usize> {
+    segments.iter().position(|segment| *segment == router).filter(|index| match *index {
+        0 => true,
+        1 => segments[0] == "src",
+        2 => matches!(segments[0], "apps" | "packages"),
+        3 => matches!(segments[0], "apps" | "packages") && segments[2] == "src",
+        _ => false,
+    })
 }
 
 fn manifest_has_dependency(manifest: &serde_json::Value, dependency: &str) -> bool {
@@ -244,7 +266,7 @@ mod tests {
     fn classifies_app_router_client_server_route_action_and_middleware_modules() {
         let adapter = NextJsAdapter;
         let client_semantics =
-            ModuleSemantics { directives: vec!["use client".into()], exported_runtime: None };
+            ModuleSemantics { directives: vec!["use client".into()], ..ModuleSemantics::default() };
         let client = adapter.classify(ModuleEvidence {
             path: "src/app/cart/client.tsx",
             semantics: &client_semantics,
@@ -256,13 +278,14 @@ mod tests {
             adapter.classify(ModuleEvidence { path: "src/app/cart/page.tsx", semantics: &empty });
         assert_eq!(page.runtime, Runtime::Server);
         assert_eq!(page.metadata.attributes["role"], "page");
-        let edge = ModuleSemantics { directives: vec![], exported_runtime: Some("edge".into()) };
+        let edge =
+            ModuleSemantics { exported_runtime: Some("edge".into()), ..ModuleSemantics::default() };
         let route =
             adapter.classify(ModuleEvidence { path: "src/app/api/route.ts", semantics: &edge });
         assert_eq!(route.runtime, Runtime::Edge);
         assert_eq!(route.metadata.attributes["role"], "route-handler");
         let server_action =
-            ModuleSemantics { directives: vec!["use server".into()], exported_runtime: None };
+            ModuleSemantics { directives: vec!["use server".into()], ..ModuleSemantics::default() };
         let action =
             adapter.classify(ModuleEvidence { path: "src/actions.ts", semantics: &server_action });
         assert_eq!(action.metadata.attributes["role"], "server-action-module");
@@ -286,5 +309,32 @@ mod tests {
             semantics: &ModuleSemantics::default(),
         });
         assert_eq!(document.metadata.attributes["role"], "custom-document");
+    }
+
+    #[test]
+    fn router_roots_are_anchored_and_marker_packages_define_runtime() {
+        let adapter = NextJsAdapter;
+        let nested = adapter.classify(ModuleEvidence {
+            path: "src/components/app/page.tsx",
+            semantics: &ModuleSemantics::default(),
+        });
+        assert_eq!(nested.metadata.attributes["router"], "none");
+        assert_eq!(nested.metadata.attributes["role"], "module");
+
+        let server = adapter.classify(ModuleEvidence {
+            path: "src/lib/secrets.ts",
+            semantics: &ModuleSemantics {
+                marker_imports: vec!["server-only".into()],
+                ..ModuleSemantics::default()
+            },
+        });
+        assert_eq!(server.runtime, Runtime::Server);
+        assert_eq!(server.metadata.attributes["runtimeSource"], "marker-package");
+
+        let monorepo_page = adapter.classify(ModuleEvidence {
+            path: "apps/store/src/app/page.tsx",
+            semantics: &ModuleSemantics::default(),
+        });
+        assert_eq!(monorepo_page.metadata.attributes["router"], "app");
     }
 }

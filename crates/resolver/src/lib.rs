@@ -116,6 +116,7 @@ impl ResolverPipeline {
         mode: ResolutionMode,
     ) -> Self {
         Self::new()
+            .with_handler(BuiltinResolver)
             .with_handler(RelativeResolver { mode })
             .with_handler(AliasResolver { root: root.into(), aliases, mode })
             .with_handler(PackageResolver)
@@ -128,6 +129,7 @@ impl ResolverPipeline {
         mode: ResolutionMode,
     ) -> Self {
         Self::new()
+            .with_handler(BuiltinResolver)
             .with_handler(RelativeResolver { mode })
             .with_handler(AliasResolver { root: root.into(), aliases, mode })
             .with_handler(workspaces)
@@ -140,12 +142,74 @@ impl ResolverPipeline {
         mode: ResolutionMode,
     ) -> Self {
         Self::new()
+            .with_handler(BuiltinResolver)
             .with_handler(RelativeResolver { mode })
             .with_handler(IndexedAliasResolver::new(tsconfigs))
             .with_handler(workspaces)
             .with_handler(PackageResolver)
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct BuiltinResolver;
+
+impl ResolutionHandler for BuiltinResolver {
+    fn name(&self) -> &'static str {
+        "node-builtin"
+    }
+
+    fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
+        let specifier = request.specifier;
+        let unprefixed = specifier.strip_prefix("node:").unwrap_or(specifier);
+        let root = unprefixed.split('/').next().unwrap_or(unprefixed);
+        NODE_BUILTINS.contains(&root).then(|| Resolution::Builtin(format!("node:{unprefixed}")))
+    }
+}
+
+const NODE_BUILTINS: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "test",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
 
 impl ModuleResolver for ResolverPipeline {
     fn resolve(&self, request: &ResolutionRequest<'_>) -> Resolution {
@@ -609,6 +673,35 @@ fn package_name(specifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_builtins_are_distinct_from_external_packages() {
+        fn request<'a>(importer: &'a ModulePath, specifier: &'a str) -> ResolutionRequest<'a> {
+            ResolutionRequest {
+                importer,
+                specifier,
+                dependency_kind: wae_core::domain::DependencyKind::Static,
+                resolution_kind: ResolutionKind::Import,
+                importer_format: ModuleFormat::Esm,
+                mode: ResolutionMode::NodeNext,
+                custom_conditions: &[],
+            }
+        }
+        let importer = ModulePath("src/app.ts".into());
+        let resolver = ResolverPipeline::node_defaults(".", Vec::new());
+        assert_eq!(
+            resolver.resolve(&request(&importer, "node:fs/promises")),
+            Resolution::Builtin("node:fs/promises".into())
+        );
+        assert_eq!(
+            resolver.resolve(&request(&importer, "path")),
+            Resolution::Builtin("node:path".into())
+        );
+        assert_eq!(
+            resolver.resolve(&request(&importer, "server-only")),
+            Resolution::External("server-only".into())
+        );
+    }
     use std::fs;
     use wae_core::domain::DependencyKind;
 

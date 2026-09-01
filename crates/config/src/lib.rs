@@ -286,6 +286,23 @@ pub struct ResolutionConfig {
 pub struct SuppressionConfig {
     pub require_reason: bool,
     pub report_unused: bool,
+    pub paths: Vec<PathSuppression>,
+    pub fingerprints: Vec<FingerprintSuppression>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PathSuppression {
+    pub pattern: String,
+    pub rules: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FingerprintSuppression {
+    pub fingerprint: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,7 +320,12 @@ impl Default for FrameworkConfig {
 
 impl Default for SuppressionConfig {
     fn default() -> Self {
-        Self { require_reason: true, report_unused: true }
+        Self {
+            require_reason: true,
+            report_unused: true,
+            paths: Vec::new(),
+            fingerprints: Vec::new(),
+        }
     }
 }
 
@@ -380,10 +402,30 @@ impl Default for BaselineConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     pub format: OutputFormat,
+    pub fail_on: FailOn,
+    pub max_warnings: Option<usize>,
 }
 impl Default for OutputConfig {
     fn default() -> Self {
-        Self { format: OutputFormat::Human }
+        Self { format: OutputFormat::Human, fail_on: FailOn::Error, max_warnings: None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailOn {
+    #[default]
+    Error,
+    Warning,
+}
+
+impl FailOn {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "error" => Some(Self::Error),
+            "warning" => Some(Self::Warning),
+            _ => None,
+        }
     }
 }
 
@@ -531,6 +573,50 @@ impl Config {
         )?;
         validate_patterns(&self.project.include, "project.include")?;
         validate_patterns(&self.project.exclude, "project.exclude")?;
+        for (index, suppression) in self.suppressions.paths.iter().enumerate() {
+            validate_patterns(
+                std::slice::from_ref(&suppression.pattern),
+                &format!("suppressions.paths.{index}.pattern"),
+            )?;
+            if suppression.rules.is_empty() {
+                return Err(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("suppressions.paths.{index}.rules")),
+                    "a path suppression must name at least one rule".into(),
+                ));
+            }
+            if let Some(rule) = suppression.rules.iter().find(|rule| !known.contains(rule.as_str()))
+            {
+                return Err(config_error(
+                    ConfigErrorKind::UnknownRule,
+                    Some(format!("suppressions.paths.{index}.rules")),
+                    format!("suppression references unknown rule `{rule}`"),
+                ));
+            }
+            if self.suppressions.require_reason && suppression.reason.trim().is_empty() {
+                return Err(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("suppressions.paths.{index}.reason")),
+                    "path suppression requires a reason".into(),
+                ));
+            }
+        }
+        for (index, suppression) in self.suppressions.fingerprints.iter().enumerate() {
+            if suppression.fingerprint.trim().is_empty() {
+                return Err(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("suppressions.fingerprints.{index}.fingerprint")),
+                    "suppression fingerprint cannot be empty".into(),
+                ));
+            }
+            if self.suppressions.require_reason && suppression.reason.trim().is_empty() {
+                return Err(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("suppressions.fingerprints.{index}.reason")),
+                    "fingerprint suppression requires a reason".into(),
+                ));
+            }
+        }
         for (index, condition) in self.resolution.custom_conditions.iter().enumerate() {
             if condition.trim().is_empty() {
                 return Err(config_error(
@@ -588,6 +674,24 @@ impl Config {
         }
         for (id, rule) in &self.rules {
             let Some(options) = rule.options() else { continue };
+            for (name, configured, supported) in [
+                ("max_depth", options.max_depth.is_some(), id == "ARCH-006"),
+                ("max_fan_out", options.max_fan_out.is_some(), id == "ARCH-007"),
+                ("max_fan_in", options.max_fan_in.is_some(), id == "ARCH-008"),
+                (
+                    "entrypoints",
+                    !options.entrypoints.is_empty(),
+                    matches!(id.as_str(), "ARCH-006" | "ARCH-009"),
+                ),
+            ] {
+                if configured && !supported {
+                    return Err(config_error(
+                        ConfigErrorKind::ConflictingConfig,
+                        Some(format!("rules.{id}.{name}")),
+                        format!("rule `{id}` does not support option `{name}`"),
+                    ));
+                }
+            }
             for (name, value) in [
                 ("max_depth", options.max_depth),
                 ("max_fan_out", options.max_fan_out),
@@ -700,6 +804,34 @@ mod tests {
         assert_eq!(config.rules["ARCH-005"].severity(), Some(Severity::Error));
         assert!(config.configured);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_rule_options_that_the_selected_rule_cannot_consume() {
+        let config: Config = yaml_serde::from_str(
+            "version: 1\nrules:\n  ARCH-003:\n    severity: error\n    max_depth: 4\n",
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.path.as_deref(), Some("rules.ARCH-003.max_depth"));
+        assert!(error.message.contains("does not support"));
+    }
+
+    #[test]
+    fn validates_path_and_identity_suppressions_with_reasons() {
+        let valid: Config = yaml_serde::from_str(
+            "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/legacy/**'\n      rules: [ARCH-003]\n      reason: 'migration ARC-42'\n  fingerprints:\n    - fingerprint: abc123\n      reason: 'accepted ARC-99'\n",
+        )
+        .unwrap();
+        valid.validate().unwrap();
+        let invalid: Config = yaml_serde::from_str(
+            "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/**'\n      rules: [ARCH-003]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            invalid.validate().unwrap_err().path.as_deref(),
+            Some("suppressions.paths.0.reason")
+        );
     }
 
     #[test]

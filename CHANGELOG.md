@@ -8,6 +8,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.24] - 2026-09-01
+
+### Added
+
+- Added explicit Node builtin resolution, anchored Next.js App/Pages Router classification, and
+  `server-only`/`client-only` runtime marker semantics.
+- Added warning failure thresholds through `output.fail_on`, `output.max_warnings`, `--fail-on`,
+  and `--max-warnings`, with the effective policy exposed by machine reporters.
+- Added file-, path-, and fingerprint-level suppressions with required reasons, plus auditable
+  baseline metadata, expiration, `baseline list`, and `baseline prune`.
+- Added per-rule execution profiles and an end-to-end positive harness covering all 21
+  configurable architecture, package, and runtime rules.
+
+### Changed
+
+- Made LSP force coalescing monotonic and shared workspace snapshots with `Arc` to avoid cloning
+  complete analysis graphs between editor generations.
+- Streamed semantic graph hashing, combined module and environment discovery, loaded cache shards
+  lazily, and replaced normal resolved-target filesystem stats with in-memory membership checks.
+- Made `check --changed` scope-aware so edge-local rules do not expand every shared-module edit to
+  the complete reverse dependency closure.
+- Embedded release-generated binary hashes in the npm package, separating checksum trust from the
+  GitHub asset download origin while retaining the hardened atomic installer.
+
+### Fixed
+
+- Bounded MCP stdio input before allocation and preserved a hard request-size ceiling for malformed
+  or newline-free clients.
+- Rejected unsupported per-rule options explicitly instead of accepting configurations that became
+  silent no-ops.
+
 ## [0.0.23] - 2026-08-31
 
 ### Added
@@ -237,7 +268,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.23...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.24...HEAD
+[0.0.24]: https://github.com/Don-Erfan/wae/compare/v0.0.23...v0.0.24
 [0.0.23]: https://github.com/Don-Erfan/wae/compare/v0.0.22...v0.0.23
 [0.0.22]: https://github.com/Don-Erfan/wae/compare/v0.0.21...v0.0.22
 [0.0.21]: https://github.com/Don-Erfan/wae/compare/v0.0.20...v0.0.21

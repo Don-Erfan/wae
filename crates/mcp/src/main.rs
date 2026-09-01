@@ -28,9 +28,10 @@ fn main() {
         }
     }
     let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    while let Ok(Some(line)) = read_bounded_line(&mut stdin, policy.max_request_bytes()) {
+        let line = String::from_utf8_lossy(&line).into_owned();
         if line.trim().is_empty() {
             continue;
         }
@@ -42,6 +43,34 @@ fn main() {
             {
                 break;
             }
+        }
+    }
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, maximum: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut output = Vec::with_capacity(maximum.min(8 * 1024));
+    let mut saw_input = false;
+    let mut overflow = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(saw_input.then_some(output));
+        }
+        saw_input = true;
+        let consumed =
+            buffer.iter().position(|byte| *byte == b'\n').map_or(buffer.len(), |i| i + 1);
+        let ended = buffer.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        let payload = &buffer[..consumed];
+        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        let remaining = maximum.saturating_add(1).saturating_sub(output.len());
+        output.extend_from_slice(&payload[..payload.len().min(remaining)]);
+        overflow |= payload.len() > remaining;
+        reader.consume(consumed);
+        if ended {
+            if overflow && output.len() <= maximum {
+                output.push(0);
+            }
+            return Ok(Some(output));
         }
     }
 }

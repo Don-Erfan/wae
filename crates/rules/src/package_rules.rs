@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use globset::GlobBuilder;
 use wae_core::domain::{DependencyTarget, Diagnostic, ModuleId, PackageName, SourceLocation};
 use wae_core::rule_registry::{self, RuleDescriptor};
@@ -89,20 +91,24 @@ impl Rule for UndeclaredWorkspaceDependencyRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
+        let packages = context
+            .project
+            .modules
+            .iter()
+            .map(|module| (&module.id, &module.package))
+            .collect::<HashMap<_, _>>();
         for dependency in &context.project.resolved_dependencies {
             let DependencyTarget::WorkspacePackage { package: target, module } = &dependency.target
             else {
                 continue;
             };
-            let Some(importer) =
-                context.project.modules.iter().find(|module| module.id == dependency.from)
-            else {
+            let Some(importer_package) = packages.get(&dependency.from) else {
                 continue;
             };
-            if importer.package == *target {
+            if **importer_package == *target {
                 continue;
             }
-            let Some(declared) = context.declared_package_dependencies.get(&importer.package)
+            let Some(declared) = context.declared_package_dependencies.get(*importer_package)
             else {
                 continue;
             };
@@ -114,11 +120,11 @@ impl Rule for UndeclaredWorkspaceDependencyRule {
                     &dependency.location,
                     format!(
                         "Workspace package `{}` is not declared by `{}`",
-                        target.0, importer.package.0
+                        target.0, importer_package.0
                     ),
                     "Add the workspace package to dependencies, devDependencies, peerDependencies, or optionalDependencies.",
                 );
-                diagnostic.metadata.insert("importerPackage".into(), importer.package.0.clone());
+                diagnostic.metadata.insert("importerPackage".into(), importer_package.0.clone());
                 diagnostic.metadata.insert("targetPackage".into(), target.0.clone());
                 sink.emit(diagnostic);
             }
@@ -137,6 +143,12 @@ impl Rule for CrossPackageRelativeImportRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
+        let packages = context
+            .project
+            .modules
+            .iter()
+            .map(|module| (&module.id, &module.package))
+            .collect::<HashMap<_, _>>();
         for dependency in &context.project.resolved_dependencies {
             if !dependency.specifier.starts_with('.') {
                 continue;
@@ -146,17 +158,13 @@ impl Rule for CrossPackageRelativeImportRule {
                 | DependencyTarget::WorkspacePackage { module, .. } => module,
                 _ => continue,
             };
-            let Some(importer) =
-                context.project.modules.iter().find(|module| module.id == dependency.from)
-            else {
+            let Some(importer_package) = packages.get(&dependency.from) else {
                 continue;
             };
-            let Some(target) =
-                context.project.modules.iter().find(|module| module.id == *target_id)
-            else {
+            let Some(target_package) = packages.get(target_id) else {
                 continue;
             };
-            if importer.package != target.package {
+            if importer_package != target_package {
                 sink.emit(dependency_diagnostic(
                     "PACKAGE-004",
                     &dependency.from,
@@ -164,7 +172,7 @@ impl Rule for CrossPackageRelativeImportRule {
                     &dependency.location,
                     format!(
                         "Relative import crosses package boundary from `{}` to `{}`",
-                        importer.package.0, target.package.0
+                        importer_package.0, target_package.0
                     ),
                     "Import the target package by its declared package name and public entrypoint.",
                 ));

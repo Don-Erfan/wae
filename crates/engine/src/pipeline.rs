@@ -8,6 +8,53 @@ struct AnalysisContext<'engine, P> {
     request: AnalyzeRequest,
 }
 
+/// Typed boundary between project loading/discovery and semantic analysis. Keeping this state
+/// explicit prevents later stages from quietly repeating filesystem discovery.
+struct DiscoveredWorkspace {
+    root: PathBuf,
+    config: Config,
+    files: Vec<PathBuf>,
+    analysis_inputs: Vec<PathBuf>,
+}
+
+fn discover_stage(
+    requested_root: PathBuf,
+    config_path: Option<PathBuf>,
+    cache_enabled: Option<bool>,
+    known_files: Option<Vec<PathBuf>>,
+    overlay_modules: impl Iterator<Item = String>,
+) -> Result<DiscoveredWorkspace, AnalysisError> {
+    let root = requested_root
+        .canonicalize()
+        .map_err(|error| AnalysisError::Project(format!("cannot open project root: {error}")))?;
+    let mut config = match config_path {
+        Some(path) => {
+            let path = if path.is_absolute() { path } else { root.join(path) };
+            Config::load_file(&path).map_err(AnalysisError::Config)?
+        }
+        None => Config::load(&root).map_err(AnalysisError::Config)?,
+    };
+    if let Some(enabled) = cache_enabled {
+        config.cache.enabled = enabled;
+    }
+    let (mut files, analysis_inputs) = match known_files {
+        Some(files) => (files, discovery::discover_analysis_inputs(&root, &config)?),
+        None => {
+            let discovery = discovery::discover_project(&root, &config)?;
+            (discovery.modules, discovery.analysis_inputs)
+        }
+    };
+    for module in overlay_modules {
+        let path = root.join(module);
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(DiscoveredWorkspace { root, config, files, analysis_inputs })
+}
+
 impl<P: ParserAdapter> AnalysisContext<'_, P> {
     fn run(self) -> Result<Analysis, AnalysisError> {
         execute(self.engine, self.request)
@@ -39,33 +86,16 @@ fn execute<P: ParserAdapter>(
     if cancellation.is_cancelled() {
         return Err(AnalysisError::Cancelled);
     }
-    let root = requested_root
-        .canonicalize()
-        .map_err(|e| AnalysisError::Project(format!("cannot open project root: {e}")))?;
-    let mut config = match config_path {
-        Some(path) => {
-            let path = if path.is_absolute() { path } else { root.join(path) };
-            Config::load_file(&path).map_err(AnalysisError::Config)?
-        }
-        None => Config::load(&root).map_err(AnalysisError::Config)?,
-    };
-    if let Some(enabled) = cache_enabled {
-        config.cache.enabled = enabled;
-    }
     let discovery_started = std::time::Instant::now();
+    let discovered = discover_stage(
+        requested_root,
+        config_path,
+        cache_enabled,
+        known_files,
+        overlays.keys().cloned(),
+    )?;
+    let DiscoveredWorkspace { root, config, files, analysis_inputs } = discovered;
     let architecture = CompiledArchitectureModel::compile(&config)?;
-    let mut files = match known_files {
-        Some(files) => files,
-        None => discover_modules(&root, &config)?,
-    };
-    for module in overlays.keys() {
-        let path = root.join(module);
-        if !files.contains(&path) {
-            files.push(path);
-        }
-    }
-    files.sort();
-    files.dedup();
     let framework_registry = FrameworkRegistry::default();
     let framework_evidence = framework_project_evidence(&root)?;
     let framework_adapter = framework_registry.select(
@@ -111,7 +141,7 @@ fn execute<P: ParserAdapter>(
     let mut cache = PipelineTelemetry::measure(&mut telemetry.cache, || {
         AnalysisCache::load(&root, &config, live_cache_files)
     })?;
-    let environment_hash = analysis_environment_hash(&root, &config)?;
+    let environment_hash = analysis_environment_hash(&root, &config, analysis_inputs)?;
     let mut incremental = IncrementalStats { cache_enabled: cache.enabled(), ..Default::default() };
     let mut suppressions = Vec::new();
     telemetry.discovery = discovery_started.elapsed().saturating_sub(telemetry.cache);
@@ -369,6 +399,40 @@ fn execute<P: ParserAdapter>(
                                 location: import.location.clone(),
                             });
                         }
+                        Resolution::Builtin(name) => {
+                            let builtin_id = ModuleId(format!("builtin:{name}"));
+                            if project_index.insert_module(builtin_id.clone()) {
+                                let builtin_package = PackageName("node".into());
+                                project.modules.push(Module {
+                                    id: builtin_id.clone(),
+                                    path: ModulePath(format!("builtin:{name}")),
+                                    package: builtin_package.clone(),
+                                    kind: ModuleKind::External,
+                                    runtime: Runtime::Node,
+                                    layer: None,
+                                    framework_metadata: FrameworkMetadata::default(),
+                                });
+                                if project_index.insert_package(builtin_package.clone()) {
+                                    project.packages.push(Package {
+                                        name: builtin_package,
+                                        root_path: String::new(),
+                                    });
+                                }
+                            }
+                            project.resolved_dependencies.push(ResolvedDependency {
+                                from: module_id.clone(),
+                                specifier: import.specifier.clone(),
+                                kind: candidate.kind.clone(),
+                                target: DependencyTarget::Builtin(name),
+                                location: import.location.clone(),
+                            });
+                            project.dependencies.push(Dependency {
+                                from: module_id.clone(),
+                                to: builtin_id,
+                                kind: candidate.kind,
+                                location: import.location.clone(),
+                            });
+                        }
                         Resolution::Unresolved => {
                             project.resolved_dependencies.push(ResolvedDependency {
                                 from: module_id.clone(),
@@ -488,17 +552,17 @@ fn execute<P: ParserAdapter>(
     };
     let mut diagnostics = project.diagnostics.clone();
     let graph_hash = analysis_graph_hash(&project, environment_hash)?;
-    let rule_diagnostics = PipelineTelemetry::measure(
+    let (rule_diagnostics, rule_profiles) = PipelineTelemetry::measure(
         &mut telemetry.rule_evaluation,
         || -> Result<_, AnalysisError> {
             if let Some(diagnostics) = cache.rule_diagnostics(graph_hash) {
                 incremental.rule_snapshot_reused = true;
-                Ok(diagnostics)
+                Ok((diagnostics, Vec::new()))
             } else {
-                let diagnostics =
-                    engine.rules.evaluate(&context).map_err(AnalysisError::Internal)?;
-                cache.set_rule_diagnostics(graph_hash, diagnostics.clone());
-                Ok(diagnostics)
+                let evaluation =
+                    engine.rules.evaluate_profiled(&context).map_err(AnalysisError::Internal)?;
+                cache.set_rule_diagnostics(graph_hash, evaluation.diagnostics.clone());
+                Ok((evaluation.diagnostics, evaluation.profiles))
             }
         },
     )?;
@@ -509,19 +573,30 @@ fn execute<P: ParserAdapter>(
         diagnostics.extend(rule_diagnostics);
         diagnostics = DiagnosticArbitrator::arbitrate(std::mem::take(&mut diagnostics));
         suppression::apply(&mut diagnostics, &mut suppressions, config.suppressions.report_unused);
+        suppression::apply_config(&mut diagnostics, &config.suppressions);
         diagnostics.sort_by(|a, b| diagnostic_key(a).cmp(&diagnostic_key(b)));
     });
     if cancellation.is_cancelled() {
         return Err(AnalysisError::Cancelled);
     }
     PipelineTelemetry::measure(&mut telemetry.cache, || cache.save())?;
-    let timings = telemetry.finish(total_started.elapsed());
+    let mut timings = telemetry.finish(total_started.elapsed());
+    timings.rules = rule_profiles
+        .into_iter()
+        .map(|profile| {
+            (
+                profile.rule_id.to_owned(),
+                RuleTiming { elapsed_ns: profile.elapsed_ns, diagnostics: profile.diagnostics },
+            )
+        })
+        .collect();
     Ok(Analysis {
         schema_version: OUTPUT_SCHEMA_VERSION,
         project,
         graph,
         ownership,
         diagnostics,
+        failure_policy: crate::FailurePolicy::from_output(&config.output),
         incremental,
         timings,
     })

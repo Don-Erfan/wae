@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,7 +32,7 @@ pub struct WorkspaceSession {
 #[derive(Clone, Debug)]
 struct WorkspaceSnapshot {
     overlays: BTreeMap<String, String>,
-    analysis: Analysis,
+    analysis: Arc<Analysis>,
 }
 
 impl WorkspaceSession {
@@ -85,19 +86,19 @@ impl WorkspaceSession {
         ChangeSet { changed, deleted }
     }
 
-    pub fn snapshot(&self) -> Option<Analysis> {
+    pub fn snapshot(&self) -> Option<Arc<Analysis>> {
         self.snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|snapshot| snapshot.analysis.clone())
+            .map(|snapshot| Arc::clone(&snapshot.analysis))
     }
 
     pub fn analyze(
         &self,
         ticket: &AnalysisTicket,
         overlays: &BTreeMap<String, String>,
-    ) -> Result<Analysis, AnalysisError> {
+    ) -> Result<Arc<Analysis>, AnalysisError> {
         self.analyze_changes(ticket, overlays, true)
     }
 
@@ -106,12 +107,13 @@ impl WorkspaceSession {
         ticket: &AnalysisTicket,
         overlays: &BTreeMap<String, String>,
         force: bool,
-    ) -> Result<Analysis, AnalysisError> {
+    ) -> Result<Arc<Analysis>, AnalysisError> {
         if !self.is_current(ticket) {
             return Err(AnalysisError::Cancelled);
         }
         if !force && self.changes_since_snapshot(overlays) == ChangeSet::default() {
-            if let Some(mut analysis) = self.snapshot() {
+            if let Some(analysis) = self.snapshot() {
+                let mut analysis = (*analysis).clone();
                 analysis.incremental.analyzed_modules = 0;
                 analysis.incremental.restored_modules = analysis
                     .project
@@ -121,7 +123,7 @@ impl WorkspaceSession {
                     .count();
                 analysis.incremental.rule_snapshot_reused = true;
                 analysis.timings = Default::default();
-                return Ok(analysis);
+                return Ok(Arc::new(analysis));
             }
         }
         let mut request = overlays.iter().fold(
@@ -146,10 +148,13 @@ impl WorkspaceSession {
                 request = request.with_known_files(known_files);
             }
         }
-        let analysis = self.engine.analyze(request)?;
+        let analysis = Arc::new(self.engine.analyze(request)?);
         if self.is_current(ticket) {
             *self.snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(WorkspaceSnapshot { overlays: overlays.clone(), analysis: analysis.clone() });
+                Some(WorkspaceSnapshot {
+                    overlays: overlays.clone(),
+                    analysis: Arc::clone(&analysis),
+                });
         }
         Ok(analysis)
     }

@@ -8,24 +8,30 @@ use wae_config::Config;
 use wae_core::domain::{Diagnostic, Severity};
 use wae_engine::FailurePolicy;
 
-const BASELINE_SCHEMA_VERSION: u32 = 2;
+const BASELINE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BaselineFile<'a> {
+struct BaselineFile {
     schema_version: u32,
     created_at_unix: u64,
-    entries: Vec<BaselineEntry<'a>>,
+    entries: Vec<BaselineEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BaselineEntry<'a> {
-    fingerprint: &'a str,
-    rule_id: &'a str,
-    source: Option<&'a str>,
-    target: Option<&'a str>,
-    reason: Option<&'a str>,
+pub struct BaselineEntry {
+    pub fingerprint: String,
+    #[serde(default)]
+    pub rule_id: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,14 +39,11 @@ struct BaselineEntry<'a> {
 struct StoredBaseline {
     schema_version: u32,
     #[serde(default)]
+    created_at_unix: u64,
+    #[serde(default)]
     fingerprints: Vec<String>,
     #[serde(default)]
-    entries: Vec<StoredEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StoredEntry {
-    fingerprint: String,
+    entries: Vec<BaselineEntry>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +57,7 @@ pub struct SaveResult {
 #[derive(Debug, Default)]
 pub struct BaselineMatcher {
     fingerprints: HashSet<String>,
+    expired: usize,
 }
 
 impl BaselineMatcher {
@@ -70,18 +74,16 @@ impl BaselineMatcher {
     }
 
     pub fn matched_count(&self, diagnostics: &[Diagnostic]) -> usize {
-        self.fingerprints
-            .iter()
-            .filter(|stored| {
-                diagnostics.iter().any(|diagnostic| {
-                    &diagnostic.fingerprint == *stored
-                        || diagnostic
-                            .legacy_fingerprint_aliases()
-                            .iter()
-                            .any(|alias| alias == *stored)
-                })
-            })
-            .count()
+        let mut live = HashSet::new();
+        for diagnostic in diagnostics {
+            live.insert(diagnostic.fingerprint.clone());
+            live.extend(diagnostic.legacy_fingerprint_aliases());
+        }
+        self.fingerprints.intersection(&live).count()
+    }
+
+    pub fn expired_count(&self) -> usize {
+        self.expired
     }
 
     #[cfg(test)]
@@ -92,6 +94,7 @@ impl BaselineMatcher {
 
 pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
+    let failure_policy = FailurePolicy::from_output(&config.output);
     let path = root.join(config.baseline.file);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -103,18 +106,19 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
         .count();
     let mut sorted = diagnostics
         .iter()
-        .filter(|diagnostic| FailurePolicy::is_failure(diagnostic))
+        .filter(|diagnostic| failure_policy.is_failure(diagnostic))
         .collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
     sorted.dedup_by(|left, right| left.fingerprint == right.fingerprint);
     let entries: Vec<_> = sorted
         .into_iter()
         .map(|diagnostic| BaselineEntry {
-            fingerprint: &diagnostic.fingerprint,
-            rule_id: &diagnostic.rule_id.0,
-            source: diagnostic.dependency_path.first().map(|module| module.0.as_str()),
-            target: diagnostic.dependency_path.get(1).map(|module| module.0.as_str()),
+            fingerprint: diagnostic.fingerprint.clone(),
+            rule_id: diagnostic.rule_id.0.clone(),
+            source: diagnostic.dependency_path.first().map(|module| module.0.clone()),
+            target: diagnostic.dependency_path.get(1).map(|module| module.0.clone()),
             reason: None,
+            expires_at: None,
         })
         .collect();
     let recorded = entries.len();
@@ -139,16 +143,87 @@ pub fn load(root: &Path) -> Result<BaselineMatcher, String> {
             path.display()
         ));
     }
-    let source = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let stored: StoredBaseline =
-        serde_json::from_str(&source).map_err(|error| format!("invalid baseline: {error}"))?;
+    let stored = read_stored(&path)?;
+    let now = now_unix()?;
     match stored.schema_version {
-        1 => Ok(BaselineMatcher { fingerprints: stored.fingerprints.into_iter().collect() }),
-        BASELINE_SCHEMA_VERSION => Ok(BaselineMatcher {
-            fingerprints: stored.entries.into_iter().map(|entry| entry.fingerprint).collect(),
+        1 => Ok(BaselineMatcher {
+            fingerprints: stored.fingerprints.into_iter().collect(),
+            expired: 0,
         }),
+        2 | BASELINE_SCHEMA_VERSION => {
+            let expired = stored
+                .entries
+                .iter()
+                .filter(|entry| entry.expires_at.is_some_and(|expires| expires <= now))
+                .count();
+            Ok(BaselineMatcher {
+                fingerprints: stored
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.expires_at.is_none_or(|expires| expires > now))
+                    .map(|entry| entry.fingerprint)
+                    .collect(),
+                expired,
+            })
+        }
         version => Err(format!("unsupported baseline schema version `{version}`")),
     }
+}
+
+fn now_unix() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())
+        .map(|d| d.as_secs())
+}
+
+fn read_stored(path: &Path) -> Result<StoredBaseline, String> {
+    let source = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&source).map_err(|error| format!("invalid baseline: {error}"))
+}
+
+pub fn list(root: &Path, rule: Option<&str>) -> Result<Vec<BaselineEntry>, String> {
+    let config = Config::load(root).map_err(|error| error.message)?;
+    let path = root.join(config.baseline.file);
+    let stored = read_stored(&path)?;
+    if !matches!(stored.schema_version, 2 | BASELINE_SCHEMA_VERSION) {
+        return Err("baseline list requires schema v2 or newer; recreate the baseline".into());
+    }
+    Ok(stored
+        .entries
+        .into_iter()
+        .filter(|entry| rule.is_none_or(|rule| entry.rule_id == rule))
+        .collect())
+}
+
+pub fn prune(root: &Path, diagnostics: &[Diagnostic]) -> Result<(PathBuf, usize, usize), String> {
+    let config = Config::load(root).map_err(|error| error.message)?;
+    let path = root.join(config.baseline.file);
+    let stored = read_stored(&path)?;
+    if !matches!(stored.schema_version, 2 | BASELINE_SCHEMA_VERSION) {
+        return Err("baseline prune requires schema v2 or newer; recreate the baseline".into());
+    }
+    let now = now_unix()?;
+    let mut live = HashSet::new();
+    for diagnostic in diagnostics {
+        live.insert(diagnostic.fingerprint.clone());
+        live.extend(diagnostic.legacy_fingerprint_aliases());
+    }
+    let before = stored.entries.len();
+    let mut entries = stored.entries;
+    entries.retain(|entry| {
+        entry.expires_at.is_none_or(|expires| expires > now) && live.contains(&entry.fingerprint)
+    });
+    let removed = before - entries.len();
+    let remaining = entries.len();
+    let contents = serde_json::to_string_pretty(&BaselineFile {
+        schema_version: BASELINE_SCHEMA_VERSION,
+        created_at_unix: stored.created_at_unix,
+        entries,
+    })
+    .map_err(|error| error.to_string())?;
+    fs::write(&path, format!("{contents}\n")).map_err(|error| error.to_string())?;
+    Ok((path, removed, remaining))
 }
 
 #[cfg(test)]
@@ -157,7 +232,7 @@ mod tests {
     use wae_core::domain::{ModuleId, SourceLocation};
 
     #[test]
-    fn saves_auditable_v2_entries_and_loads_them() {
+    fn saves_auditable_v3_entries_and_loads_them() {
         let root = std::env::temp_dir().join(format!("wae-baseline-v2-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let mut diagnostic = Diagnostic::new("ARCH-003", "layer");
@@ -170,7 +245,7 @@ mod tests {
         assert_eq!(saved.recorded, 1);
         let source = fs::read_to_string(root.join(".wae/baseline.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&source).unwrap();
-        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["schemaVersion"], 3);
         assert_eq!(value["entries"][0]["ruleId"], "ARCH-003");
         assert!(load(&root).unwrap().contains(&diagnostic.fingerprint));
         fs::remove_dir_all(root).unwrap();
@@ -224,6 +299,31 @@ mod tests {
         )
         .unwrap();
         assert!(load(&root).unwrap().matches(&diagnostic));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expired_entries_are_reported_and_pruned_with_resolved_entries() {
+        let root = std::env::temp_dir().join(format!("wae-baseline-expiry-{}", std::process::id()));
+        fs::create_dir_all(root.join(".wae")).unwrap();
+        fs::write(
+            root.join(".wae/baseline.json"),
+            r#"{
+              "schemaVersion": 3,
+              "createdAtUnix": 1,
+              "entries": [
+                {"fingerprint":"expired","ruleId":"ARCH-001","expiresAt":1},
+                {"fingerprint":"resolved","ruleId":"ARCH-003"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let matcher = load(&root).unwrap();
+        assert_eq!(matcher.expired_count(), 1);
+        assert_eq!(matcher.len(), 1);
+        let (_, removed, remaining) = prune(&root, &[]).unwrap();
+        assert_eq!((removed, remaining), (2, 0));
+        assert!(list(&root, None).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }

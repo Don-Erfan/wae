@@ -7,7 +7,7 @@ const { spawnSync } = require("node:child_process");
 
 const binaryPath = path.join(__dirname, os.platform() === "win32" ? "wae-mcp.exe" : "wae-mcp");
 if (!fs.existsSync(binaryPath)) {
-  console.error("WAE MCP server was not found. Reinstall or rebuild @don-erfan/wae.");
+  console.error("WAE MCP server was not found. Reinstall without --ignore-scripts or rebuild @don-erfan/wae.");
   process.exit(1);
 }
 const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });

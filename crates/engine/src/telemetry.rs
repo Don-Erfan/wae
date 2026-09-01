@@ -53,6 +53,7 @@ impl PipelineTelemetry {
             reporting_ms,
             orchestration_ms: total_ms.saturating_sub(named_ms),
             total_ms,
+            rules: Default::default(),
         }
     }
 }
