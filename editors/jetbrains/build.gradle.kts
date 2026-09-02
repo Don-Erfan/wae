@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.donerfan.wae"
-version = "0.0.24"
+version = "0.0.25"
 
 repositories {
     mavenCentral()

@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.25] - 2026-09-02
+
+### Changed
+
+- Reused the validated resolution-environment fingerprint from persistent editor snapshots, so a
+  source-only overlay edit no longer performs a second repository environment walk.
+- Emitted complete 10k performance samples before enforcing thresholds and based the edit envelope
+  on the observed GitHub-hosted runner rather than a faster local machine.
+
+### Fixed
+
+- Repaired the release readiness gate that prevented `0.0.24` from producing GitHub assets or an
+  npm package. The signed `v0.0.24` tag remains immutable; publication resumes at `0.0.25`.
+
 ## [0.0.24] - 2026-09-01
 
 ### Added
@@ -268,7 +282,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.24...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.25...HEAD
+[0.0.25]: https://github.com/Don-Erfan/wae/compare/v0.0.24...v0.0.25
 [0.0.24]: https://github.com/Don-Erfan/wae/compare/v0.0.23...v0.0.24
 [0.0.23]: https://github.com/Don-Erfan/wae/compare/v0.0.22...v0.0.23
 [0.0.22]: https://github.com/Don-Erfan/wae/compare/v0.0.21...v0.0.22

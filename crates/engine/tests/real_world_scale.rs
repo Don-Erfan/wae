@@ -128,6 +128,20 @@ fn ten_thousand_universal_modules_keep_cold_analysis_near_linear() {
     let edit_elapsed = median(&mut edit_samples);
     assert_eq!(edited.incremental.analyzed_modules, 1);
     assert_eq!(edited.incremental.restored_modules, MODULES - 1);
+    let peak_rss = peak_rss_kb();
+    eprintln!(
+        "WAE_ENGINE_10K cold_median_ms={} warm_median_ms={} edit_median_ms={} cold_samples_ms={:?} warm_samples_ms={:?} edit_samples_ms={:?} peak_rss_kb={:?} cold_timings={:?} warm_timings={:?} edit_timings={:?}",
+        elapsed.as_millis(),
+        warm_elapsed.as_millis(),
+        edit_elapsed.as_millis(),
+        milliseconds(&cold_samples),
+        milliseconds(&warm_samples),
+        milliseconds(&edit_samples),
+        peak_rss,
+        analysis.timings,
+        warm.timings,
+        edited.timings,
+    );
     let warm_budget = duration_env("WAE_ENGINE_10K_WARM_BUDGET_MS", 650);
     let edit_budget = duration_env("WAE_ENGINE_10K_EDIT_BUDGET_MS", 750);
     assert!(warm_elapsed <= warm_budget, "10k warm median took {warm_elapsed:?}");
@@ -150,7 +164,6 @@ fn ten_thousand_universal_modules_keep_cold_analysis_near_linear() {
         release_baseline("editMedianMs", "WAE_ENGINE_10K_BASELINE_EDIT_MS", 397),
         120,
     );
-    let peak_rss = peak_rss_kb();
     let rss_budget_kb = std::env::var("WAE_ENGINE_10K_RSS_BUDGET_KB")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -161,19 +174,6 @@ fn ten_thousand_universal_modules_keep_cold_analysis_near_linear() {
             "10k analysis peak RSS was {peak_rss} KiB; budget is {rss_budget_kb} KiB"
         );
     }
-    eprintln!(
-        "WAE_ENGINE_10K cold_median_ms={} warm_median_ms={} edit_median_ms={} cold_samples_ms={:?} warm_samples_ms={:?} edit_samples_ms={:?} peak_rss_kb={:?} cold_timings={:?} warm_timings={:?} edit_timings={:?}",
-        elapsed.as_millis(),
-        warm_elapsed.as_millis(),
-        edit_elapsed.as_millis(),
-        milliseconds(&cold_samples),
-        milliseconds(&warm_samples),
-        milliseconds(&edit_samples),
-        peak_rss,
-        analysis.timings,
-        warm.timings,
-        edited.timings,
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -263,7 +263,7 @@ fn release_baseline(key: &str, override_name: &str, default_ms: u64) -> Duration
         return duration_env(override_name, default_ms);
     }
     let value: serde_json::Value =
-        serde_json::from_str(include_str!("../../../performance/baselines/v0.0.24.json"))
+        serde_json::from_str(include_str!("../../../performance/baselines/v0.0.25.json"))
             .expect("valid checked-in release performance baseline");
     Duration::from_millis(value[key].as_u64().unwrap_or(default_ms))
 }

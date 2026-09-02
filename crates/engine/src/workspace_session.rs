@@ -145,7 +145,16 @@ impl WorkspaceSession {
                     },
                 );
             if let Some(known_files) = known_files {
+                let environment_hash = self
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .map(|snapshot| snapshot.analysis.incremental.environment_hash);
                 request = request.with_known_files(known_files);
+                if let Some(environment_hash) = environment_hash {
+                    request = request.with_known_environment_hash(environment_hash);
+                }
             }
         }
         let analysis = Arc::new(self.engine.analyze(request)?);
@@ -202,14 +211,19 @@ mod tests {
             "src/a.ts".into(),
             "import './b'; export const edited = true;".into(),
         )]);
-        let edited = session.analyze(&session.begin_analysis(), &overlays).unwrap();
+        let edited = session.analyze_changes(&session.begin_analysis(), &overlays, false).unwrap();
         assert_eq!(edited.incremental.analyzed_modules, 1);
         assert_eq!(edited.incremental.restored_modules, 1);
+        assert_eq!(edited.incremental.environment_hash, cold.incremental.environment_hash);
         assert_eq!(session.changes_since_snapshot(&overlays), ChangeSet::default());
         assert_eq!(session.snapshot().unwrap().project.modules.len(), 2);
         let no_op = session.analyze_changes(&session.begin_analysis(), &overlays, false).unwrap();
         assert_eq!(no_op.incremental.analyzed_modules, 0);
         assert_eq!(no_op.incremental.restored_modules, 2);
+
+        fs::write(root.join("package.json"), r#"{"name":"changed-environment"}"#).unwrap();
+        let forced = session.analyze_changes(&session.begin_analysis(), &overlays, true).unwrap();
+        assert_ne!(forced.incremental.environment_hash, cold.incremental.environment_hash);
         fs::remove_dir_all(root).unwrap();
     }
 }

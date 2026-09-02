@@ -22,6 +22,7 @@ fn discover_stage(
     config_path: Option<PathBuf>,
     cache_enabled: Option<bool>,
     known_files: Option<Vec<PathBuf>>,
+    environment_is_known: bool,
     overlay_modules: impl Iterator<Item = String>,
 ) -> Result<DiscoveredWorkspace, AnalysisError> {
     let root = requested_root
@@ -38,6 +39,7 @@ fn discover_stage(
         config.cache.enabled = enabled;
     }
     let (mut files, analysis_inputs) = match known_files {
+        Some(files) if environment_is_known => (files, Vec::new()),
         Some(files) => (files, discovery::discover_analysis_inputs(&root, &config)?),
         None => {
             let discovery = discovery::discover_project(&root, &config)?;
@@ -81,6 +83,7 @@ fn execute<P: ParserAdapter>(
         cache_enabled,
         overlays,
         known_files,
+        known_environment_hash,
         cancellation,
     } = request;
     if cancellation.is_cancelled() {
@@ -92,6 +95,7 @@ fn execute<P: ParserAdapter>(
         config_path,
         cache_enabled,
         known_files,
+        known_environment_hash.is_some(),
         overlays.keys().cloned(),
     )?;
     let DiscoveredWorkspace { root, config, files, analysis_inputs } = discovered;
@@ -141,8 +145,12 @@ fn execute<P: ParserAdapter>(
     let mut cache = PipelineTelemetry::measure(&mut telemetry.cache, || {
         AnalysisCache::load(&root, &config, live_cache_files)
     })?;
-    let environment_hash = analysis_environment_hash(&root, &config, analysis_inputs)?;
-    let mut incremental = IncrementalStats { cache_enabled: cache.enabled(), ..Default::default() };
+    let environment_hash = match known_environment_hash {
+        Some(hash) => hash,
+        None => analysis_environment_hash(&root, &config, analysis_inputs)?,
+    };
+    let mut incremental =
+        IncrementalStats { cache_enabled: cache.enabled(), environment_hash, ..Default::default() };
     let mut suppressions = Vec::new();
     telemetry.discovery = discovery_started.elapsed().saturating_sub(telemetry.cache);
 

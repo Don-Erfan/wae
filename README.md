@@ -70,8 +70,8 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.24-assets.spdx.json
-jq '.components | length' wae-v0.0.24-dependencies.cdx.json
+jq '.packages | length' wae-v0.0.25-assets.spdx.json
+jq '.components | length' wae-v0.0.25-dependencies.cdx.json
 ```
 
 The checksum proves both downloaded inventories are the files signed by the release workflow; use

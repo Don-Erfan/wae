@@ -47,6 +47,7 @@ pub struct AnalyzeRequest {
     pub cache_enabled: Option<bool>,
     pub overlays: BTreeMap<String, String>,
     pub known_files: Option<Vec<PathBuf>>,
+    pub known_environment_hash: Option<u64>,
     pub cancellation: CancellationToken,
 }
 impl AnalyzeRequest {
@@ -57,6 +58,7 @@ impl AnalyzeRequest {
             cache_enabled: None,
             overlays: BTreeMap::new(),
             known_files: None,
+            known_environment_hash: None,
             cancellation: CancellationToken::default(),
         }
     }
@@ -74,6 +76,10 @@ impl AnalyzeRequest {
     }
     pub fn with_known_files(mut self, files: Vec<PathBuf>) -> Self {
         self.known_files = Some(files);
+        self
+    }
+    pub fn with_known_environment_hash(mut self, hash: u64) -> Self {
+        self.known_environment_hash = Some(hash);
         self
     }
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
@@ -173,6 +179,7 @@ pub struct IncrementalStats {
     pub restored_modules: usize,
     pub analyzed_modules: usize,
     pub rule_snapshot_reused: bool,
+    pub environment_hash: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
