@@ -1,6 +1,6 @@
 {
   "name": "@don-erfan/wae",
-  "version": "0.0.25",
+  "version": "0.0.26",
   "description": "WAE CLI wrapper for frontend architecture checks",
   "license": "MIT",
   "repository": {

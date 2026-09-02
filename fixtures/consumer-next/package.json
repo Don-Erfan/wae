@@ -7,7 +7,7 @@
     "architecture": "wae config validate --show-overlaps && wae check --format json"
   },
   "devDependencies": {
-    "@don-erfan/wae": "0.0.25",
+    "@don-erfan/wae": "0.0.26",
     "next": "15.2.6",
     "typescript": "5.1.6"
   }

@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.26] - 2026-09-02
+
+### Fixed
+
+- Canonicalized the persistent workspace root before deriving known-file and overlay paths. This
+  prevents macOS `/var` versus `/private/var` aliases and Windows canonical path prefixes from
+  inserting a duplicate module into incremental editor analysis.
+- Preserved the immutable failed `v0.0.25` tag and moved the cross-platform release repair to a
+  new patch version.
+
 ## [0.0.25] - 2026-09-02
 
 ### Changed
@@ -282,7 +292,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.25...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.26...HEAD
+[0.0.26]: https://github.com/Don-Erfan/wae/compare/v0.0.25...v0.0.26
 [0.0.25]: https://github.com/Don-Erfan/wae/compare/v0.0.24...v0.0.25
 [0.0.24]: https://github.com/Don-Erfan/wae/compare/v0.0.23...v0.0.24
 [0.0.23]: https://github.com/Don-Erfan/wae/compare/v0.0.22...v0.0.23

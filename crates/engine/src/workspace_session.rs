@@ -37,8 +37,14 @@ struct WorkspaceSnapshot {
 
 impl WorkspaceSession {
     pub fn new(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        // Keep every path produced by a long-lived session in the same namespace as the engine.
+        // This matters on macOS (`/var` aliases `/private/var`) and on Windows where
+        // canonicalization may add a verbatim prefix. Without it, a known module and an overlay
+        // for that module can compare as different paths and the edit is parsed twice.
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         Self {
-            root: root.as_ref().to_path_buf(),
+            root,
             engine: Engine::default(),
             generation: AtomicU64::new(0),
             active: Mutex::new(None),
@@ -204,6 +210,7 @@ mod tests {
         )
         .unwrap();
         let session = WorkspaceSession::new(&root);
+        assert_eq!(session.root, root.canonicalize().unwrap());
         let cold = session.analyze(&session.begin_analysis(), &BTreeMap::new()).unwrap();
         assert_eq!(cold.incremental.analyzed_modules, 2);
 

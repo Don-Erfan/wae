@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "release": "0.0.26",
+  "runner": "github-actions-ubuntu-latest",
+  "modules": 10000,
+  "coldMedianMs": 1116,
+  "warmMedianMs": 344,
+  "editMedianMs": 366,
+  "coldEnvelopePercent": 125,
+  "warmEnvelopePercent": 125,
+  "editEnvelopePercent": 120,
+  "sourceRun": 33614044510
+}
