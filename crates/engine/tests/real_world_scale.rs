@@ -255,9 +255,19 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
     let cold_started = Instant::now();
     let cold = engine.analyze(AnalyzeRequest::new(&root)).unwrap();
     let cold_elapsed = cold_started.elapsed();
+    assert_eq!(cold.project.modules.len(), modules);
+    assert_eq!(cold.incremental.analyzed_modules, modules);
+    let cold_timings = cold.timings.clone();
+    drop(cold);
+
     let warm_started = Instant::now();
     let warm = engine.analyze(AnalyzeRequest::new(&root)).unwrap();
     let warm_elapsed = warm_started.elapsed();
+    assert_eq!(warm.incremental.restored_modules, modules);
+    assert!(warm.incremental.rule_snapshot_reused);
+    let warm_timings = warm.timings.clone();
+    drop(warm);
+
     let session = WorkspaceSession::new(&root);
     session.analyze(&session.begin_analysis(), &BTreeMap::new()).unwrap();
     let last_module = format!("src/generated/m{}.ts", modules - 1);
@@ -270,6 +280,13 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
         )
         .unwrap();
     let syntax_edit_elapsed = syntax_started.elapsed();
+    assert_eq!(syntax_edit.incremental.analyzed_modules, 1);
+    assert_eq!(syntax_edit.incremental.restored_modules, modules - 1);
+    assert!(syntax_edit.incremental.rule_snapshot_reused);
+    let syntax_edit_timings = syntax_edit.timings.clone();
+    drop(syntax_edit);
+    drop(session);
+
     let edge_session = WorkspaceSession::new(&root);
     edge_session.analyze(&edge_session.begin_analysis(), &BTreeMap::new()).unwrap();
     let edge_started = Instant::now();
@@ -284,6 +301,12 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
         )
         .unwrap();
     let edge_edit_elapsed = edge_started.elapsed();
+    assert_eq!(edge_edit.incremental.analyzed_modules, 1);
+    assert!(!edge_edit.incremental.rule_snapshot_reused);
+    let edge_edit_timings = edge_edit.timings.clone();
+    drop(edge_edit);
+    drop(edge_session);
+
     let global_session = WorkspaceSession::new(&root);
     global_session.analyze(&global_session.begin_analysis(), &BTreeMap::new()).unwrap();
     let global_started = Instant::now();
@@ -298,18 +321,11 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
         )
         .unwrap();
     let global_edit_elapsed = global_started.elapsed();
-
-    assert_eq!(cold.project.modules.len(), modules);
-    assert_eq!(cold.incremental.analyzed_modules, modules);
-    assert_eq!(warm.incremental.restored_modules, modules);
-    assert!(warm.incremental.rule_snapshot_reused);
-    assert_eq!(syntax_edit.incremental.analyzed_modules, 1);
-    assert_eq!(syntax_edit.incremental.restored_modules, modules - 1);
-    assert!(syntax_edit.incremental.rule_snapshot_reused);
-    assert_eq!(edge_edit.incremental.analyzed_modules, 1);
-    assert!(!edge_edit.incremental.rule_snapshot_reused);
     assert_eq!(global_edit.incremental.analyzed_modules, 1);
     assert!(global_edit.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "ARCH-001"));
+    let global_edit_timings = global_edit.timings.clone();
+    drop(global_edit);
+    drop(global_session);
     let cold_budget = duration_env("WAE_ENGINE_LARGE_COLD_BUDGET_MS", 30_000);
     let warm_budget = duration_env("WAE_ENGINE_LARGE_WARM_BUDGET_MS", 5_000);
     let edit_budget = duration_env("WAE_ENGINE_LARGE_EDIT_BUDGET_MS", 5_000);
@@ -340,11 +356,11 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
         syntax_edit_elapsed.as_millis(),
         edge_edit_elapsed.as_millis(),
         global_edit_elapsed.as_millis(),
-        cold.timings,
-        warm.timings,
-        syntax_edit.timings,
-        edge_edit.timings,
-        global_edit.timings,
+        cold_timings,
+        warm_timings,
+        syntax_edit_timings,
+        edge_edit_timings,
+        global_edit_timings,
     );
     fs::remove_dir_all(root).unwrap();
 }

@@ -3,6 +3,7 @@ use wae_parser::ParserAdapter;
 use super::*;
 
 const MAX_ANALYSIS_WORKERS: usize = 8;
+const PREPARATION_BATCH_SIZE: usize = 2_048;
 
 fn analysis_worker_count(jobs: usize) -> usize {
     std::thread::available_parallelism()
@@ -352,368 +353,375 @@ fn execute<P: ParserAdapter>(
     project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
     let mut project_index = ProjectIndex::from_project(&project);
 
-    let mut prepared_modules = Vec::with_capacity(files.len());
-    for path in &files {
-        if cancellation.is_cancelled() {
-            return Err(AnalysisError::Cancelled);
+    for file_batch in files.chunks(PREPARATION_BATCH_SIZE) {
+        // Parsed syntax facts and resolution candidates are intentionally short-lived. Keeping
+        // one bounded window preserves parallel cold-path throughput without retaining the
+        // intermediate representation for every module in a 50k/100k workspace at once.
+        let mut prepared_modules = Vec::with_capacity(file_batch.len());
+        for path in file_batch {
+            if cancellation.is_cancelled() {
+                return Err(AnalysisError::Cancelled);
+            }
+            let module_id = ModuleId(relative_path(&root, path));
+            let source = match overlays
+                .get(&module_id.0)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| fs::read_to_string(path))
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    project.diagnostics.push(simple_diagnostic(
+                        "PARSE-001",
+                        format!("Cannot read source: {error}"),
+                        &module_id.0,
+                    ));
+                    continue;
+                }
+            };
+            let source_hash = stable_hash(source.as_bytes());
+            suppression::collect(
+                &module_id.0,
+                &source,
+                config.suppressions.require_reason,
+                &mut suppressions,
+                &mut project.diagnostics,
+            );
+            let cached = cache.get(&module_id.0, source_hash, environment_hash);
+            prepared_modules.push(PreparedModule {
+                path: path.clone(),
+                module_path: ModulePath(normalize(path)),
+                module_id,
+                source,
+                source_hash,
+                cached,
+                parsed: None,
+                resolved: None,
+            });
         }
-        let module_id = ModuleId(relative_path(&root, path));
-        let source = match overlays
-            .get(&module_id.0)
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| fs::read_to_string(path))
-        {
-            Ok(source) => source,
-            Err(error) => {
-                project.diagnostics.push(simple_diagnostic(
-                    "PARSE-001",
-                    format!("Cannot read source: {error}"),
-                    &module_id.0,
-                ));
+        PipelineTelemetry::measure(&mut telemetry.parsing, || {
+            parse_prepared_modules(&engine.parser, &mut prepared_modules, &cancellation)
+        })?;
+        PipelineTelemetry::measure(&mut telemetry.resolution, || {
+            resolve_prepared_modules(
+                &resolver,
+                &module_formats,
+                &config,
+                &root,
+                &mut prepared_modules,
+                &cancellation,
+            )
+        })?;
+
+        for prepared in prepared_modules {
+            if cancellation.is_cancelled() {
+                return Err(AnalysisError::Cancelled);
+            }
+            let PreparedModule {
+                path: _,
+                module_path: _,
+                module_id,
+                source: _,
+                source_hash,
+                cached,
+                parsed,
+                resolved,
+            } = prepared;
+            if let Some(cached) = cached {
+                incremental.restored_modules += 1;
+                PipelineTelemetry::measure(&mut telemetry.classification, || {
+                    apply_framework_classification(
+                        &mut project,
+                        &module_id,
+                        &root,
+                        framework_adapter,
+                        &cached.semantics,
+                    );
+                });
+                restore_cached_module(
+                    cached,
+                    &root,
+                    &workspace_packages,
+                    &default_package,
+                    framework_adapter,
+                    &architecture,
+                    &mut project,
+                    &mut project_index,
+                    &mut layers,
+                    &mut features,
+                    &mut feature_roots,
+                )?;
                 continue;
             }
-        };
-        let source_hash = stable_hash(source.as_bytes());
-        suppression::collect(
-            &module_id.0,
-            &source,
-            config.suppressions.require_reason,
-            &mut suppressions,
-            &mut project.diagnostics,
-        );
-        let cached = cache.get(&module_id.0, source_hash, environment_hash);
-        prepared_modules.push(PreparedModule {
-            path: path.clone(),
-            module_path: ModulePath(normalize(path)),
-            module_id,
-            source,
-            source_hash,
-            cached,
-            parsed: None,
-            resolved: None,
-        });
-    }
-    PipelineTelemetry::measure(&mut telemetry.parsing, || {
-        parse_prepared_modules(&engine.parser, &mut prepared_modules, &cancellation)
-    })?;
-    PipelineTelemetry::measure(&mut telemetry.resolution, || {
-        resolve_prepared_modules(
-            &resolver,
-            &module_formats,
-            &config,
-            &root,
-            &mut prepared_modules,
-            &cancellation,
-        )
-    })?;
-
-    for prepared in prepared_modules {
-        if cancellation.is_cancelled() {
-            return Err(AnalysisError::Cancelled);
-        }
-        let PreparedModule {
-            path: _,
-            module_path: _,
-            module_id,
-            source: _,
-            source_hash,
-            cached,
-            parsed,
-            resolved,
-        } = prepared;
-        if let Some(cached) = cached {
-            incremental.restored_modules += 1;
-            PipelineTelemetry::measure(&mut telemetry.classification, || {
-                apply_framework_classification(
-                    &mut project,
-                    &module_id,
-                    &root,
-                    framework_adapter,
-                    &cached.semantics,
-                );
-            });
-            restore_cached_module(
-                cached,
-                &root,
-                &workspace_packages,
-                &default_package,
-                framework_adapter,
-                &architecture,
-                &mut project,
-                &mut project_index,
-                &mut layers,
-                &mut features,
-                &mut feature_roots,
-            )?;
-            continue;
-        }
-        incremental.analyzed_modules += 1;
-        let imports_start = project.imports.len();
-        let dependencies_start = project.dependencies.len();
-        let resolved_start = project.resolved_dependencies.len();
-        let diagnostics_start = project.diagnostics.len();
-        let parsed = parsed.ok_or_else(|| {
-            AnalysisError::Internal(format!("parser produced no result for `{}`", module_id.0))
-        })?;
-        let semantics = match parsed {
-            Ok(parsed) => {
-                PipelineTelemetry::measure(&mut telemetry.classification, || {
-                    apply_framework_classification(
-                        &mut project,
-                        &module_id,
-                        &root,
-                        framework_adapter,
-                        &parsed.semantics,
-                    );
-                });
-                let resolved = resolved.ok_or_else(|| {
-                    AnalysisError::Internal(format!(
-                        "resolver produced no result for `{}`",
-                        module_id.0
-                    ))
-                })?;
-                for prepared_dependency in resolved {
-                    if cancellation.is_cancelled() {
-                        return Err(AnalysisError::Cancelled);
-                    }
-                    let PreparedDependency { import, candidate, candidate_paths, resolution } =
-                        prepared_dependency;
-                    match resolution {
-                        Resolution::Module(target) => {
-                            let target_id = ModuleId(relative_resolved_path(&root, &target.0));
-                            let target_kind = workspace_packages
-                                .iter()
-                                .filter(|package| {
-                                    normalized_path_is_within(&target.0, &package.root)
-                                })
-                                .max_by_key(|package| package.root.components().count())
-                                .map_or_else(
-                                    || DependencyTarget::Internal(target_id.clone()),
-                                    |package| DependencyTarget::WorkspacePackage {
-                                        package: PackageName(package.name.clone()),
-                                        module: target_id.clone(),
-                                    },
-                                );
-                            if project_index.insert_module(target_id.clone()) {
-                                let target_path = root.join(&target_id.0);
-                                let package = infer_package(
-                                    &root,
-                                    &target_path,
-                                    &workspace_packages,
-                                    &default_package,
-                                );
-                                if project_index.insert_package(package.name.clone()) {
-                                    project.packages.push(package.clone());
-                                }
-                                let layer = architecture.layer(&target_id.0)?;
-                                if let Some(value) = &layer {
-                                    layers.insert(target_id.clone(), value.clone());
-                                }
-                                let package_root =
-                                    relative_resolved_path(&root, &package.root_path);
-                                if let Some((feature, feature_root)) =
-                                    architecture.feature(&target_id.0, &package, &package_root)
-                                {
-                                    features.insert(target_id.clone(), feature);
-                                    feature_roots.insert(target_id.clone(), feature_root);
-                                }
-                                let semantics = ModuleSemantics::default();
-                                let classification = PipelineTelemetry::measure(
-                                    &mut telemetry.classification,
-                                    || {
-                                        framework_adapter.map(|adapter| {
-                                            adapter.classify(ModuleEvidence {
-                                                path: &target_id.0,
-                                                package_root: &package_root,
-                                                semantics: &semantics,
+            incremental.analyzed_modules += 1;
+            let imports_start = project.imports.len();
+            let dependencies_start = project.dependencies.len();
+            let resolved_start = project.resolved_dependencies.len();
+            let diagnostics_start = project.diagnostics.len();
+            let parsed = parsed.ok_or_else(|| {
+                AnalysisError::Internal(format!("parser produced no result for `{}`", module_id.0))
+            })?;
+            let semantics = match parsed {
+                Ok(parsed) => {
+                    PipelineTelemetry::measure(&mut telemetry.classification, || {
+                        apply_framework_classification(
+                            &mut project,
+                            &module_id,
+                            &root,
+                            framework_adapter,
+                            &parsed.semantics,
+                        );
+                    });
+                    let resolved = resolved.ok_or_else(|| {
+                        AnalysisError::Internal(format!(
+                            "resolver produced no result for `{}`",
+                            module_id.0
+                        ))
+                    })?;
+                    for prepared_dependency in resolved {
+                        if cancellation.is_cancelled() {
+                            return Err(AnalysisError::Cancelled);
+                        }
+                        let PreparedDependency { import, candidate, candidate_paths, resolution } =
+                            prepared_dependency;
+                        match resolution {
+                            Resolution::Module(target) => {
+                                let target_id = ModuleId(relative_resolved_path(&root, &target.0));
+                                let target_kind = workspace_packages
+                                    .iter()
+                                    .filter(|package| {
+                                        normalized_path_is_within(&target.0, &package.root)
+                                    })
+                                    .max_by_key(|package| package.root.components().count())
+                                    .map_or_else(
+                                        || DependencyTarget::Internal(target_id.clone()),
+                                        |package| DependencyTarget::WorkspacePackage {
+                                            package: PackageName(package.name.clone()),
+                                            module: target_id.clone(),
+                                        },
+                                    );
+                                if project_index.insert_module(target_id.clone()) {
+                                    let target_path = root.join(&target_id.0);
+                                    let package = infer_package(
+                                        &root,
+                                        &target_path,
+                                        &workspace_packages,
+                                        &default_package,
+                                    );
+                                    if project_index.insert_package(package.name.clone()) {
+                                        project.packages.push(package.clone());
+                                    }
+                                    let layer = architecture.layer(&target_id.0)?;
+                                    if let Some(value) = &layer {
+                                        layers.insert(target_id.clone(), value.clone());
+                                    }
+                                    let package_root =
+                                        relative_resolved_path(&root, &package.root_path);
+                                    if let Some((feature, feature_root)) =
+                                        architecture.feature(&target_id.0, &package, &package_root)
+                                    {
+                                        features.insert(target_id.clone(), feature);
+                                        feature_roots.insert(target_id.clone(), feature_root);
+                                    }
+                                    let semantics = ModuleSemantics::default();
+                                    let classification = PipelineTelemetry::measure(
+                                        &mut telemetry.classification,
+                                        || {
+                                            framework_adapter.map(|adapter| {
+                                                adapter.classify(ModuleEvidence {
+                                                    path: &target_id.0,
+                                                    package_root: &package_root,
+                                                    semantics: &semantics,
+                                                })
                                             })
-                                        })
+                                        },
+                                    );
+                                    project.modules.push(Module {
+                                        id: target_id.clone(),
+                                        path: ModulePath(target_id.0.clone()),
+                                        package: package.name,
+                                        kind: ModuleKind::Excluded,
+                                        runtime: classification
+                                            .as_ref()
+                                            .map_or(Runtime::Unknown, |value| value.runtime),
+                                        layer: layer.map(LayerId),
+                                        framework_metadata: classification
+                                            .map_or_else(FrameworkMetadata::default, |value| {
+                                                value.metadata
+                                            }),
+                                    });
+                                }
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind.clone(),
+                                    target: target_kind,
+                                    location: import.location.clone(),
+                                });
+                                project.dependencies.push(Dependency {
+                                    from: module_id.clone(),
+                                    to: target_id,
+                                    kind: candidate.kind,
+                                    location: import.location.clone(),
+                                });
+                            }
+                            Resolution::External(name) => {
+                                let external_id = ModuleId(format!("external:{name}"));
+                                if project_index.insert_module(external_id.clone()) {
+                                    let external_package = PackageName(name.clone());
+                                    project.modules.push(Module {
+                                        id: external_id.clone(),
+                                        path: ModulePath(format!("external:{name}")),
+                                        package: external_package.clone(),
+                                        kind: ModuleKind::External,
+                                        runtime: Runtime::Unknown,
+                                        layer: None,
+                                        framework_metadata: FrameworkMetadata::default(),
+                                    });
+                                    if project_index.insert_package(external_package.clone()) {
+                                        project.packages.push(Package {
+                                            name: external_package,
+                                            root_path: String::new(),
+                                        });
+                                    }
+                                }
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind.clone(),
+                                    target: DependencyTarget::ExternalPackage(PackageName(name)),
+                                    location: import.location.clone(),
+                                });
+                                project.dependencies.push(Dependency {
+                                    from: module_id.clone(),
+                                    to: external_id,
+                                    kind: candidate.kind,
+                                    location: import.location.clone(),
+                                });
+                            }
+                            Resolution::Builtin(name) => {
+                                let builtin_id = ModuleId(format!("builtin:{name}"));
+                                if project_index.insert_module(builtin_id.clone()) {
+                                    let builtin_package = PackageName("node".into());
+                                    project.modules.push(Module {
+                                        id: builtin_id.clone(),
+                                        path: ModulePath(format!("builtin:{name}")),
+                                        package: builtin_package.clone(),
+                                        kind: ModuleKind::External,
+                                        runtime: Runtime::Node,
+                                        layer: None,
+                                        framework_metadata: FrameworkMetadata::default(),
+                                    });
+                                    if project_index.insert_package(builtin_package.clone()) {
+                                        project.packages.push(Package {
+                                            name: builtin_package,
+                                            root_path: String::new(),
+                                        });
+                                    }
+                                }
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind.clone(),
+                                    target: DependencyTarget::Builtin(name),
+                                    location: import.location.clone(),
+                                });
+                                project.dependencies.push(Dependency {
+                                    from: module_id.clone(),
+                                    to: builtin_id,
+                                    kind: candidate.kind,
+                                    location: import.location.clone(),
+                                });
+                            }
+                            Resolution::Unresolved => {
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
+                                    specifier: import.specifier.clone(),
+                                    kind: candidate.kind,
+                                    target: DependencyTarget::Unresolved {
+                                        specifier: import.specifier.clone(),
+                                        reason:
+                                            "no resolver in the configured chain produced a module"
+                                                .into(),
                                     },
-                                );
-                                project.modules.push(Module {
-                                    id: target_id.clone(),
-                                    path: ModulePath(target_id.0.clone()),
-                                    package: package.name,
-                                    kind: ModuleKind::Excluded,
-                                    runtime: classification
-                                        .as_ref()
-                                        .map_or(Runtime::Unknown, |value| value.runtime),
-                                    layer: layer.map(LayerId),
-                                    framework_metadata: classification
-                                        .map_or_else(FrameworkMetadata::default, |value| {
-                                            value.metadata
-                                        }),
+                                    location: import.location.clone(),
                                 });
-                            }
-                            project.resolved_dependencies.push(ResolvedDependency {
-                                from: module_id.clone(),
-                                specifier: import.specifier.clone(),
-                                kind: candidate.kind.clone(),
-                                target: target_kind,
-                                location: import.location.clone(),
-                            });
-                            project.dependencies.push(Dependency {
-                                from: module_id.clone(),
-                                to: target_id,
-                                kind: candidate.kind,
-                                location: import.location.clone(),
-                            });
-                        }
-                        Resolution::External(name) => {
-                            let external_id = ModuleId(format!("external:{name}"));
-                            if project_index.insert_module(external_id.clone()) {
-                                let external_package = PackageName(name.clone());
-                                project.modules.push(Module {
-                                    id: external_id.clone(),
-                                    path: ModulePath(format!("external:{name}")),
-                                    package: external_package.clone(),
-                                    kind: ModuleKind::External,
-                                    runtime: Runtime::Unknown,
-                                    layer: None,
-                                    framework_metadata: FrameworkMetadata::default(),
-                                });
-                                if project_index.insert_package(external_package.clone()) {
-                                    project.packages.push(Package {
-                                        name: external_package,
-                                        root_path: String::new(),
-                                    });
+                                let mut diagnostic = unresolved_diagnostic(&import);
+                                if !candidate_paths.is_empty() {
+                                    diagnostic.metadata.insert(
+                                        "candidatePaths".into(),
+                                        serde_json::to_string(&candidate_paths).map_err(
+                                            |error| AnalysisError::Internal(error.to_string()),
+                                        )?,
+                                    );
+                                    diagnostic.refresh_fingerprint();
                                 }
+                                project.diagnostics.push(diagnostic)
                             }
-                            project.resolved_dependencies.push(ResolvedDependency {
-                                from: module_id.clone(),
-                                specifier: import.specifier.clone(),
-                                kind: candidate.kind.clone(),
-                                target: DependencyTarget::ExternalPackage(PackageName(name)),
-                                location: import.location.clone(),
-                            });
-                            project.dependencies.push(Dependency {
-                                from: module_id.clone(),
-                                to: external_id,
-                                kind: candidate.kind,
-                                location: import.location.clone(),
-                            });
-                        }
-                        Resolution::Builtin(name) => {
-                            let builtin_id = ModuleId(format!("builtin:{name}"));
-                            if project_index.insert_module(builtin_id.clone()) {
-                                let builtin_package = PackageName("node".into());
-                                project.modules.push(Module {
-                                    id: builtin_id.clone(),
-                                    path: ModulePath(format!("builtin:{name}")),
-                                    package: builtin_package.clone(),
-                                    kind: ModuleKind::External,
-                                    runtime: Runtime::Node,
-                                    layer: None,
-                                    framework_metadata: FrameworkMetadata::default(),
-                                });
-                                if project_index.insert_package(builtin_package.clone()) {
-                                    project.packages.push(Package {
-                                        name: builtin_package,
-                                        root_path: String::new(),
-                                    });
-                                }
-                            }
-                            project.resolved_dependencies.push(ResolvedDependency {
-                                from: module_id.clone(),
-                                specifier: import.specifier.clone(),
-                                kind: candidate.kind.clone(),
-                                target: DependencyTarget::Builtin(name),
-                                location: import.location.clone(),
-                            });
-                            project.dependencies.push(Dependency {
-                                from: module_id.clone(),
-                                to: builtin_id,
-                                kind: candidate.kind,
-                                location: import.location.clone(),
-                            });
-                        }
-                        Resolution::Unresolved => {
-                            project.resolved_dependencies.push(ResolvedDependency {
-                                from: module_id.clone(),
-                                specifier: import.specifier.clone(),
-                                kind: candidate.kind,
-                                target: DependencyTarget::Unresolved {
+                            Resolution::Invalid(reason) => {
+                                project.resolved_dependencies.push(ResolvedDependency {
+                                    from: module_id.clone(),
                                     specifier: import.specifier.clone(),
-                                    reason: "no resolver in the configured chain produced a module"
-                                        .into(),
-                                },
-                                location: import.location.clone(),
-                            });
-                            let mut diagnostic = unresolved_diagnostic(&import);
-                            if !candidate_paths.is_empty() {
-                                diagnostic.metadata.insert(
-                                    "candidatePaths".into(),
-                                    serde_json::to_string(&candidate_paths).map_err(|error| {
-                                        AnalysisError::Internal(error.to_string())
-                                    })?,
-                                );
+                                    kind: candidate.kind.clone(),
+                                    target: DependencyTarget::Unresolved {
+                                        specifier: import.specifier.clone(),
+                                        reason: reason.clone(),
+                                    },
+                                    location: import.location.clone(),
+                                });
+                                let mut diagnostic =
+                                    simple_diagnostic("RESOLVE-002", reason, &module_id.0);
+                                diagnostic.primary_location = Some(import.location.clone());
                                 diagnostic.refresh_fingerprint();
+                                project.diagnostics.push(diagnostic);
                             }
-                            project.diagnostics.push(diagnostic)
+                            Resolution::Redirect(target) => {
+                                return Err(AnalysisError::Internal(format!(
+                                    "resolver leaked redirect `{target}` out of its pipeline"
+                                )));
+                            }
                         }
-                        Resolution::Invalid(reason) => {
-                            project.resolved_dependencies.push(ResolvedDependency {
-                                from: module_id.clone(),
-                                specifier: import.specifier.clone(),
-                                kind: candidate.kind.clone(),
-                                target: DependencyTarget::Unresolved {
-                                    specifier: import.specifier.clone(),
-                                    reason: reason.clone(),
-                                },
-                                location: import.location.clone(),
-                            });
-                            let mut diagnostic =
-                                simple_diagnostic("RESOLVE-002", reason, &module_id.0);
-                            diagnostic.primary_location = Some(import.location.clone());
-                            diagnostic.refresh_fingerprint();
-                            project.diagnostics.push(diagnostic);
-                        }
-                        Resolution::Redirect(target) => {
-                            return Err(AnalysisError::Internal(format!(
-                                "resolver leaked redirect `{target}` out of its pipeline"
-                            )));
-                        }
+                        project.dependency_candidates.push(import.clone().into());
+                        project.imports.push(import);
                     }
-                    project.dependency_candidates.push(import.clone().into());
-                    project.imports.push(import);
+                    parsed.semantics
                 }
-                parsed.semantics
-            }
-            Err(error) => {
-                PipelineTelemetry::measure(&mut telemetry.classification, || {
-                    apply_framework_classification(
-                        &mut project,
-                        &module_id,
-                        &root,
-                        framework_adapter,
-                        &ModuleSemantics::default(),
-                    );
-                });
-                let mut diagnostic = simple_diagnostic("PARSE-001", error.message, &module_id.0);
-                diagnostic.primary_location = error.location.or_else(|| {
-                    Some(SourceLocation { file: module_id.0.clone(), line: 1, column: 1 })
-                });
-                diagnostic.refresh_fingerprint();
-                project.diagnostics.push(diagnostic);
-                ModuleSemantics::default()
-            }
-        };
-        cache.insert(
-            module_id.0.clone(),
-            source_hash,
-            environment_hash,
-            CachedModuleAnalysis {
-                hash: source_hash,
+                Err(error) => {
+                    PipelineTelemetry::measure(&mut telemetry.classification, || {
+                        apply_framework_classification(
+                            &mut project,
+                            &module_id,
+                            &root,
+                            framework_adapter,
+                            &ModuleSemantics::default(),
+                        );
+                    });
+                    let mut diagnostic =
+                        simple_diagnostic("PARSE-001", error.message, &module_id.0);
+                    diagnostic.primary_location = error.location.or_else(|| {
+                        Some(SourceLocation { file: module_id.0.clone(), line: 1, column: 1 })
+                    });
+                    diagnostic.refresh_fingerprint();
+                    project.diagnostics.push(diagnostic);
+                    ModuleSemantics::default()
+                }
+            };
+            cache.insert(
+                module_id.0.clone(),
+                source_hash,
                 environment_hash,
-                imports: project.imports[imports_start..].to_vec(),
-                dependencies: project.dependencies[dependencies_start..].to_vec(),
-                resolved_dependencies: project.resolved_dependencies[resolved_start..].to_vec(),
-                diagnostics: project.diagnostics[diagnostics_start..].to_vec(),
-                semantics,
-                resolved_paths: Vec::new(),
-            },
-        );
+                CachedModuleAnalysis {
+                    hash: source_hash,
+                    environment_hash,
+                    imports: project.imports[imports_start..].to_vec(),
+                    dependencies: project.dependencies[dependencies_start..].to_vec(),
+                    resolved_dependencies: project.resolved_dependencies[resolved_start..].to_vec(),
+                    diagnostics: project.diagnostics[diagnostics_start..].to_vec(),
+                    semantics,
+                    resolved_paths: Vec::new(),
+                },
+            );
+        }
     }
 
     project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
