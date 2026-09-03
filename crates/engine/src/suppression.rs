@@ -112,25 +112,51 @@ pub(crate) fn apply(
     }
 }
 
-pub(crate) fn apply_config(diagnostics: &mut [Diagnostic], config: &SuppressionConfig) {
+pub(crate) fn apply_config(diagnostics: &mut Vec<Diagnostic>, config: &SuppressionConfig) {
+    let today = wae_config::current_epoch_day();
     let paths = config
         .paths
         .iter()
-        .filter_map(|entry| {
-            Glob::new(&entry.pattern).ok().map(|glob| (glob.compile_matcher(), entry))
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            Glob::new(&entry.pattern).ok().map(|glob| (glob.compile_matcher(), index, entry))
         })
         .collect::<Vec<_>>();
-    for diagnostic in diagnostics {
+    let expired_paths = config
+        .paths
+        .iter()
+        .map(|entry| {
+            entry
+                .expires_at
+                .as_deref()
+                .is_some_and(|date| wae_config::expiration_day(date) <= today)
+        })
+        .collect::<Vec<_>>();
+    let expired_fingerprints = config
+        .fingerprints
+        .iter()
+        .map(|entry| {
+            entry
+                .expires_at
+                .as_deref()
+                .is_some_and(|date| wae_config::expiration_day(date) <= today)
+        })
+        .collect::<Vec<_>>();
+    let mut path_matches = vec![0usize; config.paths.len()];
+    let mut fingerprint_matches = vec![0usize; config.fingerprints.len()];
+    for diagnostic in diagnostics.iter_mut() {
         if diagnostic.suppressed {
             continue;
         }
-        if let Some(entry) = config.fingerprints.iter().find(|entry| {
-            entry.fingerprint == diagnostic.fingerprint
-                || diagnostic
-                    .legacy_fingerprint_aliases()
-                    .iter()
-                    .any(|alias| alias == &entry.fingerprint)
-        }) {
+        let aliases = diagnostic.legacy_fingerprint_aliases();
+        if let Some((index, entry)) =
+            config.fingerprints.iter().enumerate().find(|(index, entry)| {
+                !expired_fingerprints[*index]
+                    && (entry.fingerprint == diagnostic.fingerprint
+                        || aliases.iter().any(|alias| alias == &entry.fingerprint))
+            })
+        {
+            fingerprint_matches[index] += 1;
             diagnostic.suppressed = true;
             diagnostic.suppression_reason = Some(entry.reason.clone());
             continue;
@@ -140,13 +166,47 @@ pub(crate) fn apply_config(diagnostics: &mut [Diagnostic], config: &SuppressionC
             .iter()
             .map(|location| location.file.as_str())
             .chain(diagnostic.dependency_path.iter().map(|module| module.0.as_str()));
-        if let Some((_, entry)) = paths.iter().find(|(matcher, entry)| {
-            entry.rules.iter().any(|rule| rule == &diagnostic.rule_id.0)
+        if let Some((_, index, entry)) = paths.iter().find(|(matcher, index, entry)| {
+            !expired_paths[*index]
+                && entry.rules.iter().any(|rule| rule == &diagnostic.rule_id.0)
                 && files.clone().any(|file| matcher.is_match(file))
         }) {
+            path_matches[*index] += 1;
             diagnostic.suppressed = true;
             diagnostic.suppression_reason = Some(entry.reason.clone());
         }
+    }
+    if config.report_unused {
+        for (index, entry) in config.paths.iter().enumerate() {
+            if expired_paths[index] || path_matches[index] == 0 {
+                diagnostics.push(warning(
+                    "wae.yaml",
+                    1,
+                    suppression_status("path", &entry.pattern, expired_paths[index]),
+                ));
+            }
+        }
+        for (index, entry) in config.fingerprints.iter().enumerate() {
+            if expired_fingerprints[index] || fingerprint_matches[index] == 0 {
+                diagnostics.push(warning(
+                    "wae.yaml",
+                    1,
+                    suppression_status(
+                        "fingerprint",
+                        &entry.fingerprint,
+                        expired_fingerprints[index],
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn suppression_status(kind: &str, identity: &str, expired: bool) -> String {
+    if expired {
+        format!("Expired config {kind} suppression `{identity}`")
+    } else {
+        format!("Unused config {kind} suppression `{identity}`")
     }
 }
 
@@ -225,6 +285,7 @@ mod tests {
             pattern: "src/legacy/**".into(),
             rules: vec!["ARCH-003".into()],
             reason: "migration ARC-42".into(),
+            ..Default::default()
         };
         let mut path_diagnostic = diagnostic("ARCH-003", 3);
         path_diagnostic.primary_location.as_mut().unwrap().file = "src/legacy/app.ts".into();
@@ -235,11 +296,43 @@ mod tests {
             fingerprints: vec![wae_config::FingerprintSuppression {
                 fingerprint: identity_diagnostic.fingerprint.clone(),
                 reason: "accepted cycle ARC-99".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
         let mut diagnostics = vec![path_diagnostic, identity_diagnostic];
         apply_config(&mut diagnostics, &config);
         assert!(diagnostics.iter().all(|diagnostic| diagnostic.suppressed));
+    }
+
+    #[test]
+    fn config_suppressions_report_unused_and_expired_entries() {
+        let config = SuppressionConfig {
+            paths: vec![wae_config::PathSuppression {
+                pattern: "src/unused/**".into(),
+                rules: vec!["ARCH-003".into()],
+                reason: "migration".into(),
+                owner: Some("frontend-platform".into()),
+                ticket: Some("ARC-199".into()),
+                expires_at: None,
+            }],
+            fingerprints: vec![wae_config::FingerprintSuppression {
+                fingerprint: "expired".into(),
+                reason: "temporary".into(),
+                expires_at: Some("2020-01-01".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut diagnostics = vec![diagnostic("ARCH-003", 1)];
+        apply_config(&mut diagnostics, &config);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Unused config path suppression"))
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Expired config fingerprint suppression")
+        }));
     }
 }

@@ -49,21 +49,62 @@ fn incremental(criterion: &mut Criterion) {
             });
         });
         let revision = std::cell::Cell::new(0_u64);
-        group.bench_with_input(BenchmarkId::new("single_edit", modules), &root, |bencher, root| {
+        group.bench_with_input(
+            BenchmarkId::new("syntax_only_edit", modules),
+            &root,
+            |bencher, root| {
+                bencher.iter(|| {
+                    let next = revision.get() + 1;
+                    revision.set(next);
+                    let analysis = engine
+                        .analyze(AnalyzeRequest::new(root).with_overlay(
+                            "src/m0.ts",
+                            format!("import './m1.ts'; export const edited = {next};"),
+                        ))
+                        .unwrap();
+                    assert_eq!(analysis.incremental.analyzed_modules, 1);
+                    assert_eq!(analysis.incremental.restored_modules, modules - 1);
+                    black_box(analysis)
+                });
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("edge_edit", modules), &root, |bencher, root| {
             bencher.iter(|| {
-                let next = revision.get() + 1;
-                revision.set(next);
-                let analysis = engine
-                    .analyze(AnalyzeRequest::new(root).with_overlay(
-                        "src/m0.ts",
-                        format!("import './m1.ts'; export const edited = {next};"),
-                    ))
-                    .unwrap();
+                let analysis =
+                    engine
+                        .analyze(AnalyzeRequest::new(root).with_overlay(
+                            "src/m0.ts",
+                            "import './m2.ts'; export const edited = true;",
+                        ))
+                        .unwrap();
                 assert_eq!(analysis.incremental.analyzed_modules, 1);
-                assert_eq!(analysis.incremental.restored_modules, modules - 1);
+                assert!(!analysis.incremental.rule_snapshot_reused);
                 black_box(analysis)
             });
         });
+        let last_module = format!("src/m{}.ts", modules - 1);
+        group.bench_with_input(
+            BenchmarkId::new("global_cycle_edit", modules),
+            &root,
+            |bencher, root| {
+                bencher.iter(|| {
+                    let analysis = engine
+                        .analyze(AnalyzeRequest::new(root).with_overlay(
+                            last_module.clone(),
+                            "import './m0.ts'; export const edited = true;",
+                        ))
+                        .unwrap();
+                    assert_eq!(analysis.incremental.analyzed_modules, 1);
+                    assert!(
+                        analysis
+                            .diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.rule_id.0 == "ARCH-001")
+                    );
+                    black_box(analysis)
+                });
+            },
+        );
         let _ = fs::remove_dir_all(root);
     }
     group.finish();

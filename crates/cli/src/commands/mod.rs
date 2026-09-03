@@ -11,8 +11,9 @@ use serde_json::json;
 use wae_config::{CONFIG_FILE, Config, ConfigPreset, FailOn};
 use wae_core::domain::{DependencyKind, Diagnostic, ModuleKind};
 use wae_engine::{
-    Analysis, AnalysisError, AnalyzeRequest, CancellationToken, ChangeSet, Engine, ImpactAnalyzer,
-    TraceResolutionRequest, VcsPort, trace_resolution, validate_project_config,
+    Analysis, AnalysisError, AnalyzeRequest, AtomicJsonRepository, CancellationToken, ChangeSet,
+    Engine, ImpactAnalyzer, TraceResolutionRequest, VcsPort, trace_resolution,
+    validate_project_config,
 };
 use wae_reporters::{Format, render};
 
@@ -68,6 +69,60 @@ pub fn scan(root: &Path, cancellation: &CancellationToken) -> CliOutput {
 
 pub fn discover(root: &Path, json: bool, write: bool, force: bool) -> CliOutput {
     discover::run(root, json, write, force)
+}
+
+pub fn suppressions_list(root: &Path) -> CliOutput {
+    match Config::load(root) {
+        Ok(config) => CliOutput::success(
+            serde_json::to_string_pretty(&json!({
+                "paths": config.suppressions.paths,
+                "fingerprints": config.suppressions.fingerprints,
+            }))
+            .expect("serializable suppression config"),
+        ),
+        Err(error) => CliOutput::project_error(config_error(&error)),
+    }
+}
+
+pub fn suppressions_validate(root: &Path, cancellation: &CancellationToken) -> CliOutput {
+    let analysis = match analyze(root, cancellation) {
+        Ok(analysis) => analysis,
+        Err(output) => return output,
+    };
+    let findings = analysis
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.rule_id.0 == "SUPPRESS-001")
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    if findings.is_empty() {
+        CliOutput::success("Suppression registry is valid and every active entry is used.")
+    } else {
+        CliOutput::violations(findings.join("\n"))
+    }
+}
+
+pub fn suppressions_prune(root: &Path) -> CliOutput {
+    let mut config = match Config::load(root) {
+        Ok(config) => config,
+        Err(error) => return CliOutput::project_error(config_error(&error)),
+    };
+    let removed = config.suppressions.prune_expired(wae_config::current_epoch_day());
+    let path = root.join(CONFIG_FILE);
+    if !path.exists() {
+        return CliOutput::project_error(format!("configuration is missing at {}", path.display()));
+    }
+    let yaml = match config.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return CliOutput::internal_error(config_error(&error)),
+    };
+    match AtomicJsonRepository::write_bytes(&path, yaml.as_bytes()) {
+        Ok(()) => CliOutput::success(format!(
+            "Pruned {removed} expired suppression entries; updated {}",
+            path.display()
+        )),
+        Err(error) => CliOutput::project_error(error),
+    }
 }
 
 pub struct CheckOptions {
@@ -224,7 +279,7 @@ fn attach_regression_summary(
 
 fn verbose_analysis(analysis: &Analysis) -> String {
     let mut report = format!(
-        "WAE timing: discovery={}ms classification={}ms parsing={}ms resolution={}ms graph={}ms rules={}ms cache={}ms reporting={}ms orchestration={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={}",
+        "WAE timing: discovery={}ms classification={}ms parsing={}ms resolution={}ms graph={}ms rules={}ms cache={}ms reporting={}ms orchestration={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={} restored-rules={} evaluated-rules={}",
         analysis.timings.discovery_ms,
         analysis.timings.classification_ms,
         analysis.timings.parsing_ms,
@@ -239,6 +294,8 @@ fn verbose_analysis(analysis: &Analysis) -> String {
         analysis.incremental.restored_modules,
         analysis.incremental.analyzed_modules,
         analysis.incremental.rule_snapshot_reused,
+        analysis.incremental.restored_rules,
+        analysis.incremental.evaluated_rules,
     );
     if !analysis.timings.rules.is_empty() {
         report.push_str("\nRule profile:");
@@ -503,6 +560,7 @@ fn map_analysis_error(error: AnalysisError) -> CliOutput {
         AnalysisError::Project(error) => CliOutput::project_error(error),
         AnalysisError::Internal(error) => CliOutput::internal_error(error),
         AnalysisError::Cancelled => CliOutput::cancelled(),
+        _ => CliOutput::internal_error("unsupported engine error"),
     }
 }
 fn config_error(error: &wae_core::domain::ConfigError) -> String {
@@ -519,6 +577,7 @@ fn analysis_error_detail(error: &AnalysisError) -> String {
         AnalysisError::Project(message) => format!("Project error: {message}"),
         AnalysisError::Internal(message) => format!("Internal error: {message}"),
         AnalysisError::Cancelled => "Analysis cancelled".into(),
+        _ => "Unsupported engine error".into(),
     }
 }
 
@@ -760,16 +819,7 @@ mod tests {
         std::fs::write(root.join("untracked.ts"), "export const fresh = true;").unwrap();
 
         let project = Project::default();
-        let analysis = Analysis {
-            failure_policy: Default::default(),
-            schema_version: 1,
-            graph: Default::default(),
-            ownership: Default::default(),
-            project,
-            diagnostics: Vec::new(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = Analysis::new(project, Default::default(), Vec::new());
         let (_, affected) = affected_modules(&root, &analysis, Some("HEAD")).unwrap();
         assert!(affected.contains("tracked.ts"));
         assert!(affected.contains("staged.ts"));

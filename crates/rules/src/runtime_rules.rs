@@ -217,7 +217,16 @@ fn modules_with_runtime(context: &RuleContext<'_>, runtime: Runtime) -> Vec<Modu
         .project
         .modules
         .iter()
-        .filter(|module| module.kind != ModuleKind::External && module.runtime == runtime)
+        .filter(|module| {
+            module.kind != ModuleKind::External
+                && module.runtime == runtime
+                && !(runtime == Runtime::Browser
+                    && module
+                        .framework_metadata
+                        .attributes
+                        .get("runtimeSource")
+                        .is_some_and(|source| source == "propagated"))
+        })
         .map(|module| module.id.clone())
         .collect()
 }

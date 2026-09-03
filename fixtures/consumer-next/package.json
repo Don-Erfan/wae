@@ -4,11 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "architecture": "wae config validate --show-overlaps && wae check --format json"
+    "architecture": "wae config validate --show-overlaps && wae check --format json",
+    "build": "next build"
   },
   "devDependencies": {
-    "@don-erfan/wae": "0.0.26",
-    "next": "15.2.6",
-    "typescript": "5.1.6"
+    "@types/node": "20.19.14",
+    "@types/react": "18.3.28",
+    "@types/react-dom": "18.3.7",
+    "next": "13.5.11",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "typescript": "5.9.2"
   }
 }

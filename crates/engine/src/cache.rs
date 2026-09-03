@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fs2::FileExt;
@@ -10,7 +9,7 @@ use wae_config::Config;
 use wae_core::domain::{Dependency, Diagnostic, Import, ModuleSemantics, ResolvedDependency};
 use wae_parser::PARSER_CACHE_VERSION;
 
-use crate::AnalysisError;
+use crate::{AnalysisError, AtomicJsonRepository};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CachedModuleAnalysis {
@@ -33,7 +32,7 @@ struct CacheFile {
     parser_version: String,
     files: BTreeMap<String, CachedModuleAnalysis>,
     #[serde(default)]
-    rules: Option<CachedRuleAnalysis>,
+    rule_partitions: BTreeMap<String, CachedRuleAnalysis>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -42,14 +41,15 @@ struct CacheManifest {
     #[serde(default)]
     parser_version: String,
     #[serde(default)]
-    rules: Option<CachedRuleAnalysis>,
+    rule_partitions: BTreeMap<String, CachedRuleAnalysis>,
     #[serde(default)]
     modules: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedRuleAnalysis {
-    graph_hash: u64,
+    #[serde(alias = "graph_hash")]
+    input_hash: u64,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -60,7 +60,7 @@ pub(crate) struct AnalysisCache {
     file: CacheFile,
     live_files: BTreeSet<String>,
     dirty_files: BTreeMap<String, CachedModuleAnalysis>,
-    dirty_rules: Option<CachedRuleAnalysis>,
+    dirty_rule_partitions: BTreeMap<String, CachedRuleAnalysis>,
     needs_prune: bool,
     stale_files: BTreeSet<String>,
     loaded_shards: BTreeSet<u8>,
@@ -85,7 +85,7 @@ impl AnalysisCache {
                 file: fresh_cache(),
                 live_files,
                 dirty_files: BTreeMap::new(),
-                dirty_rules: None,
+                dirty_rule_partitions: BTreeMap::new(),
                 needs_prune: false,
                 stale_files: BTreeSet::new(),
                 loaded_shards: BTreeSet::new(),
@@ -105,7 +105,7 @@ impl AnalysisCache {
             schema_version: manifest.schema_version,
             parser_version: manifest.parser_version,
             files: BTreeMap::new(),
-            rules: manifest.rules,
+            rule_partitions: manifest.rule_partitions,
         };
         Ok(Self {
             enabled: true,
@@ -114,7 +114,7 @@ impl AnalysisCache {
             file,
             live_files,
             dirty_files: BTreeMap::new(),
-            dirty_rules: None,
+            dirty_rule_partitions: BTreeMap::new(),
             needs_prune,
             stale_files,
             loaded_shards: BTreeSet::new(),
@@ -171,19 +171,24 @@ impl AnalysisCache {
         }
     }
 
-    pub(crate) fn rule_diagnostics(&self, graph_hash: u64) -> Option<Vec<Diagnostic>> {
+    pub(crate) fn rule_partition(&self, rule_id: &str, input_hash: u64) -> Option<Vec<Diagnostic>> {
         self.enabled
-            .then_some(self.file.rules.as_ref())
+            .then(|| self.file.rule_partitions.get(rule_id))
             .flatten()
-            .filter(|cached| cached.graph_hash == graph_hash)
+            .filter(|cached| cached.input_hash == input_hash)
             .map(|cached| cached.diagnostics.clone())
     }
 
-    pub(crate) fn set_rule_diagnostics(&mut self, graph_hash: u64, diagnostics: Vec<Diagnostic>) {
+    pub(crate) fn set_rule_partition(
+        &mut self,
+        rule_id: String,
+        input_hash: u64,
+        diagnostics: Vec<Diagnostic>,
+    ) {
         if self.enabled {
-            let cached = CachedRuleAnalysis { graph_hash, diagnostics };
-            self.file.rules = Some(cached.clone());
-            self.dirty_rules = Some(cached);
+            let cached = CachedRuleAnalysis { input_hash, diagnostics };
+            self.file.rule_partitions.insert(rule_id.clone(), cached.clone());
+            self.dirty_rule_partitions.insert(rule_id, cached);
         }
     }
 
@@ -191,7 +196,8 @@ impl AnalysisCache {
         if !self.enabled {
             return Ok(());
         }
-        if self.dirty_files.is_empty() && self.dirty_rules.is_none() && !self.needs_prune {
+        if self.dirty_files.is_empty() && self.dirty_rule_partitions.is_empty() && !self.needs_prune
+        {
             return Ok(());
         }
         // Parsing and graph analysis happen without a global writer lock. The short transaction
@@ -216,12 +222,10 @@ impl AnalysisCache {
         let mut manifest = read_manifest(&self.path).unwrap_or(CacheManifest {
             schema_version: 3,
             parser_version: PARSER_CACHE_VERSION.into(),
-            rules: self.file.rules.clone(),
+            rule_partitions: self.file.rule_partitions.clone(),
             modules: BTreeSet::new(),
         });
-        if self.dirty_rules.is_some() {
-            manifest.rules.clone_from(&self.dirty_rules);
-        }
+        manifest.rule_partitions.extend(self.dirty_rule_partitions.clone());
         manifest.schema_version = 3;
         manifest.parser_version = PARSER_CACHE_VERSION.into();
         manifest.modules.clone_from(&self.live_files);
@@ -231,52 +235,7 @@ impl AnalysisCache {
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), AnalysisError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AnalysisError::Project("cache path has no parent directory".into()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| AnalysisError::Project(format!("cannot create cache shard: {error}")))?;
-    static CACHE_WRITE_ID: AtomicU64 = AtomicU64::new(0);
-    let write_id = CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-    let temporary = path.with_extension(format!("tmp-{}-{write_id}", std::process::id()));
-    let contents =
-        serde_json::to_vec(value).map_err(|error| AnalysisError::Internal(error.to_string()))?;
-    fs::write(&temporary, contents)
-        .map_err(|error| AnalysisError::Project(format!("cannot write cache: {error}")))?;
-    replace_file(&temporary, path)
-}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<(), AnalysisError> {
-    fs::rename(temporary, destination)
-        .map_err(|error| AnalysisError::Project(format!("cannot install cache: {error}")))
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, destination: &Path) -> Result<(), AnalysisError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source = temporary.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-    let target =
-        destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-    // SAFETY: both buffers are NUL-terminated and remain alive for the duration of the call.
-    let replaced = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        return Err(AnalysisError::Project(format!(
-            "cannot atomically install cache: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
+    AtomicJsonRepository::write(path, value).map_err(AnalysisError::Project)
 }
 
 fn unresolved_candidate_became_live(
@@ -310,7 +269,7 @@ fn read_cache(path: &Path) -> CacheFile {
         schema_version: manifest.schema_version,
         parser_version: manifest.parser_version,
         files,
-        rules: manifest.rules,
+        rule_partitions: manifest.rule_partitions,
     }
 }
 

@@ -110,16 +110,7 @@ mod tests {
             }],
             ..Project::default()
         };
-        let analysis = Analysis {
-            failure_policy: Default::default(),
-            schema_version: 1,
-            graph: Default::default(),
-            ownership: Default::default(),
-            project,
-            diagnostics: Vec::new(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = Analysis::new(project, Default::default(), Vec::new());
         let result = write(&root, Path::new("report/index.html"), &analysis);
         assert_eq!(result.exit_code, 0);
         let document = std::fs::read_to_string(root.join("report/index.html")).unwrap();

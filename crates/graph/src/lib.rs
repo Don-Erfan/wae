@@ -12,6 +12,32 @@ pub struct ModuleGraph {
     edge_keys: HashSet<(ModuleId, ModuleId, wae_core::domain::DependencyKind)>,
 }
 
+/// A compact multi-source BFS result. It retains only depth and predecessor indexes, so callers
+/// can inspect every depth in O(1) and materialize a path only for diagnostics that need one.
+pub struct MultiSourcePaths<'graph> {
+    graph: &'graph ModuleGraph,
+    depths: Vec<Option<usize>>,
+    previous: Vec<Option<usize>>,
+}
+
+impl MultiSourcePaths<'_> {
+    pub fn depth(&self, node: &ModuleId) -> Option<usize> {
+        self.graph.node_indices.get(node).and_then(|index| self.depths[*index])
+    }
+
+    pub fn path(&self, node: &ModuleId) -> Option<Vec<ModuleId>> {
+        let mut cursor = *self.graph.node_indices.get(node)?;
+        self.depths[cursor]?;
+        let mut path = vec![cursor];
+        while let Some(parent) = self.previous[cursor] {
+            cursor = parent;
+            path.push(cursor);
+        }
+        path.reverse();
+        Some(path.into_iter().map(|index| self.graph.nodes[index].clone()).collect())
+    }
+}
+
 impl ModuleGraph {
     pub fn new() -> Self {
         Self::default()
@@ -88,12 +114,46 @@ impl ModuleGraph {
         self.outgoing[index].iter().map(|target| self.nodes[*target].clone()).collect()
     }
 
+    pub fn out_degree(&self, node: &ModuleId) -> usize {
+        self.node_indices.get(node).map_or(0, |index| self.outgoing[*index].len())
+    }
+
     pub fn incoming(&self, node: &ModuleId) -> Vec<ModuleId> {
         let Some(index) = self.node_indices.get(node).copied() else {
             return Vec::new();
         };
 
         self.incoming[index].iter().map(|source| self.nodes[*source].clone()).collect()
+    }
+
+    pub fn in_degree(&self, node: &ModuleId) -> usize {
+        self.node_indices.get(node).map_or(0, |index| self.incoming[*index].len())
+    }
+
+    /// Computes deterministic shortest paths from all roots with one O(V+E) traversal.
+    pub fn shortest_paths_from_any(&self, roots: &[ModuleId]) -> MultiSourcePaths<'_> {
+        let mut depths = vec![None; self.nodes.len()];
+        let mut previous = vec![None; self.nodes.len()];
+        let mut queue = VecDeque::new();
+        for root in roots {
+            let Some(index) = self.node_indices.get(root).copied() else { continue };
+            if depths[index].is_none() {
+                depths[index] = Some(0);
+                queue.push_back(index);
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            let next_depth = depths[node].expect("queued nodes have a depth") + 1;
+            for &neighbor in &self.outgoing[node] {
+                if depths[neighbor].is_some() {
+                    continue;
+                }
+                depths[neighbor] = Some(next_depth);
+                previous[neighbor] = Some(node);
+                queue.push_back(neighbor);
+            }
+        }
+        MultiSourcePaths { graph: self, depths, previous }
     }
 
     pub fn reachable_from(&self, start: &ModuleId) -> Vec<ModuleId> {
@@ -121,6 +181,42 @@ impl ModuleGraph {
         }
 
         reachable
+    }
+
+    /// Multi-source forward traversal that records boundary nodes but does not traverse through
+    /// them. This is used for runtime propagation where RPC and explicit-runtime modules are
+    /// terminal boundaries.
+    pub fn reachable_from_any_until(
+        &self,
+        starts: &[ModuleId],
+        boundaries: &HashSet<ModuleId>,
+    ) -> Vec<ModuleId> {
+        let mut visited = vec![false; self.nodes.len()];
+        let mut queue = VecDeque::new();
+        for start in starts {
+            let Some(index) = self.node_indices.get(start).copied() else { continue };
+            if !visited[index] {
+                visited[index] = true;
+                queue.push_back(index);
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            if boundaries.contains(&self.nodes[node]) {
+                continue;
+            }
+            for &neighbor in &self.outgoing[node] {
+                if !visited[neighbor] {
+                    visited[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        visited
+            .into_iter()
+            .enumerate()
+            .filter(|(_, reachable)| *reachable)
+            .map(|(index, _)| self.nodes[index].clone())
+            .collect()
     }
 
     pub fn has_path(&self, from: &ModuleId, to: &ModuleId) -> bool {
@@ -830,11 +926,13 @@ mod tests {
 
         let outgoing_a = graph.outgoing(&ModuleId(String::from("A")));
         assert_eq!(outgoing_a.len(), 2);
+        assert_eq!(graph.out_degree(&ModuleId(String::from("A"))), 2);
         assert_eq!(outgoing_a[0].0, "B");
         assert_eq!(outgoing_a[1].0, "C");
 
         let incoming_c = graph.incoming(&ModuleId(String::from("C")));
         assert_eq!(incoming_c.len(), 2);
+        assert_eq!(graph.in_degree(&ModuleId(String::from("C"))), 2);
         assert_eq!(incoming_c[0].0, "A");
         assert_eq!(incoming_c[1].0, "B");
 
@@ -865,6 +963,53 @@ mod tests {
             vec![ModuleId("A".into()), ModuleId("B".into()), ModuleId("C".into())]
         );
         assert!(graph.shortest_path(&ModuleId("C".into()), &ModuleId("A".into())).is_none());
+    }
+
+    #[test]
+    fn multi_source_paths_traverse_the_graph_once_and_materialize_on_demand() {
+        let package = Package { name: PackageName("web".into()), root_path: "/app".into() };
+        let graph = ModuleGraph::from_project(
+            &ProjectBuilder::new()
+                .add_package(package.clone())
+                .add_module(module(&package, "A"))
+                .add_module(module(&package, "B"))
+                .add_module(module(&package, "C"))
+                .add_module(module(&package, "D"))
+                .add_dependency(dependency("A", "B"))
+                .add_dependency(dependency("B", "C"))
+                .add_dependency(dependency("D", "C"))
+                .build(),
+        );
+        let paths = graph.shortest_paths_from_any(&[ModuleId("A".into()), ModuleId("D".into())]);
+        assert_eq!(paths.depth(&ModuleId("C".into())), Some(1));
+        assert_eq!(
+            paths.path(&ModuleId("C".into())),
+            Some(vec![ModuleId("D".into()), ModuleId("C".into())])
+        );
+        assert_eq!(paths.depth(&ModuleId("missing".into())), None);
+    }
+
+    #[test]
+    fn multi_source_reachability_stops_after_explicit_boundaries() {
+        let package = Package { name: PackageName("web".into()), root_path: "/app".into() };
+        let graph = ModuleGraph::from_project(
+            &ProjectBuilder::new()
+                .add_package(package.clone())
+                .add_module(module(&package, "client"))
+                .add_module(module(&package, "helper"))
+                .add_module(module(&package, "action"))
+                .add_module(module(&package, "secret"))
+                .add_dependency(dependency("client", "helper"))
+                .add_dependency(dependency("helper", "action"))
+                .add_dependency(dependency("action", "secret"))
+                .build(),
+        );
+        let reachable = graph.reachable_from_any_until(
+            &[ModuleId("client".into())],
+            &std::collections::HashSet::from([ModuleId("action".into())]),
+        );
+        assert!(reachable.contains(&ModuleId("action".into())));
+        assert!(!reachable.contains(&ModuleId("secret".into())));
     }
 
     #[test]

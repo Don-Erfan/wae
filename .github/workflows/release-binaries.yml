@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -37,16 +38,29 @@ jobs:
           tag_url=$(curl --fail --silent --show-error --location "$ref" | jq -r '.object | select(.type == "tag") | .url')
           test -n "$tag_url"
           test "$(curl --fail --silent --show-error --location "$tag_url" | jq -r '.verification.verified')" = "true"
-  readiness:
-    name: Complete v1 readiness gate
-    needs: verify
-    uses: ./.github/workflows/ci.yml
-    with:
-      ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+      - name: Require a successful pre-tag readiness run for the exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")
+          checks=$(gh api --paginate \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/commits/${commit}/check-runs?per_page=100" \
+            --slurp)
+          for required in quality tests audit performance 'v1 readiness'; do
+            jq -e --arg name "$required" '
+              [.[].check_runs[] | select(.name == $name and .conclusion == "success")] | length > 0
+            ' <<<"$checks" >/dev/null || {
+              echo "Missing successful pre-tag check: $required on $commit" >&2
+              exit 1
+            }
+          done
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [verify, readiness]
+    needs: verify
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

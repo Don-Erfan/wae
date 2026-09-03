@@ -6,7 +6,7 @@ WAE analyzes JavaScript and TypeScript dependency architecture. Its production p
 source discovery → import parsing → Node/TypeScript resolution → module graph → rules → diagnostics
 ```
 
-The current engine traverses the Tree-sitter AST for static imports, type-only imports, re-exports, literal dynamic imports, and CommonJS `require` calls. It resolves relative extension/index imports, JSONC `tsconfig` aliases and `extends`, workspace packages, `exports`, and `imports`, then evaluates `ARCH-001` through `ARCH-011`, `PACKAGE-001` through `PACKAGE-004`, and `RUNTIME-001` through `RUNTIME-006` against shared deterministic graphs. A real framework adapter classifies Next.js App/Pages Router modules, client/server directives, routes, actions, middleware, and explicit runtime exports. Runtime diagnostics carry the shortest transitive dependency path, while Server Actions act as explicit RPC boundaries.
+The current engine iteratively traverses the Tree-sitter AST for static imports, type-only imports, re-exports, literal string/template dynamic imports, `new URL(..., import.meta.url)` assets, and CommonJS `require` calls. It resolves relative extension/index imports, JSONC `tsconfig` aliases and `extends`, workspace packages, `exports`, and `imports`, then evaluates `ARCH-001` through `ARCH-011`, `PACKAGE-001` through `PACKAGE-004`, and `RUNTIME-001` through `RUNTIME-006` against shared deterministic graphs. A real framework adapter classifies Next.js App/Pages Router modules relative to package roots, propagates client boundaries, and models routes, actions, middleware, marker packages, and explicit runtimes. Runtime diagnostics carry the shortest transitive dependency path, while Server Actions act as explicit RPC boundaries.
 
 ## Use from source
 
@@ -70,8 +70,8 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.26-assets.spdx.json
-jq '.components | length' wae-v0.0.26-dependencies.cdx.json
+jq '.packages | length' wae-v0.0.27-assets.spdx.json
+jq '.components | length' wae-v0.0.27-dependencies.cdx.json
 ```
 
 The checksum proves both downloaded inventories are the files signed by the release workflow; use

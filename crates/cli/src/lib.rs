@@ -66,6 +66,9 @@ enum Command {
         rule: Option<String>,
     },
     BaselinePrune,
+    SuppressionsList,
+    SuppressionsValidate,
+    SuppressionsPrune,
     Graph,
     Explore {
         output: PathBuf,
@@ -130,6 +133,9 @@ pub fn run_with_cancellation(
         Command::BaselineCreate => commands::baseline_create(cwd, cancellation),
         Command::BaselineList { rule } => commands::baseline_list(cwd, rule.as_deref()),
         Command::BaselinePrune => commands::baseline_prune(cwd, cancellation),
+        Command::SuppressionsList => commands::suppressions_list(cwd),
+        Command::SuppressionsValidate => commands::suppressions_validate(cwd, cancellation),
+        Command::SuppressionsPrune => commands::suppressions_prune(cwd),
         Command::Graph => commands::graph(cwd, cancellation),
         Command::Explore { output } => commands::explore(cwd, output, cancellation),
         Command::Doctor => commands::doctor(cwd, cancellation),
@@ -170,6 +176,17 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 _ => return Err("baseline list accepts only `--rule RULE_ID`".into()),
             };
             Ok(Command::BaselineList { rule })
+        }
+        "suppressions" if args.get(1).map(String::as_str) == Some("list") && args.len() == 2 => {
+            Ok(Command::SuppressionsList)
+        }
+        "suppressions"
+            if args.get(1).map(String::as_str) == Some("validate") && args.len() == 2 =>
+        {
+            Ok(Command::SuppressionsValidate)
+        }
+        "suppressions" if args.get(1).map(String::as_str) == Some("prune") && args.len() == 2 => {
+            Ok(Command::SuppressionsPrune)
         }
         "explain" if args.len() == 2 => Ok(Command::Explain(args[1].clone())),
         "resolve" => parse_resolve(&args[1..]),
@@ -328,7 +345,7 @@ fn parse_explore(args: &[String]) -> Result<Command, String> {
 }
 
 fn usage() -> String {
-    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n        [--fail-on error|warning] [--max-warnings N]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  config validate [--show-overlaps] [--show-coverage] [--show-unassigned]\n                               Validate config, ownership and coverage\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
+    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n        [--fail-on error|warning] [--max-warnings N]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  suppressions list|validate|prune\n                               Inspect, audit, or remove expired config suppressions\n  config validate [--show-overlaps] [--show-coverage] [--show-unassigned]\n                               Validate config, ownership and coverage\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
     .replace(
         "baseline create              Explicitly record current violations",
         "baseline create|list|prune   Create, inspect, or remove stale baseline entries",
@@ -380,6 +397,36 @@ mod tests {
         assert_eq!(
             run(&["check".into(), "--max-warnings".into(), "0".into()], &root).exit_code,
             EXIT_VIOLATIONS
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn suppression_registry_commands_list_validate_and_prune_atomically() {
+        let root =
+            std::env::temp_dir().join(format!("wae-suppressions-cli-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.ts"), "export const value = true;").unwrap();
+        std::fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/unused/**'\n      rules: [ARCH-003]\n      reason: migration\n      owner: platform\n  fingerprints:\n    - fingerprint: expired\n      reason: temporary\n      expires_at: '2020-01-01'\n",
+        )
+        .unwrap();
+        let listed = run(&["suppressions".into(), "list".into()], &root);
+        assert_eq!(listed.exit_code, EXIT_PASSED);
+        assert!(listed.stdout.contains("platform"));
+        let validated = run(&["suppressions".into(), "validate".into()], &root);
+        assert_eq!(validated.exit_code, EXIT_VIOLATIONS);
+        assert!(validated.stdout.contains("Expired config fingerprint suppression"));
+        let pruned = run(&["suppressions".into(), "prune".into()], &root);
+        assert_eq!(pruned.exit_code, EXIT_PASSED);
+        assert_eq!(wae_config::Config::load(&root).unwrap().suppressions.fingerprints.len(), 0);
+        assert!(
+            !std::fs::read_dir(&root).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("tmp-"))
         );
         std::fs::remove_dir_all(root).unwrap();
     }

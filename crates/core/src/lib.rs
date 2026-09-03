@@ -674,6 +674,16 @@ pub mod rule_registry {
                 _ => RuleScope::Global,
             }
         }
+
+        pub fn supports_option(&self, option: &str) -> bool {
+            match option {
+                "max_depth" => self.id == "ARCH-006",
+                "max_fan_out" => self.id == "ARCH-007",
+                "max_fan_in" => self.id == "ARCH-008",
+                "entrypoints" => matches!(self.id, "ARCH-006" | "ARCH-009"),
+                _ => false,
+            }
+        }
     }
 
     pub static RULES: &[RuleDescriptor] = &[
@@ -873,7 +883,7 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.26"]);
+        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.27"]);
     }
 
     #[test]

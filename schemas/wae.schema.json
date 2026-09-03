@@ -8,6 +8,12 @@
   "required": ["version"],
   "properties": {
     "version": { "const": 1 },
+    "extends": {
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/stringList" }
+      ]
+    },
     "project": { "$ref": "#/$defs/project" },
     "resolution": { "$ref": "#/$defs/resolution" },
     "architecture": { "$ref": "#/$defs/architecture" },
@@ -33,10 +39,40 @@
     "cache": { "$ref": "#/$defs/cache" },
     "suppressions": { "$ref": "#/$defs/suppressions" },
     "framework": { "$ref": "#/$defs/framework" },
-    "runtime": { "$ref": "#/$defs/runtime" }
+    "runtime": { "$ref": "#/$defs/runtime" },
+    "overrides": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/override" }
+    }
   },
   "$defs": {
     "stringList": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files"],
+      "properties": {
+        "files": { "$ref": "#/$defs/stringList", "minItems": 1 },
+        "excluded_files": { "$ref": "#/$defs/stringList" },
+        "rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ARCH-001": { "$ref": "#/$defs/rule" }, "ARCH-002": { "$ref": "#/$defs/rule" },
+            "ARCH-003": { "$ref": "#/$defs/rule" }, "ARCH-004": { "$ref": "#/$defs/rule" },
+            "ARCH-005": { "$ref": "#/$defs/rule" }, "ARCH-006": { "$ref": "#/$defs/rule" },
+            "ARCH-007": { "$ref": "#/$defs/rule" }, "ARCH-008": { "$ref": "#/$defs/rule" },
+            "ARCH-009": { "$ref": "#/$defs/rule" }, "ARCH-010": { "$ref": "#/$defs/rule" },
+            "ARCH-011": { "$ref": "#/$defs/rule" },
+            "PACKAGE-001": { "$ref": "#/$defs/rule" }, "PACKAGE-002": { "$ref": "#/$defs/rule" },
+            "PACKAGE-003": { "$ref": "#/$defs/rule" }, "PACKAGE-004": { "$ref": "#/$defs/rule" },
+            "RUNTIME-001": { "$ref": "#/$defs/rule" }, "RUNTIME-002": { "$ref": "#/$defs/rule" },
+            "RUNTIME-003": { "$ref": "#/$defs/rule" }, "RUNTIME-004": { "$ref": "#/$defs/rule" },
+            "RUNTIME-005": { "$ref": "#/$defs/rule" }, "RUNTIME-006": { "$ref": "#/$defs/rule" }
+          }
+        }
+      }
+    },
     "project": {
       "type": "object", "additionalProperties": false,
       "properties": {
@@ -129,7 +165,10 @@
             "properties": {
               "pattern": { "type": "string", "minLength": 1 },
               "rules": { "type": "array", "minItems": 1, "items": { "type": "string" } },
-              "reason": { "type": "string" }
+              "reason": { "type": "string" },
+              "owner": { "type": ["string", "null"], "minLength": 1 },
+              "ticket": { "type": ["string", "null"], "minLength": 1 },
+              "expires_at": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
             }
           }
         },
@@ -141,7 +180,10 @@
             "required": ["fingerprint", "reason"],
             "properties": {
               "fingerprint": { "type": "string", "minLength": 1 },
-              "reason": { "type": "string" }
+              "reason": { "type": "string" },
+              "owner": { "type": ["string", "null"], "minLength": 1 },
+              "ticket": { "type": ["string", "null"], "minLength": 1 },
+              "expires_at": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
             }
           }
         }

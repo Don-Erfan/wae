@@ -9,7 +9,7 @@ use dependency_classifier::{classify_export, classify_import};
 
 /// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
 /// persist this value so parser upgrades can never reuse stale import IR.
-pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v5");
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v6");
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedModule {
@@ -155,11 +155,16 @@ fn valid_with_import_attributes(parser: &mut Parser, source: &str) -> bool {
 }
 
 fn first_error(node: Node<'_>) -> Option<Node<'_>> {
-    if node.is_error() || node.is_missing() {
-        return Some(node);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
     }
-    let mut cursor = node.walk();
-    node.children(&mut cursor).find_map(first_error)
+    None
 }
 
 fn collect_dependencies(
@@ -168,39 +173,49 @@ fn collect_dependencies(
     source: &str,
     output: &mut Vec<Import>,
 ) {
-    match node.kind() {
-        "import_statement" => {
-            if let Some(specifier) = node.child_by_field_name("source") {
-                let kind = classify_import(node, source);
-                push_string_import(output, module_path, source, specifier, kind);
-            } else {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        let descend = match node.kind() {
+            "import_statement" => {
+                if let Some(specifier) = node.child_by_field_name("source") {
+                    let kind = classify_import(node, source);
+                    push_literal_import(output, module_path, source, specifier, kind);
+                } else {
+                    collect_import_equals_require(node, module_path, source, output);
+                }
+                false
+            }
+            "import_alias" => {
                 collect_import_equals_require(node, module_path, source, output);
+                false
             }
-            return;
-        }
-        "import_alias" => {
-            collect_import_equals_require(node, module_path, source, output);
-            return;
-        }
-        "export_statement" => {
-            if let Some(specifier) = node.child_by_field_name("source") {
-                push_string_import(
-                    output,
-                    module_path,
-                    source,
-                    specifier,
-                    classify_export(node, source),
-                );
+            "export_statement" => {
+                if let Some(specifier) = node.child_by_field_name("source") {
+                    push_literal_import(
+                        output,
+                        module_path,
+                        source,
+                        specifier,
+                        classify_export(node, source),
+                    );
+                }
+                false
             }
-            return;
+            "call_expression" => {
+                collect_call(node, module_path, source, output);
+                true
+            }
+            "new_expression" => {
+                collect_new_url(node, module_path, source, output);
+                true
+            }
+            _ => true,
+        };
+        if descend {
+            let mut cursor = node.walk();
+            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            pending.extend(children.into_iter().rev());
         }
-        "call_expression" => collect_call(node, module_path, source, output),
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_dependencies(child, module_path, source, output);
     }
 }
 
@@ -214,16 +229,21 @@ fn collect_import_equals_require(
         return;
     }
     if let Some(specifier) = first_descendant_of_kind(node, "string") {
-        push_string_import(output, module_path, source, specifier, ImportKind::Require);
+        push_literal_import(output, module_path, source, specifier, ImportKind::Require);
     }
 }
 
 fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    if node.kind() == kind {
-        return Some(node);
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find_map(|child| first_descendant_of_kind(child, kind))
+    None
 }
 
 fn collect_call(node: Node<'_>, module_path: &ModulePath, source: &str, output: &mut Vec<Import>) {
@@ -240,12 +260,34 @@ fn collect_call(node: Node<'_>, module_path: &ModulePath, source: &str, output: 
     let Some(argument) = named.next() else { return };
     // Only literal module specifiers are statically resolvable. Expressions and
     // template substitutions intentionally do not become graph edges.
-    if named.next().is_none() && argument.kind() == "string" {
-        push_string_import(output, module_path, source, argument, kind);
+    if named.next().is_none() {
+        push_literal_import(output, module_path, source, argument, kind);
     }
 }
 
-fn push_string_import(
+fn collect_new_url(
+    node: Node<'_>,
+    module_path: &ModulePath,
+    source: &str,
+    output: &mut Vec<Import>,
+) {
+    let Some(constructor) = node.child_by_field_name("constructor") else { return };
+    if constructor.utf8_text(source.as_bytes()).ok() != Some("URL") {
+        return;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else { return };
+    let mut cursor = arguments.walk();
+    let mut named = arguments.named_children(&mut cursor);
+    let (Some(specifier), Some(base)) = (named.next(), named.next()) else { return };
+    if named.next().is_some()
+        || base.utf8_text(source.as_bytes()).ok().map(str::trim) != Some("import.meta.url")
+    {
+        return;
+    }
+    push_literal_import(output, module_path, source, specifier, ImportKind::Static);
+}
+
+fn push_literal_import(
     output: &mut Vec<Import>,
     module_path: &ModulePath,
     source: &str,
@@ -253,13 +295,26 @@ fn push_string_import(
     kind: ImportKind,
 ) {
     let Ok(raw) = string_node.utf8_text(source.as_bytes()) else { return };
-    let Some(specifier) = decode_string_literal(raw) else { return };
+    let Some(specifier) = decode_static_literal(string_node, raw) else { return };
     output.push(Import {
         module_id: ModuleId(module_path.0.clone()),
         specifier,
         kind,
         location: source_location(module_path, source, string_node.start_byte() + 1),
     });
+}
+
+fn decode_static_literal(node: Node<'_>, raw: &str) -> Option<String> {
+    match node.kind() {
+        "string" => decode_string_literal(raw),
+        "template_string" => {
+            let mut cursor = node.walk();
+            (!node.named_children(&mut cursor).any(|child| child.kind() == "template_substitution"))
+                .then(|| raw.strip_prefix('`')?.strip_suffix('`').map(str::to_owned))
+                .flatten()
+        }
+        _ => None,
+    }
 }
 
 fn source_location(module_path: &ModulePath, source: &str, byte_offset: usize) -> SourceLocation {
@@ -308,6 +363,9 @@ const lazy = import('./lazy');
 const legacy = require('./legacy');
 const resolved = require.resolve('./resolved');
 import legacyAlias = require('./legacy-alias');
+const templateLazy = import(`./template-lazy`);
+const asset = new URL('./worker.ts', import.meta.url);
+const ignoredTemplate = import(`./${name}`);
 // import nope from './comment';
 "#;
         let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
@@ -324,11 +382,25 @@ import legacyAlias = require('./legacy-alias');
                 "./legacy",
                 "./resolved",
                 "./legacy-alias",
+                "./template-lazy",
+                "./worker.ts",
             ]
         );
         assert_eq!(imports[1].kind, ImportKind::TypeOnly);
         assert_eq!(imports[2].kind, ImportKind::ReExport);
-        assert!(imports[7..].iter().all(|import| import.kind == ImportKind::Require));
+        assert!(imports[7..10].iter().all(|import| import.kind == ImportKind::Require));
+        assert_eq!(imports[10].kind, ImportKind::Dynamic);
+        assert_eq!(imports[11].kind, ImportKind::Static);
+    }
+
+    #[test]
+    fn iterative_ast_walk_handles_deep_valid_source_without_recursive_stack_growth() {
+        let depth = 2_000;
+        let source =
+            format!("{}import('./deep');{}", "if (true) {".repeat(depth), "}".repeat(depth));
+        let imports = JsTsParser.parse_imports(&ModulePath("src/deep.ts".into()), &source).unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].specifier, "./deep");
     }
 
     #[test]

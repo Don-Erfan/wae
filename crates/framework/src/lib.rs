@@ -10,7 +10,10 @@ pub struct ProjectEvidence {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleEvidence<'a> {
+    /// Project-relative path used for diagnostics and stable identities.
     pub path: &'a str,
+    /// Project-relative package boundary. An empty value means the project root package.
+    pub package_root: &'a str,
     pub semantics: &'a ModuleSemantics,
 }
 
@@ -88,7 +91,8 @@ impl FrameworkAdapter for NextJsAdapter {
 
     fn classify(&self, module: ModuleEvidence<'_>) -> FrameworkClassification {
         let path = module.path.replace('\\', "/");
-        let segments = path.split('/').collect::<Vec<_>>();
+        let package_relative = package_relative_path(&path, module.package_root);
+        let segments = package_relative.split('/').collect::<Vec<_>>();
         let app_index = router_root_index(&segments, "app");
         let pages_index = router_root_index(&segments, "pages");
         let file = segments.last().copied().unwrap_or_default();
@@ -190,13 +194,19 @@ impl FrameworkAdapter for NextJsAdapter {
 }
 
 fn router_root_index(segments: &[&str], router: &str) -> Option<usize> {
-    segments.iter().position(|segment| *segment == router).filter(|index| match *index {
-        0 => true,
-        1 => segments[0] == "src",
-        2 => matches!(segments[0], "apps" | "packages"),
-        3 => matches!(segments[0], "apps" | "packages") && segments[2] == "src",
-        _ => false,
-    })
+    match segments {
+        [first, ..] if *first == router => Some(0),
+        ["src", second, ..] if *second == router => Some(1),
+        _ => None,
+    }
+}
+
+fn package_relative_path<'a>(path: &'a str, package_root: &str) -> &'a str {
+    let root = package_root.trim_matches('/');
+    if root.is_empty() || root == "." {
+        return path.trim_start_matches("./");
+    }
+    path.strip_prefix(root).and_then(|relative| relative.strip_prefix('/')).unwrap_or(path)
 }
 
 fn manifest_has_dependency(manifest: &serde_json::Value, dependency: &str) -> bool {
@@ -269,28 +279,41 @@ mod tests {
             ModuleSemantics { directives: vec!["use client".into()], ..ModuleSemantics::default() };
         let client = adapter.classify(ModuleEvidence {
             path: "src/app/cart/client.tsx",
+            package_root: "",
             semantics: &client_semantics,
         });
         assert_eq!(client.runtime, Runtime::Browser);
         assert_eq!(client.metadata.attributes["component"], "client");
         let empty = ModuleSemantics::default();
-        let page =
-            adapter.classify(ModuleEvidence { path: "src/app/cart/page.tsx", semantics: &empty });
+        let page = adapter.classify(ModuleEvidence {
+            path: "src/app/cart/page.tsx",
+            package_root: "",
+            semantics: &empty,
+        });
         assert_eq!(page.runtime, Runtime::Server);
         assert_eq!(page.metadata.attributes["role"], "page");
         let edge =
             ModuleSemantics { exported_runtime: Some("edge".into()), ..ModuleSemantics::default() };
-        let route =
-            adapter.classify(ModuleEvidence { path: "src/app/api/route.ts", semantics: &edge });
+        let route = adapter.classify(ModuleEvidence {
+            path: "src/app/api/route.ts",
+            package_root: "",
+            semantics: &edge,
+        });
         assert_eq!(route.runtime, Runtime::Edge);
         assert_eq!(route.metadata.attributes["role"], "route-handler");
         let server_action =
             ModuleSemantics { directives: vec!["use server".into()], ..ModuleSemantics::default() };
-        let action =
-            adapter.classify(ModuleEvidence { path: "src/actions.ts", semantics: &server_action });
+        let action = adapter.classify(ModuleEvidence {
+            path: "src/actions.ts",
+            package_root: "",
+            semantics: &server_action,
+        });
         assert_eq!(action.metadata.attributes["role"], "server-action-module");
-        let middleware =
-            adapter.classify(ModuleEvidence { path: "src/middleware.ts", semantics: &empty });
+        let middleware = adapter.classify(ModuleEvidence {
+            path: "src/middleware.ts",
+            package_root: "",
+            semantics: &empty,
+        });
         assert_eq!(middleware.runtime, Runtime::Edge);
     }
 
@@ -299,6 +322,7 @@ mod tests {
         let adapter = NextJsAdapter;
         let api = adapter.classify(ModuleEvidence {
             path: "src/pages/api/user.ts",
+            package_root: "",
             semantics: &ModuleSemantics::default(),
         });
         assert_eq!(api.metadata.attributes["role"], "api-route");
@@ -306,6 +330,7 @@ mod tests {
         assert_eq!(api.runtime, Runtime::Server);
         let document = adapter.classify(ModuleEvidence {
             path: "pages/_document.tsx",
+            package_root: "",
             semantics: &ModuleSemantics::default(),
         });
         assert_eq!(document.metadata.attributes["role"], "custom-document");
@@ -316,6 +341,7 @@ mod tests {
         let adapter = NextJsAdapter;
         let nested = adapter.classify(ModuleEvidence {
             path: "src/components/app/page.tsx",
+            package_root: "",
             semantics: &ModuleSemantics::default(),
         });
         assert_eq!(nested.metadata.attributes["router"], "none");
@@ -323,6 +349,7 @@ mod tests {
 
         let server = adapter.classify(ModuleEvidence {
             path: "src/lib/secrets.ts",
+            package_root: "",
             semantics: &ModuleSemantics {
                 marker_imports: vec!["server-only".into()],
                 ..ModuleSemantics::default()
@@ -332,9 +359,17 @@ mod tests {
         assert_eq!(server.metadata.attributes["runtimeSource"], "marker-package");
 
         let monorepo_page = adapter.classify(ModuleEvidence {
-            path: "apps/store/src/app/page.tsx",
+            path: "services/store/src/app/page.tsx",
+            package_root: "services/store",
             semantics: &ModuleSemantics::default(),
         });
         assert_eq!(monorepo_page.metadata.attributes["router"], "app");
+
+        let arbitrary_pages = adapter.classify(ModuleEvidence {
+            path: "frontend/pages/index.tsx",
+            package_root: "frontend",
+            semantics: &ModuleSemantics::default(),
+        });
+        assert_eq!(arbitrary_pages.metadata.attributes["router"], "pages");
     }
 }

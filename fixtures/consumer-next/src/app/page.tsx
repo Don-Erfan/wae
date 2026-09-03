@@ -1,8 +1,9 @@
 import type { Cart } from "@/features/cart";
 import { createCart } from "@/features/cart";
 
-export const cart: Cart = createCart();
+const cart: Cart = createCart();
 
-export async function loadCheckout() {
-  return import("@/features/checkout");
+export default async function CartPage() {
+  await import("@/features/checkout");
+  return <main>{cart.products.length} products</main>;
 }

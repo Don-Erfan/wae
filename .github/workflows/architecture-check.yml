@@ -38,8 +38,8 @@ jobs:
 
           result = json.loads(Path("wae-consumer-result.json").read_text())
           assert result["failureCount"] == 0, result
-          assert result["sourceModules"] == 11, result
-          assert result["dependencies"] == 5, result
+          assert result["sourceModules"] == 13, result
+          assert result["dependencies"] == 7, result
           PY
           rm wae-consumer-result.json
 

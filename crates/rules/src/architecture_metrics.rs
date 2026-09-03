@@ -22,13 +22,10 @@ impl Rule for DependencyDepthRule {
         };
         let Some(max_depth) = options.max_depth else { return Ok(()) };
         let entrypoints = compile_entrypoints(&options.entrypoints)?;
+        let roots = matching_nodes(context, &entrypoints);
+        let paths = context.graph.shortest_paths_from_any(&roots);
         for target in context.graph.nodes() {
-            let path = matching_nodes(context, &entrypoints)
-                .into_iter()
-                .filter_map(|root| context.graph.shortest_path(&root, target))
-                .min_by_key(Vec::len);
-            let Some(path) = path else { continue };
-            let depth = path.len().saturating_sub(1);
+            let Some(depth) = paths.depth(target) else { continue };
             if depth > max_depth {
                 let mut diagnostic = module_diagnostic(
                     "ARCH-006",
@@ -36,7 +33,7 @@ impl Rule for DependencyDepthRule {
                     format!("Dependency depth {depth} exceeds configured maximum {max_depth}"),
                     "Introduce a facade or split the dependency chain at a stable boundary.",
                 );
-                diagnostic.dependency_path = path;
+                diagnostic.dependency_path = paths.path(target).unwrap_or_default();
                 diagnostic.metadata.insert("depth".into(), depth.to_string());
                 diagnostic.metadata.insert("maximum".into(), max_depth.to_string());
                 sink.emit(diagnostic);
@@ -66,7 +63,7 @@ impl Rule for OutgoingCouplingRule {
             return Ok(());
         };
         for module in source_modules(context) {
-            let actual = context.graph.outgoing(&module.id).len();
+            let actual = context.graph.out_degree(&module.id);
             if actual > maximum {
                 sink.emit(metric_diagnostic(
                     "ARCH-007",
@@ -101,7 +98,7 @@ impl Rule for IncomingCouplingRule {
             return Ok(());
         };
         for module in source_modules(context) {
-            let actual = context.graph.incoming(&module.id).len();
+            let actual = context.graph.in_degree(&module.id);
             if actual > maximum {
                 sink.emit(metric_diagnostic(
                     "ARCH-008",

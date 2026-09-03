@@ -11,6 +11,7 @@ use wae_core::domain::{
     ModuleSemantics, Package, PackageName, Project, ResolvedDependency, Runtime, Severity,
     SourceLocation,
 };
+use wae_core::rule_registry::{self, RuleScope};
 use wae_framework::{FrameworkAdapter, FrameworkRegistry, ModuleEvidence, ProjectEvidence};
 use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
 use wae_parser::{JsTsParser, ParserAdapter};
@@ -25,6 +26,7 @@ mod architecture_index;
 mod cache;
 mod diagnostic_arbitrator;
 mod discovery;
+mod persistence;
 mod pipeline;
 mod resolution_context;
 mod suppression;
@@ -34,6 +36,7 @@ use architecture_index::CompiledArchitectureModel;
 use cache::{AnalysisCache, CachedModuleAnalysis, stable_hash};
 use diagnostic_arbitrator::DiagnosticArbitrator;
 use discovery::discover_modules;
+pub use persistence::AtomicJsonRepository;
 use resolution_context::ModuleFormatResolver;
 use telemetry::PipelineTelemetry;
 pub use workspace_session::{AnalysisTicket, WorkspaceSession};
@@ -41,6 +44,7 @@ pub use workspace_session::{AnalysisTicket, WorkspaceSession};
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AnalyzeRequest {
     pub root: PathBuf,
     pub config_path: Option<PathBuf>,
@@ -101,6 +105,7 @@ impl CancellationToken {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Analysis {
     pub schema_version: u32,
     pub project: Project,
@@ -112,7 +117,31 @@ pub struct Analysis {
     pub timings: AnalysisTimings,
 }
 
+impl Analysis {
+    pub fn new(project: Project, graph: ModuleGraph, diagnostics: Vec<Diagnostic>) -> Self {
+        Self {
+            schema_version: OUTPUT_SCHEMA_VERSION,
+            project,
+            graph,
+            ownership: ArchitectureOwnershipIndex::default(),
+            diagnostics,
+            failure_policy: FailurePolicy::default(),
+            incremental: IncrementalStats::default(),
+            timings: AnalysisTimings::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AnalysisExecution {
+    pub incremental: IncrementalStats,
+    pub timings: AnalysisTimings,
+    pub reused_snapshot: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnalysisTimings {
     pub discovery_ms: u128,
     pub classification_ms: u128,
@@ -179,6 +208,8 @@ pub struct IncrementalStats {
     pub restored_modules: usize,
     pub analyzed_modules: usize,
     pub rule_snapshot_reused: bool,
+    pub restored_rules: usize,
+    pub evaluated_rules: usize,
     pub environment_hash: u64,
 }
 
@@ -469,6 +500,7 @@ impl ProjectIndex {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AnalysisError {
     Config(wae_core::domain::ConfigError),
     Project(String),
@@ -501,14 +533,70 @@ impl<P: ParserAdapter> Engine<P> {
 fn apply_framework_classification(
     project: &mut Project,
     module_id: &ModuleId,
+    root: &Path,
     framework_adapter: Option<&dyn FrameworkAdapter>,
     semantics: &ModuleSemantics,
 ) {
     let Some(adapter) = framework_adapter else { return };
-    let classification = adapter.classify(ModuleEvidence { path: &module_id.0, semantics });
+    let package_root = project
+        .modules
+        .iter()
+        .find(|module| module.id == *module_id)
+        .and_then(|module| project.packages.iter().find(|package| package.name == module.package))
+        .map(|package| relative_resolved_path(root, &package.root_path))
+        .unwrap_or_default();
+    let classification = adapter.classify(ModuleEvidence {
+        path: &module_id.0,
+        package_root: &package_root,
+        semantics,
+    });
     if let Some(module) = project.modules.iter_mut().find(|module| module.id == *module_id) {
         module.framework_metadata = classification.metadata;
         module.runtime = classification.runtime;
+    }
+}
+
+fn propagate_client_runtime(project: &mut Project, graph: &ModuleGraph) {
+    fn can_inherit_browser(module: &Module) -> bool {
+        module.runtime == Runtime::Universal
+            || (module.runtime == Runtime::Server
+                && module.framework_metadata.attributes.get("runtimeSource").map(String::as_str)
+                    == Some("convention")
+                && module.framework_metadata.attributes.get("role").map(String::as_str)
+                    == Some("module"))
+    }
+    let roots = project
+        .modules
+        .iter()
+        .filter(|module| module.kind != ModuleKind::External && module.runtime == Runtime::Browser)
+        .map(|module| module.id.clone())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return;
+    }
+    let boundaries = project
+        .modules
+        .iter()
+        .filter(|module| {
+            (!can_inherit_browser(module) && module.runtime != Runtime::Browser)
+                || module.framework_metadata.attributes.get("role").map(String::as_str)
+                    == Some("server-action-module")
+        })
+        .map(|module| module.id.clone())
+        .collect::<HashSet<_>>();
+    let reachable =
+        graph.reachable_from_any_until(&roots, &boundaries).into_iter().collect::<HashSet<_>>();
+    for module in &mut project.modules {
+        if module.kind == ModuleKind::External
+            || !can_inherit_browser(module)
+            || !reachable.contains(&module.id)
+        {
+            continue;
+        }
+        module.runtime = Runtime::Browser;
+        module.framework_metadata.attributes.insert("runtime".into(), "browser".into());
+        module.framework_metadata.attributes.insert("runtimeSource".into(), "propagated".into());
+        module.framework_metadata.attributes.insert("component".into(), "client".into());
     }
 }
 
@@ -595,7 +683,11 @@ fn restore_cached_module(
         }
         let semantics = ModuleSemantics::default();
         let classification = framework_adapter.map(|adapter| {
-            adapter.classify(ModuleEvidence { path: &dependency.to.0, semantics: &semantics })
+            adapter.classify(ModuleEvidence {
+                path: &dependency.to.0,
+                package_root: &package_root,
+                semantics: &semantics,
+            })
         });
         project.modules.push(Module {
             id: dependency.to.clone(),
@@ -637,32 +729,122 @@ fn analysis_environment_hash(
     Ok(stable_hash(&identity))
 }
 
-fn analysis_graph_hash(project: &Project, environment_hash: u64) -> Result<u64, AnalysisError> {
-    struct HashWriter(u64);
-    impl std::io::Write for HashWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            for byte in bytes {
-                self.0 ^= u64::from(*byte);
-                self.0 = self.0.wrapping_mul(0x100000001b3);
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+#[derive(Clone, Copy)]
+struct RuleInputHashes {
+    edge: u64,
+    closure: u64,
+    global: u64,
+}
+
+impl RuleInputHashes {
+    fn for_scope(self, scope: RuleScope) -> u64 {
+        match scope {
+            RuleScope::Edge => self.edge,
+            RuleScope::Closure => self.closure,
+            RuleScope::Global => self.global,
         }
     }
-    let mut writer = HashWriter(0xcbf29ce484222325);
-    serde_json::to_writer(
-        &mut writer,
-        &(
-            environment_hash,
-            &project.modules,
-            &project.dependencies,
-            &project.resolved_dependencies,
-        ),
-    )
-    .map_err(|error| AnalysisError::Internal(error.to_string()))?;
-    Ok(writer.0)
+}
+
+#[derive(Clone, Copy)]
+struct SemanticHasher(u64);
+
+impl SemanticHasher {
+    fn new(seed: u64) -> Self {
+        let mut value = Self(0xcbf29ce484222325);
+        value.feed(&seed.to_le_bytes());
+        value
+    }
+    fn feed(&mut self, bytes: &[u8]) {
+        self.feed_usize(bytes.len());
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn feed_str(&mut self, value: &str) {
+        self.feed(value.as_bytes());
+    }
+    fn feed_usize(&mut self, value: usize) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+fn analysis_rule_hashes(project: &Project, environment_hash: u64) -> RuleInputHashes {
+    let mut edge = SemanticHasher::new(environment_hash);
+    let mut closure = SemanticHasher::new(environment_hash ^ 0x434c_4f53_5552_4500);
+    for module in &project.modules {
+        for hasher in [&mut edge, &mut closure] {
+            hasher.feed_str(&module.id.0);
+            hasher.feed_str(&module.package.0);
+            hasher.feed_str(module.layer.as_ref().map_or("", |layer| layer.0.as_str()));
+        }
+        closure.feed(&[module.runtime as u8]);
+        closure
+            .feed_str(module.framework_metadata.attributes.get("role").map_or("", String::as_str));
+    }
+    for dependency in &project.dependencies {
+        for hasher in [&mut edge, &mut closure] {
+            hasher.feed_str(&dependency.from.0);
+            hasher.feed_str(&dependency.to.0);
+            hasher.feed(&[dependency_kind_rank(&dependency.kind)]);
+        }
+    }
+    for dependency in &project.resolved_dependencies {
+        for hasher in [&mut edge, &mut closure] {
+            hasher.feed_str(&dependency.from.0);
+            hasher.feed_str(&dependency.specifier);
+            feed_dependency_target(hasher, &dependency.target);
+        }
+    }
+    let edge = edge.finish();
+    let closure = closure.finish();
+    let mut global = SemanticHasher::new(closure);
+    global.feed(&edge.to_le_bytes());
+    RuleInputHashes { edge, closure, global: global.finish() }
+}
+
+fn dependency_kind_rank(kind: &wae_core::domain::DependencyKind) -> u8 {
+    match kind {
+        wae_core::domain::DependencyKind::Static => 0,
+        wae_core::domain::DependencyKind::Dynamic => 1,
+        wae_core::domain::DependencyKind::TypeOnly => 2,
+        wae_core::domain::DependencyKind::ReExport => 3,
+        wae_core::domain::DependencyKind::Require => 4,
+    }
+}
+
+fn feed_dependency_target(hasher: &mut SemanticHasher, target: &DependencyTarget) {
+    match target {
+        DependencyTarget::Internal(module) => {
+            hasher.feed(&[0]);
+            hasher.feed_str(&module.0);
+        }
+        DependencyTarget::WorkspacePackage { package, module } => {
+            hasher.feed(&[1]);
+            hasher.feed_str(&package.0);
+            hasher.feed_str(&module.0);
+        }
+        DependencyTarget::Builtin(name) => {
+            hasher.feed(&[2]);
+            hasher.feed_str(name);
+        }
+        DependencyTarget::ExternalPackage(package) => {
+            hasher.feed(&[3]);
+            hasher.feed_str(&package.0);
+        }
+        DependencyTarget::Unresolved { specifier, reason } => {
+            hasher.feed(&[4]);
+            hasher.feed_str(specifier);
+            hasher.feed_str(reason);
+        }
+    }
 }
 
 fn framework_project_evidence(root: &Path) -> Result<ProjectEvidence, AnalysisError> {
@@ -1017,6 +1199,11 @@ mod tests {
             "client"
         );
         assert_eq!(module("src/app/client-widget.tsx").runtime, Runtime::Browser);
+        assert_eq!(module("src/app/client-helper.ts").runtime, Runtime::Browser);
+        assert_eq!(
+            module("src/app/client-helper.ts").framework_metadata.attributes["runtimeSource"],
+            "propagated"
+        );
         assert_eq!(module("src/app/api/route.ts").runtime, Runtime::Edge);
         assert_eq!(
             module("src/app/actions.ts").framework_metadata.attributes["role"],
@@ -1273,6 +1460,28 @@ mod tests {
     }
 
     #[test]
+    fn path_overrides_change_the_emitted_rule_severity() {
+        let root = std::env::temp_dir().join(format!("wae-rule-override-{}", std::process::id()));
+        fs::create_dir_all(root.join("src/legacy")).unwrap();
+        fs::write(root.join("src/legacy/a.ts"), "import './b';").unwrap();
+        fs::write(root.join("src/legacy/b.ts"), "import './a';").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nrules:\n  ARCH-001: error\noverrides:\n  - files: ['src/legacy/**']\n    rules:\n      ARCH-001: warning\n",
+        )
+        .unwrap();
+        let result = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let cycle = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.rule_id.0 == "ARCH-001")
+            .unwrap();
+        assert_eq!(cycle.severity, Severity::Warning);
+        assert_eq!(result.failure_policy.count(&result.diagnostics), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn every_fixture_matches_its_golden_expectation_from_real_source() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         for name in ["basic", "circular", "layers", "features", "aliases", "monorepo", "broken"] {
@@ -1313,7 +1522,7 @@ mod tests {
                 analysis.diagnostics
             );
         }
-        assert_eq!(source_modules, 30);
+        assert_eq!(source_modules, 32);
     }
 
     #[test]
@@ -1420,10 +1629,14 @@ mod tests {
         assert_eq!(cold.incremental.analyzed_modules, 1);
         assert_eq!(cold.incremental.restored_modules, 0);
         assert!(!cold.incremental.rule_snapshot_reused);
+        assert_eq!(cold.incremental.restored_rules, 0);
+        assert!(cold.incremental.evaluated_rules > 0);
         let warm = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
         assert_eq!(warm.incremental.analyzed_modules, 0);
         assert_eq!(warm.incremental.restored_modules, 1);
         assert!(warm.incremental.rule_snapshot_reused);
+        assert_eq!(warm.incremental.evaluated_rules, 0);
+        assert_eq!(warm.incremental.restored_rules, cold.incremental.evaluated_rules);
         assert_eq!(warm.diagnostics, cold.diagnostics);
         let cache = root.join(".wae/cache/analysis-v3/manifest.json");
         assert!(cache.is_file());
@@ -1438,7 +1651,7 @@ mod tests {
         let records: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&shard_files[0]).unwrap()).unwrap();
         assert!(records["src/a.ts"]["resolved_dependencies"].is_array());
-        assert!(snapshot["rules"]["diagnostics"].is_array());
+        assert!(snapshot["rule_partitions"]["ARCH-001"]["diagnostics"].is_array());
         let lock = root.join(".wae/cache/analysis-v3/manifest.lock");
         assert!(lock.is_file());
         fs::write(&lock, "stale lock file content from a killed process").unwrap();

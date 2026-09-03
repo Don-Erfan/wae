@@ -76,7 +76,34 @@ output:
 
 baseline:
   file: .wae/baseline.json
+
+overrides:
+  - files: ["src/legacy/**"]
+    excluded_files: ["src/legacy/generated/**"]
+    rules:
+      ARCH-003: warning
 ```
+
+## Inheritance and path overrides
+
+A file-backed config may inherit one or more relative configs. Parents are deep-merged in order,
+then the child is applied; mappings merge recursively and arrays/scalars are replaced. Cycles,
+absolute paths, missing parents and invalid entry types are explicit configuration errors.
+
+```yaml
+extends:
+  - config/company.yaml
+  - config/frontend.yaml
+version: 1
+```
+
+`overrides` apply in declaration order and the last matching path policy wins. They may enable,
+disable or change rule severity. Structural options such as `max_depth` stay project-wide because
+they define a shared graph evaluation contract. Both `files` and `excluded_files` use the same
+validated glob semantics as project discovery.
+
+`Config::validation_errors` returns independent validation failures together. CLI-facing loading
+formats multiple failures into one path-aware report instead of forcing repeated fix/run cycles.
 
 ## Resolution
 
@@ -125,6 +152,11 @@ override `project.exclude`.
 
 Type-only dependency classification covers `import type`, `export type`, and named clauses whose
 specifiers are all marked `type`. Mixed clauses remain runtime `Static`/`ReExport` edges.
+
+Static template specifiers such as ``import(`./worker`)`` and asset/worker references in
+`new URL('./worker.ts', import.meta.url)` are dependency edges. Templates containing substitutions
+remain intentionally unresolved dynamic expressions. AST traversal is iterative so deeply nested
+or minified valid files do not consume the Rust call stack.
 
 Absolute module specifiers are rejected because they escape the project analysis boundary.
 Duplicate workspace package names are configuration errors.

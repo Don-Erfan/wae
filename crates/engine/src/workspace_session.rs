@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Analysis, AnalysisError, AnalyzeRequest, CancellationToken, ChangeSet, Engine};
+use crate::{
+    Analysis, AnalysisError, AnalysisExecution, AnalyzeRequest, CancellationToken, ChangeSet,
+    Engine,
+};
 
 /// Generation-scoped work issued by a long-lived editor session.
 #[derive(Clone, Debug)]
@@ -27,6 +30,7 @@ pub struct WorkspaceSession {
     generation: AtomicU64,
     active: Mutex<Option<CancellationToken>>,
     snapshot: Mutex<Option<WorkspaceSnapshot>>,
+    last_execution: Mutex<AnalysisExecution>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +53,7 @@ impl WorkspaceSession {
             generation: AtomicU64::new(0),
             active: Mutex::new(None),
             snapshot: Mutex::new(None),
+            last_execution: Mutex::new(AnalysisExecution::default()),
         }
     }
 
@@ -100,6 +105,10 @@ impl WorkspaceSession {
             .map(|snapshot| Arc::clone(&snapshot.analysis))
     }
 
+    pub fn last_execution(&self) -> AnalysisExecution {
+        self.last_execution.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
     pub fn analyze(
         &self,
         ticket: &AnalysisTicket,
@@ -119,17 +128,28 @@ impl WorkspaceSession {
         }
         if !force && self.changes_since_snapshot(overlays) == ChangeSet::default() {
             if let Some(analysis) = self.snapshot() {
-                let mut analysis = (*analysis).clone();
-                analysis.incremental.analyzed_modules = 0;
-                analysis.incremental.restored_modules = analysis
+                let restored_modules = analysis
                     .project
                     .modules
                     .iter()
                     .filter(|module| module.kind == wae_core::domain::ModuleKind::Source)
                     .count();
-                analysis.incremental.rule_snapshot_reused = true;
-                analysis.timings = Default::default();
-                return Ok(Arc::new(analysis));
+                *self.last_execution.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    AnalysisExecution {
+                        incremental: crate::IncrementalStats {
+                            cache_enabled: analysis.incremental.cache_enabled,
+                            restored_modules,
+                            analyzed_modules: 0,
+                            rule_snapshot_reused: true,
+                            restored_rules: analysis.incremental.restored_rules
+                                + analysis.incremental.evaluated_rules,
+                            evaluated_rules: 0,
+                            environment_hash: analysis.incremental.environment_hash,
+                        },
+                        timings: Default::default(),
+                        reused_snapshot: true,
+                    };
+                return Ok(analysis);
             }
         }
         let mut request = overlays.iter().fold(
@@ -164,6 +184,12 @@ impl WorkspaceSession {
             }
         }
         let analysis = Arc::new(self.engine.analyze(request)?);
+        *self.last_execution.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            AnalysisExecution {
+                incremental: analysis.incremental.clone(),
+                timings: analysis.timings.clone(),
+                reused_snapshot: false,
+            };
         if self.is_current(ticket) {
             *self.snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 Some(WorkspaceSnapshot {
@@ -225,8 +251,10 @@ mod tests {
         assert_eq!(session.changes_since_snapshot(&overlays), ChangeSet::default());
         assert_eq!(session.snapshot().unwrap().project.modules.len(), 2);
         let no_op = session.analyze_changes(&session.begin_analysis(), &overlays, false).unwrap();
-        assert_eq!(no_op.incremental.analyzed_modules, 0);
-        assert_eq!(no_op.incremental.restored_modules, 2);
+        assert!(Arc::ptr_eq(&edited, &no_op));
+        assert_eq!(session.last_execution().incremental.analyzed_modules, 0);
+        assert_eq!(session.last_execution().incremental.restored_modules, 2);
+        assert!(session.last_execution().reused_snapshot);
 
         fs::write(root.join("package.json"), r#"{"name":"changed-environment"}"#).unwrap();
         let forced = session.analyze_changes(&session.begin_analysis(), &overlays, true).unwrap();

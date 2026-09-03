@@ -1,5 +1,7 @@
 'use client';
 
+import { formatClientLabel } from './client-helper';
+
 export function ClientWidget() {
-  return null;
+  return formatClientLabel('cart');
 }

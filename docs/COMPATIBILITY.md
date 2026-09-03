@@ -14,7 +14,7 @@
 
 - `Config schema`: versioned (`version: 1`)
 - `JSON output schema`: versioned (`schemaVersion: 1`)
-- `Baseline schema`: writer uses version 2; readers migrate version 1 and accept legacy `0.0.10`
+- `Baseline schema`: writer uses version 3; readers migrate version 1/2 and accept legacy `0.0.10`
   and `0.0.11` fingerprint identities
 - `Rule IDs`: پایدار در minor/patch؛ تغییر breaking فقط در major
 - `CLI exit codes`: پایدار و contract-based
@@ -27,7 +27,8 @@
 - TypeScript
 - React
 
-طبقه‌بندی semantic مربوط به Next.js App Router و Pages Router پشتیبانی و در CI تست می‌شود.
+طبقه‌بندی semantic مربوط به Next.js App Router و Pages Router در patchهای `13.5.11`، `14.2.35`،
+`15.5.25` و stable فعلی `16.3.4` با نصب و build واقعی در CI تست می‌شود.
 `RuntimeGraph` و قوانین transitive از `RUNTIME-001` تا `RUNTIME-006` کوتاه‌ترین مسیر ناسازگار را
 گزارش می‌کنند و Server Action را به‌عنوان مرز RPC در نظر می‌گیرند.
 
@@ -51,14 +52,15 @@
 فایل resolve‌شده‌ای که با `project.exclude` از discovery کنار گذاشته شده، به‌صورت node صریح
 `Excluded` و opaque در مدل نگه‌داری می‌شود؛ dependencyهای transitive آن تحلیل نمی‌شوند.
 
-## 4) ماتریس سازگاری هدف (Beta → v1)
+## 4) ماتریس سازگاری (Beta → v1)
 
 - TypeScript (چند نسخه اصلی فعال)
 - Node ecosystem: `pnpm`, `npm`, `yarn`
 - monorepo tooling structures: `turborepo`, `nx-like`
-- Next.js نسخه‌های پشتیبانی‌شده (به‌صورت explicit)
+- Next.js `13.5.11`، `14.2.35`، `15.5.25` و `16.3.4`؛ App، Pages و hybrid router، root و `src`
+  و package root دلخواه monorepo، runtimeهای browser/server/edge/nodejs و Server Action
 
-> نسخه‌های دقیق پس از اضافه‌شدن تست CI برای هر محور در همین سند تثبیت می‌شوند.
+نسخه‌های جدید فقط پس از سبزشدن install، build و تحلیل WAE به این فهرست اضافه می‌شوند.
 
 ## 5) سیاست تغییرات (Compatibility Guarantees)
 

@@ -2,6 +2,15 @@ use wae_parser::ParserAdapter;
 
 use super::*;
 
+const MAX_ANALYSIS_WORKERS: usize = 8;
+
+fn analysis_worker_count(jobs: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_ANALYSIS_WORKERS)
+        .min(jobs)
+}
+
 /// Immutable input context for a single pipeline execution.
 struct AnalysisContext<'engine, P> {
     engine: &'engine Engine<P>,
@@ -15,6 +24,160 @@ struct DiscoveredWorkspace {
     config: Config,
     files: Vec<PathBuf>,
     analysis_inputs: Vec<PathBuf>,
+}
+
+struct PreparedModule {
+    path: PathBuf,
+    module_path: ModulePath,
+    module_id: ModuleId,
+    source: String,
+    source_hash: u64,
+    cached: Option<CachedModuleAnalysis>,
+    parsed: Option<Result<wae_parser::ParsedModule, wae_core::domain::ParseError>>,
+    resolved: Option<Vec<PreparedDependency>>,
+}
+
+struct PreparedDependency {
+    import: wae_core::domain::Import,
+    candidate: wae_core::domain::DependencyCandidate,
+    candidate_paths: Vec<String>,
+    resolution: Resolution,
+}
+
+fn parse_prepared_modules<P: ParserAdapter>(
+    parser: &P,
+    modules: &mut [PreparedModule],
+    cancellation: &CancellationToken,
+) -> Result<(), AnalysisError> {
+    let jobs = modules
+        .iter()
+        .enumerate()
+        .filter(|(_, module)| module.cached.is_none())
+        .map(|(index, module)| (index, &module.module_path, module.source.as_str()))
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let workers = analysis_worker_count(jobs.len());
+    let chunk_size = jobs.len().div_ceil(workers);
+    let batches = std::thread::scope(|scope| {
+        jobs.chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(index, path, source)| {
+                            if cancellation.is_cancelled() {
+                                return (*index, None);
+                            }
+                            (*index, Some(parser.parse_module(path, source)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle.join().map_err(|_| AnalysisError::Internal("parser worker panicked".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    if cancellation.is_cancelled() {
+        return Err(AnalysisError::Cancelled);
+    }
+    for (index, parsed) in batches.into_iter().flatten() {
+        modules[index].parsed = parsed;
+    }
+    Ok(())
+}
+
+fn resolve_prepared_modules(
+    resolver: &ResolverPipeline,
+    formats: &ModuleFormatResolver<'_>,
+    config: &Config,
+    root: &Path,
+    modules: &mut [PreparedModule],
+    cancellation: &CancellationToken,
+) -> Result<(), AnalysisError> {
+    let jobs = modules
+        .iter()
+        .enumerate()
+        .filter(|(_, module)| {
+            module.cached.is_none() && module.parsed.as_ref().is_some_and(Result::is_ok)
+        })
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let workers = analysis_worker_count(jobs.len());
+    let chunk_size = jobs.len().div_ceil(workers);
+    let batches = std::thread::scope(|scope| {
+        jobs.chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(index, module)| {
+                            let parsed =
+                                module.parsed.as_ref().and_then(|result| result.as_ref().ok());
+                            let dependencies = parsed
+                                .into_iter()
+                                .flat_map(|parsed| parsed.imports.iter().cloned())
+                                .map(|mut import| {
+                                    import.module_id = module.module_id.clone();
+                                    import.location.file = module.module_id.0.clone();
+                                    let candidate =
+                                        wae_core::domain::DependencyCandidate::from(import.clone());
+                                    let importer_format = formats.resolve(&module.path);
+                                    let resolution_kind = resolution_kind_for(
+                                        config.resolution.mode,
+                                        &candidate.kind,
+                                        importer_format,
+                                    );
+                                    let request = ResolutionRequest {
+                                        importer: &module.module_path,
+                                        specifier: &import.specifier,
+                                        dependency_kind: candidate.kind.clone(),
+                                        resolution_kind,
+                                        importer_format,
+                                        mode: config.resolution.mode,
+                                        custom_conditions: &config.resolution.custom_conditions,
+                                    };
+                                    let candidate_paths = resolver
+                                        .candidate_paths(&request)
+                                        .into_iter()
+                                        .map(|path| relative_resolved_path(root, &path.0))
+                                        .collect();
+                                    let resolution = resolver.resolve(&request);
+                                    PreparedDependency {
+                                        import,
+                                        candidate,
+                                        candidate_paths,
+                                        resolution,
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            (*index, dependencies)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| AnalysisError::Internal("resolver worker panicked".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    if cancellation.is_cancelled() {
+        return Err(AnalysisError::Cancelled);
+    }
+    for (index, dependencies) in batches.into_iter().flatten() {
+        modules[index].resolved = Some(dependencies);
+    }
+    Ok(())
 }
 
 fn discover_stage(
@@ -189,11 +352,11 @@ fn execute<P: ParserAdapter>(
     project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
     let mut project_index = ProjectIndex::from_project(&project);
 
+    let mut prepared_modules = Vec::with_capacity(files.len());
     for path in &files {
         if cancellation.is_cancelled() {
             return Err(AnalysisError::Cancelled);
         }
-        let module_path = ModulePath(normalize(path));
         let module_id = ModuleId(relative_path(&root, path));
         let source = match overlays
             .get(&module_id.0)
@@ -219,12 +382,53 @@ fn execute<P: ParserAdapter>(
             &mut suppressions,
             &mut project.diagnostics,
         );
-        if let Some(cached) = cache.get(&module_id.0, source_hash, environment_hash) {
+        let cached = cache.get(&module_id.0, source_hash, environment_hash);
+        prepared_modules.push(PreparedModule {
+            path: path.clone(),
+            module_path: ModulePath(normalize(path)),
+            module_id,
+            source,
+            source_hash,
+            cached,
+            parsed: None,
+            resolved: None,
+        });
+    }
+    PipelineTelemetry::measure(&mut telemetry.parsing, || {
+        parse_prepared_modules(&engine.parser, &mut prepared_modules, &cancellation)
+    })?;
+    PipelineTelemetry::measure(&mut telemetry.resolution, || {
+        resolve_prepared_modules(
+            &resolver,
+            &module_formats,
+            &config,
+            &root,
+            &mut prepared_modules,
+            &cancellation,
+        )
+    })?;
+
+    for prepared in prepared_modules {
+        if cancellation.is_cancelled() {
+            return Err(AnalysisError::Cancelled);
+        }
+        let PreparedModule {
+            path: _,
+            module_path: _,
+            module_id,
+            source: _,
+            source_hash,
+            cached,
+            parsed,
+            resolved,
+        } = prepared;
+        if let Some(cached) = cached {
             incremental.restored_modules += 1;
             PipelineTelemetry::measure(&mut telemetry.classification, || {
                 apply_framework_classification(
                     &mut project,
                     &module_id,
+                    &root,
                     framework_adapter,
                     &cached.semantics,
                 );
@@ -249,50 +453,32 @@ fn execute<P: ParserAdapter>(
         let dependencies_start = project.dependencies.len();
         let resolved_start = project.resolved_dependencies.len();
         let diagnostics_start = project.diagnostics.len();
-        let parsed = PipelineTelemetry::measure(&mut telemetry.parsing, || {
-            engine.parser.parse_module(&module_path, &source)
-        });
+        let parsed = parsed.ok_or_else(|| {
+            AnalysisError::Internal(format!("parser produced no result for `{}`", module_id.0))
+        })?;
         let semantics = match parsed {
             Ok(parsed) => {
                 PipelineTelemetry::measure(&mut telemetry.classification, || {
                     apply_framework_classification(
                         &mut project,
                         &module_id,
+                        &root,
                         framework_adapter,
                         &parsed.semantics,
                     );
                 });
-                for mut import in parsed.imports {
+                let resolved = resolved.ok_or_else(|| {
+                    AnalysisError::Internal(format!(
+                        "resolver produced no result for `{}`",
+                        module_id.0
+                    ))
+                })?;
+                for prepared_dependency in resolved {
                     if cancellation.is_cancelled() {
                         return Err(AnalysisError::Cancelled);
                     }
-                    import.module_id = module_id.clone();
-                    import.location.file = module_id.0.clone();
-                    let candidate = wae_core::domain::DependencyCandidate::from(import.clone());
-                    let importer_format = module_formats.resolve(path);
-                    let resolution_kind = resolution_kind_for(
-                        config.resolution.mode,
-                        &candidate.kind,
-                        importer_format,
-                    );
-                    let resolution_request = ResolutionRequest {
-                        importer: &module_path,
-                        specifier: &import.specifier,
-                        dependency_kind: candidate.kind.clone(),
-                        resolution_kind,
-                        importer_format,
-                        mode: config.resolution.mode,
-                        custom_conditions: &config.resolution.custom_conditions,
-                    };
-                    let (candidate_paths, resolution) =
-                        PipelineTelemetry::measure(&mut telemetry.resolution, || {
-                            let candidates = resolver
-                                .candidate_paths(&resolution_request)
-                                .into_iter()
-                                .map(|path| relative_resolved_path(&root, &path.0))
-                                .collect::<Vec<_>>();
-                            (candidates, resolver.resolve(&resolution_request))
-                        });
+                    let PreparedDependency { import, candidate, candidate_paths, resolution } =
+                        prepared_dependency;
                     match resolution {
                         Resolution::Module(target) => {
                             let target_id = ModuleId(relative_resolved_path(&root, &target.0));
@@ -339,6 +525,7 @@ fn execute<P: ParserAdapter>(
                                         framework_adapter.map(|adapter| {
                                             adapter.classify(ModuleEvidence {
                                                 path: &target_id.0,
+                                                package_root: &package_root,
                                                 semantics: &semantics,
                                             })
                                         })
@@ -498,6 +685,7 @@ fn execute<P: ParserAdapter>(
                     apply_framework_classification(
                         &mut project,
                         &module_id,
+                        &root,
                         framework_adapter,
                         &ModuleSemantics::default(),
                     );
@@ -536,11 +724,11 @@ fn execute<P: ParserAdapter>(
     }
     let (graph, package_graph, runtime_graph) =
         PipelineTelemetry::measure(&mut telemetry.graph_build, || {
-            (
-                ModuleGraph::from_project(&project),
-                PackageGraph::from_project(&project),
-                RuntimeGraph::from_project(&project),
-            )
+            let graph = ModuleGraph::from_project(&project);
+            propagate_client_runtime(&mut project, &graph);
+            let package_graph = PackageGraph::from_project(&project);
+            let runtime_graph = RuntimeGraph::from_project(&project);
+            (graph, package_graph, runtime_graph)
         });
     let rule_policies = PipelineTelemetry::measure(&mut telemetry.rule_evaluation, || {
         CompiledRulePolicies::compile(&config).map_err(AnalysisError::Internal)
@@ -559,19 +747,57 @@ fn execute<P: ParserAdapter>(
         declared_package_dependencies: &declared_package_dependencies,
     };
     let mut diagnostics = project.diagnostics.clone();
-    let graph_hash = analysis_graph_hash(&project, environment_hash)?;
+    let rule_input_hashes = analysis_rule_hashes(&project, environment_hash);
     let (rule_diagnostics, rule_profiles) = PipelineTelemetry::measure(
         &mut telemetry.rule_evaluation,
         || -> Result<_, AnalysisError> {
-            if let Some(diagnostics) = cache.rule_diagnostics(graph_hash) {
-                incremental.rule_snapshot_reused = true;
-                Ok((diagnostics, Vec::new()))
-            } else {
-                let evaluation =
-                    engine.rules.evaluate_profiled(&context).map_err(AnalysisError::Internal)?;
-                cache.set_rule_diagnostics(graph_hash, evaluation.diagnostics.clone());
-                Ok((evaluation.diagnostics, evaluation.profiles))
+            let mut diagnostics = Vec::new();
+            let mut missing = HashSet::new();
+            let enabled_rule_ids = engine.rules.enabled_rule_ids(&context);
+
+            for rule_id in enabled_rule_ids {
+                let descriptor = rule_registry::descriptor(rule_id).ok_or_else(|| {
+                    AnalysisError::Internal(format!(
+                        "enabled rule `{rule_id}` is missing from the rule registry"
+                    ))
+                })?;
+                let input_hash = rule_input_hashes.for_scope(descriptor.scope());
+                if let Some(cached) = cache.rule_partition(rule_id, input_hash) {
+                    incremental.restored_rules += 1;
+                    diagnostics.extend(cached);
+                } else {
+                    missing.insert(rule_id.to_owned());
+                }
             }
+
+            incremental.evaluated_rules = missing.len();
+            incremental.rule_snapshot_reused = missing.is_empty();
+            let evaluation = engine
+                .rules
+                .evaluate_profiled_rules(&context, &missing)
+                .map_err(AnalysisError::Internal)?;
+            let mut evaluated_by_rule = evaluation.diagnostics.into_iter().fold(
+                HashMap::<String, Vec<Diagnostic>>::new(),
+                |mut grouped, diagnostic| {
+                    grouped.entry(diagnostic.rule_id.0.clone()).or_default().push(diagnostic);
+                    grouped
+                },
+            );
+            let mut missing = missing.into_iter().collect::<Vec<_>>();
+            missing.sort();
+            for rule_id in missing {
+                let descriptor = rule_registry::descriptor(&rule_id).ok_or_else(|| {
+                    AnalysisError::Internal(format!(
+                        "evaluated rule `{rule_id}` is missing from the rule registry"
+                    ))
+                })?;
+                let input_hash = rule_input_hashes.for_scope(descriptor.scope());
+                let rule_diagnostics = evaluated_by_rule.remove(&rule_id).unwrap_or_default();
+                cache.set_rule_partition(rule_id, input_hash, rule_diagnostics.clone());
+                diagnostics.extend(rule_diagnostics);
+            }
+            debug_assert!(evaluated_by_rule.is_empty());
+            Ok((diagnostics, evaluation.profiles))
         },
     )?;
     if cancellation.is_cancelled() {

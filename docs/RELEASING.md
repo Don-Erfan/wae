@@ -8,15 +8,19 @@
 3. Keep Cargo, npm, and tag versions identical.
 4. Enable GitHub's immutable releases setting before publishing the first immutable release.
 
-The release workflow calls the same complete reusable readiness workflow as pull requests,
-including performance, IDE, MCP, fuzz and installer gates. A failing gate prevents GitHub Release
-and npm publication.
+The complete readiness workflow runs before tagging and includes performance, the real Next.js
+compatibility matrix, IDE, MCP, fuzz and installer gates. The release workflow resolves the signed
+tag to its exact commit and refuses to build unless that commit already has successful `quality`,
+`tests`, `audit`, `performance` and `v1 readiness` checks. This keeps failed gates from consuming an
+immutable version number.
 
 ## Publish
 
 ```bash
 git switch master
 git pull --ff-only
+# Wait for the exact HEAD commit's `v1 readiness` check to be green.
+gh run list --commit "$(git rev-parse HEAD)" --workflow CI
 git tag -s vX.Y.Z -m "WAE vX.Y.Z"
 git push origin master vX.Y.Z
 ```

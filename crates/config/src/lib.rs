@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Config {
     pub version: u32,
     pub project: ProjectConfig,
@@ -26,6 +27,7 @@ pub struct Config {
     pub suppressions: SuppressionConfig,
     pub framework: FrameworkConfig,
     pub runtime: RuntimeConfig,
+    pub overrides: Vec<ConfigOverride>,
     #[serde(skip)]
     pub configured: bool,
 }
@@ -70,6 +72,7 @@ impl Default for Config {
             suppressions: SuppressionConfig::default(),
             framework: FrameworkConfig::default(),
             runtime: RuntimeConfig::default(),
+            overrides: Vec::new(),
             configured: false,
         }
     }
@@ -147,6 +150,17 @@ pub struct ProjectConfig {
     pub roots: Vec<String>,
     pub follow_symlinks: bool,
     pub max_file_size_kb: u64,
+}
+
+/// A path-scoped policy overlay. Entries are applied in declaration order; the last matching
+/// override wins for a rule. Detailed rule entries may change `enabled` and `severity`, while
+/// structural rule options remain project-wide so graph evaluation stays deterministic.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigOverride {
+    pub files: Vec<String>,
+    pub excluded_files: Vec<String>,
+    pub rules: BTreeMap<String, RuleConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -296,6 +310,9 @@ pub struct PathSuppression {
     pub pattern: String,
     pub rules: Vec<String>,
     pub reason: String,
+    pub owner: Option<String>,
+    pub ticket: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +320,9 @@ pub struct PathSuppression {
 pub struct FingerprintSuppression {
     pub fingerprint: String,
     pub reason: String,
+    pub owner: Option<String>,
+    pub ticket: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +347,39 @@ impl Default for SuppressionConfig {
             fingerprints: Vec::new(),
         }
     }
+}
+
+impl SuppressionConfig {
+    pub fn prune_expired(&mut self, today: u64) -> usize {
+        let before = self.paths.len() + self.fingerprints.len();
+        self.paths.retain(|entry| {
+            entry.expires_at.as_deref().is_none_or(|date| expiration_day(date) > today)
+        });
+        self.fingerprints.retain(|entry| {
+            entry.expires_at.as_deref().is_none_or(|date| expiration_day(date) > today)
+        });
+        before - self.paths.len() - self.fingerprints.len()
+    }
+}
+
+pub fn current_epoch_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() / 86_400)
+}
+
+pub fn expiration_day(date: &str) -> u64 {
+    let mut parts = date.split('-').filter_map(|part| part.parse::<i64>().ok());
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return 0;
+    };
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era * 146_097 + day_of_era - 719_468).max(0) as u64
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,10 +547,8 @@ impl Config {
                 "configuration file does not exist".into(),
             ));
         }
-        let source = fs::read_to_string(path).map_err(|e| {
-            config_error(ConfigErrorKind::Io, Some(path.display().to_string()), e.to_string())
-        })?;
-        let mut config = Self::from_yaml(&source).map_err(|mut error| {
+        let value = load_config_value(path, &mut Vec::new())?;
+        let mut config = Self::from_value(value).map_err(|mut error| {
             error.path = Some(path.display().to_string());
             error
         })?;
@@ -506,7 +557,21 @@ impl Config {
     }
 
     pub fn from_yaml(source: &str) -> Result<Self, ConfigError> {
-        let mut config: Self = yaml_serde::from_str(source)
+        let value: yaml_serde::Value = yaml_serde::from_str(source)
+            .map_err(|e| config_error(ConfigErrorKind::InvalidYaml, None, e.to_string()))?;
+        if value.as_mapping().is_some_and(|mapping| mapping.contains_key("extends")) {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some("extends".into()),
+                "`extends` requires a file-backed configuration so relative paths are defined"
+                    .into(),
+            ));
+        }
+        Self::from_value(value)
+    }
+
+    fn from_value(value: yaml_serde::Value) -> Result<Self, ConfigError> {
+        let mut config: Self = yaml_serde::from_value(value)
             .map_err(|e| config_error(ConfigErrorKind::InvalidYaml, None, e.to_string()))?;
         for (id, rule) in Self::default().rules {
             config.rules.entry(id).or_insert(rule);
@@ -516,6 +581,102 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut errors = self.validation_errors();
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0)),
+            count => Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                None,
+                format!(
+                    "configuration has {count} errors:\n{}",
+                    errors
+                        .iter()
+                        .map(|error| format!(
+                            "- {}: {}",
+                            error.path.as_deref().unwrap_or("configuration"),
+                            error.message
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            )),
+        }
+    }
+
+    pub fn validation_errors(&self) -> Vec<ConfigError> {
+        let mut errors = Vec::new();
+        if self.version != CURRENT_CONFIG_VERSION {
+            errors.push(config_error(
+                ConfigErrorKind::UnsupportedVersion,
+                Some("version".into()),
+                format!(
+                    "unsupported config version {}; expected {}",
+                    self.version, CURRENT_CONFIG_VERSION
+                ),
+            ));
+        }
+        let known = rule_registry::configurable_ids().collect::<BTreeSet<_>>();
+        errors.extend(self.rules.keys().filter(|rule| !known.contains(rule.as_str())).map(
+            |rule| {
+                config_error(
+                    ConfigErrorKind::UnknownRule,
+                    Some(format!("rules.{rule}")),
+                    format!("unknown rule `{rule}`"),
+                )
+            },
+        ));
+        if self.project.roots.is_empty() {
+            errors.push(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some("project.roots".into()),
+                "at least one project root is required".into(),
+            ));
+        }
+        if self.architecture.coverage.minimum.is_some_and(|minimum| minimum > 100) {
+            errors.push(config_error(
+                ConfigErrorKind::InvalidDependency,
+                Some("architecture.coverage.minimum".into()),
+                "architecture coverage minimum must be between 0 and 100".into(),
+            ));
+        }
+        for (index, condition) in self.resolution.custom_conditions.iter().enumerate() {
+            if condition.trim().is_empty() {
+                errors.push(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("resolution.custom_conditions.{index}")),
+                    "custom resolution conditions cannot be empty".into(),
+                ));
+            }
+        }
+        for (index, framework) in self.framework.enabled.iter().enumerate() {
+            if framework != "nextjs" {
+                errors.push(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("framework.enabled.{index}")),
+                    format!("unsupported framework adapter `{framework}`"),
+                ));
+            }
+        }
+        if let Err(error) = self.validate_first() {
+            if !errors
+                .iter()
+                .any(|candidate| candidate.path == error.path && candidate.message == error.message)
+            {
+                errors.push(error);
+            }
+        }
+        errors.sort_by(|left, right| {
+            left.path
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right.path.as_deref().unwrap_or(""))
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        errors
+    }
+
+    fn validate_first(&self) -> Result<(), ConfigError> {
         if self.version != CURRENT_CONFIG_VERSION {
             return Err(config_error(
                 ConfigErrorKind::UnsupportedVersion,
@@ -600,6 +761,12 @@ impl Config {
                     "path suppression requires a reason".into(),
                 ));
             }
+            validate_suppression_metadata(
+                suppression.owner.as_deref(),
+                suppression.ticket.as_deref(),
+                suppression.expires_at.as_deref(),
+                &format!("suppressions.paths.{index}"),
+            )?;
         }
         for (index, suppression) in self.suppressions.fingerprints.iter().enumerate() {
             if suppression.fingerprint.trim().is_empty() {
@@ -616,6 +783,12 @@ impl Config {
                     "fingerprint suppression requires a reason".into(),
                 ));
             }
+            validate_suppression_metadata(
+                suppression.owner.as_deref(),
+                suppression.ticket.as_deref(),
+                suppression.expires_at.as_deref(),
+                &format!("suppressions.fingerprints.{index}"),
+            )?;
         }
         for (index, condition) in self.resolution.custom_conditions.iter().enumerate() {
             if condition.trim().is_empty() {
@@ -672,16 +845,60 @@ impl Config {
                 &format!("architecture.forbidden_package_dependencies.{index}.to"),
             )?;
         }
+        for (index, policy) in self.overrides.iter().enumerate() {
+            if policy.files.is_empty() {
+                return Err(config_error(
+                    ConfigErrorKind::ConflictingConfig,
+                    Some(format!("overrides.{index}.files")),
+                    "an override must include at least one file glob".into(),
+                ));
+            }
+            validate_patterns(&policy.files, &format!("overrides.{index}.files"))?;
+            validate_patterns(
+                &policy.excluded_files,
+                &format!("overrides.{index}.excluded_files"),
+            )?;
+            for (id, rule) in &policy.rules {
+                if !known.contains(id.as_str()) {
+                    return Err(config_error(
+                        ConfigErrorKind::UnknownRule,
+                        Some(format!("overrides.{index}.rules.{id}")),
+                        format!("override references unknown rule `{id}`"),
+                    ));
+                }
+                if rule.options().is_some_and(|options| {
+                    options.max_depth.is_some()
+                        || options.max_fan_out.is_some()
+                        || options.max_fan_in.is_some()
+                        || !options.entrypoints.is_empty()
+                }) {
+                    return Err(config_error(
+                        ConfigErrorKind::ConflictingConfig,
+                        Some(format!("overrides.{index}.rules.{id}")),
+                        "path overrides may change only rule enablement and severity; structural options are project-wide".into(),
+                    ));
+                }
+            }
+        }
         for (id, rule) in &self.rules {
             let Some(options) = rule.options() else { continue };
+            let descriptor = rule_registry::descriptor(id).expect("known rule was validated above");
             for (name, configured, supported) in [
-                ("max_depth", options.max_depth.is_some(), id == "ARCH-006"),
-                ("max_fan_out", options.max_fan_out.is_some(), id == "ARCH-007"),
-                ("max_fan_in", options.max_fan_in.is_some(), id == "ARCH-008"),
+                ("max_depth", options.max_depth.is_some(), descriptor.supports_option("max_depth")),
+                (
+                    "max_fan_out",
+                    options.max_fan_out.is_some(),
+                    descriptor.supports_option("max_fan_out"),
+                ),
+                (
+                    "max_fan_in",
+                    options.max_fan_in.is_some(),
+                    descriptor.supports_option("max_fan_in"),
+                ),
                 (
                     "entrypoints",
                     !options.entrypoints.is_empty(),
-                    matches!(id.as_str(), "ARCH-006" | "ARCH-009"),
+                    descriptor.supports_option("entrypoints"),
                 ),
             ] {
                 if configured && !supported {
@@ -721,10 +938,128 @@ impl Config {
             })
             .collect()
     }
+
+    pub fn rule_severity_for_path(&self, rule_id: &str, path: &str) -> Option<Severity> {
+        let mut severity = self.rules.get(rule_id).and_then(RuleConfig::severity);
+        for policy in &self.overrides {
+            let included = policy.files.iter().any(|pattern| pattern_matches(pattern, path));
+            let excluded =
+                policy.excluded_files.iter().any(|pattern| pattern_matches(pattern, path));
+            if included && !excluded {
+                if let Some(rule) = policy.rules.get(rule_id) {
+                    severity = rule.severity();
+                }
+            }
+        }
+        severity
+    }
+
+    pub fn rule_enabled_anywhere(&self, rule_id: &str) -> bool {
+        self.rules.get(rule_id).and_then(RuleConfig::severity).is_some()
+            || self
+                .overrides
+                .iter()
+                .filter_map(|policy| policy.rules.get(rule_id))
+                .any(|rule| rule.severity().is_some())
+    }
     pub fn to_yaml(&self) -> Result<String, ConfigError> {
         yaml_serde::to_string(self)
             .map_err(|e| config_error(ConfigErrorKind::InvalidYaml, None, e.to_string()))
     }
+}
+
+fn load_config_value(
+    path: &Path,
+    loading: &mut Vec<PathBuf>,
+) -> Result<yaml_serde::Value, ConfigError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        config_error(ConfigErrorKind::Io, Some(path.display().to_string()), error.to_string())
+    })?;
+    if let Some(start) = loading.iter().position(|candidate| candidate == &canonical) {
+        let mut cycle =
+            loading[start..].iter().map(|path| path.display().to_string()).collect::<Vec<_>>();
+        cycle.push(canonical.display().to_string());
+        return Err(config_error(
+            ConfigErrorKind::ConflictingConfig,
+            Some("extends".into()),
+            format!("configuration extends cycle: {}", cycle.join(" -> ")),
+        ));
+    }
+    loading.push(canonical.clone());
+    let source = fs::read_to_string(&canonical).map_err(|error| {
+        config_error(ConfigErrorKind::Io, Some(canonical.display().to_string()), error.to_string())
+    })?;
+    let mut child: yaml_serde::Value = yaml_serde::from_str(&source).map_err(|error| {
+        config_error(
+            ConfigErrorKind::InvalidYaml,
+            Some(canonical.display().to_string()),
+            error.to_string(),
+        )
+    })?;
+    let extends = take_extends(&mut child)?;
+    let mut merged = yaml_serde::Value::Mapping(Default::default());
+    let parent = canonical.parent().unwrap_or_else(|| Path::new("."));
+    for extension in extends {
+        if Path::new(&extension).is_absolute() {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some("extends".into()),
+                format!("extended config `{extension}` must be a relative path"),
+            ));
+        }
+        let inherited = load_config_value(&parent.join(extension), loading)?;
+        merge_yaml(&mut merged, inherited);
+    }
+    merge_yaml(&mut merged, child);
+    loading.pop();
+    Ok(merged)
+}
+
+fn take_extends(value: &mut yaml_serde::Value) -> Result<Vec<String>, ConfigError> {
+    let Some(mapping) = value.as_mapping_mut() else { return Ok(Vec::new()) };
+    let Some(value) = mapping.remove("extends") else { return Ok(Vec::new()) };
+    match value {
+        yaml_serde::Value::String(path) => Ok(vec![path]),
+        yaml_serde::Value::Sequence(paths) => paths
+            .into_iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    config_error(
+                        ConfigErrorKind::InvalidYaml,
+                        Some("extends".into()),
+                        "every `extends` entry must be a string path".into(),
+                    )
+                })
+            })
+            .collect(),
+        _ => Err(config_error(
+            ConfigErrorKind::InvalidYaml,
+            Some("extends".into()),
+            "`extends` must be a string or an array of string paths".into(),
+        )),
+    }
+}
+
+fn merge_yaml(base: &mut yaml_serde::Value, overlay: yaml_serde::Value) {
+    match (base, overlay) {
+        (yaml_serde::Value::Mapping(base), yaml_serde::Value::Mapping(overlay)) => {
+            for (key, value) in overlay {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_yaml(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .is_ok_and(|glob| glob.compile_matcher().is_match(path))
 }
 
 fn validate_patterns(patterns: &[String], path: &str) -> Result<(), ConfigError> {
@@ -757,6 +1092,46 @@ fn validate_relative_path(value: &str, path: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_suppression_metadata(
+    owner: Option<&str>,
+    ticket: Option<&str>,
+    expires_at: Option<&str>,
+    path: &str,
+) -> Result<(), ConfigError> {
+    for (field, value) in [("owner", owner), ("ticket", ticket)] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some(format!("{path}.{field}")),
+                format!("suppression {field} cannot be empty"),
+            ));
+        }
+    }
+    if let Some(date) = expires_at {
+        let parts = date.split('-').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
+        let valid = parts.ok().filter(|parts| parts.len() == 3).is_some_and(|parts| {
+            let (year, month, day) = (parts[0], parts[1], parts[2]);
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let maximum = match month {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 if leap => 29,
+                2 => 28,
+                _ => 0,
+            };
+            year >= 1970 && day > 0 && day <= maximum
+        });
+        if !valid {
+            return Err(config_error(
+                ConfigErrorKind::ConflictingConfig,
+                Some(format!("{path}.expires_at")),
+                "suppression expiration must be a valid YYYY-MM-DD date".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn config_error(kind: ConfigErrorKind, path: Option<String>, message: String) -> ConfigError {
     ConfigError { kind, message, path }
 }
@@ -773,6 +1148,13 @@ mod tests {
         let schema_rules = properties.keys().map(String::as_str).collect::<BTreeSet<_>>();
         let registry_rules = rule_registry::configurable_ids().collect::<BTreeSet<_>>();
         assert_eq!(schema_rules, registry_rules);
+        let override_rules = schema["$defs"]["override"]["properties"]["rules"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(override_rules, registry_rules);
     }
 
     #[test]
@@ -791,6 +1173,26 @@ mod tests {
         config.rules.insert("ARCH-999".into(), RuleConfig::Severity(Severity::Error));
         let error = config.validate().unwrap_err();
         assert_eq!(error.path.as_deref(), Some("rules.ARCH-999"));
+    }
+
+    #[test]
+    fn reports_independent_configuration_errors_together() {
+        let mut config = Config {
+            version: 99,
+            project: ProjectConfig { roots: Vec::new(), ..ProjectConfig::default() },
+            ..Config::default()
+        };
+        config.rules.insert("ARCH-999".into(), RuleConfig::Severity(Severity::Error));
+        config.resolution.custom_conditions = vec![String::new()];
+        let errors = config.validation_errors();
+        let paths =
+            errors.iter().filter_map(|error| error.path.as_deref()).collect::<BTreeSet<_>>();
+        assert!(paths.contains("version"));
+        assert!(paths.contains("project.roots"));
+        assert!(paths.contains("rules.ARCH-999"));
+        assert!(paths.contains("resolution.custom_conditions.0"));
+        let aggregate = config.validate().unwrap_err();
+        assert!(aggregate.message.contains("configuration has 4 errors"));
     }
 
     #[test]
@@ -820,10 +1222,11 @@ mod tests {
     #[test]
     fn validates_path_and_identity_suppressions_with_reasons() {
         let valid: Config = yaml_serde::from_str(
-            "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/legacy/**'\n      rules: [ARCH-003]\n      reason: 'migration ARC-42'\n  fingerprints:\n    - fingerprint: abc123\n      reason: 'accepted ARC-99'\n",
+            "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/legacy/**'\n      rules: [ARCH-003]\n      reason: 'migration ARC-42'\n      owner: frontend-platform\n      ticket: ARC-42\n      expires_at: '2027-01-01'\n  fingerprints:\n    - fingerprint: abc123\n      reason: 'accepted ARC-99'\n",
         )
         .unwrap();
         valid.validate().unwrap();
+        assert_eq!(valid.suppressions.paths[0].owner.as_deref(), Some("frontend-platform"));
         let invalid: Config = yaml_serde::from_str(
             "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/**'\n      rules: [ARCH-003]\n",
         )
@@ -831,6 +1234,14 @@ mod tests {
         assert_eq!(
             invalid.validate().unwrap_err().path.as_deref(),
             Some("suppressions.paths.0.reason")
+        );
+        let invalid_date: Config = yaml_serde::from_str(
+            "version: 1\nsuppressions:\n  fingerprints:\n    - fingerprint: abc\n      reason: migration\n      expires_at: '2026-02-30'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_date.validate().unwrap_err().path.as_deref(),
+            Some("suppressions.fingerprints.0.expires_at")
         );
     }
 
@@ -905,5 +1316,49 @@ mod tests {
         assert!(
             Config::for_preset(ConfigPreset::Blank).to_yaml().unwrap().contains("mode: nodenext")
         );
+    }
+
+    #[test]
+    fn file_backed_config_extends_and_deep_merges_multiple_parents() {
+        let root = std::env::temp_dir().join(format!("wae-config-extends-{}", std::process::id()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(
+            root.join("config/base.yaml"),
+            "version: 1\nproject:\n  roots: [src]\nrules:\n  ARCH-001: warning\n",
+        )
+        .unwrap();
+        fs::write(root.join("config/team.yaml"), "version: 1\noutput:\n  max_warnings: 4\n")
+            .unwrap();
+        fs::write(
+            root.join(CONFIG_FILE),
+            "extends: [config/base.yaml, config/team.yaml]\nversion: 1\nrules:\n  ARCH-001: error\n",
+        )
+        .unwrap();
+        let config = Config::load(&root).unwrap();
+        assert_eq!(config.project.roots, ["src"]);
+        assert_eq!(config.output.max_warnings, Some(4));
+        assert_eq!(config.rules["ARCH-001"].severity(), Some(Severity::Error));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extends_cycles_are_reported_and_path_overrides_use_last_match() {
+        let root = std::env::temp_dir().join(format!("wae-config-cycle-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.yaml"), "extends: b.yaml\nversion: 1\n").unwrap();
+        fs::write(root.join("b.yaml"), "extends: a.yaml\nversion: 1\n").unwrap();
+        let error = Config::load_file(&root.join("a.yaml")).unwrap_err();
+        assert!(error.message.contains("extends cycle"));
+
+        let config = Config::from_yaml(
+            "version: 1\noverrides:\n  - files: ['src/legacy/**']\n    rules:\n      ARCH-003: warning\n  - files: ['src/legacy/generated/**']\n    rules:\n      ARCH-003:\n        enabled: false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.rule_severity_for_path("ARCH-003", "src/legacy/a.ts"),
+            Some(Severity::Warning)
+        );
+        assert_eq!(config.rule_severity_for_path("ARCH-003", "src/legacy/generated/a.ts"), None);
+        fs::remove_dir_all(root).unwrap();
     }
 }

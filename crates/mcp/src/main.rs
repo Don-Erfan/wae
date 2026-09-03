@@ -30,12 +30,13 @@ fn main() {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let mut stdout = io::stdout().lock();
+    let server = wae_mcp::McpServer::new(&root, policy.clone());
     while let Ok(Some(line)) = read_bounded_line(&mut stdin, policy.max_request_bytes()) {
         let line = String::from_utf8_lossy(&line).into_owned();
         if line.trim().is_empty() {
             continue;
         }
-        let response = wae_mcp::handle_line(&line, &root, &policy);
+        let response = server.handle_line(&line);
         if let Some(response) = response {
             if serde_json::to_writer(&mut stdout, &response).is_err()
                 || writeln!(stdout).is_err()

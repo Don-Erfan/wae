@@ -8,6 +8,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.27] - 2026-09-03
+
+### Added
+
+- Added a provenance-backed Node builtin catalog that separates bare builtins from `node:`-only
+  modules, including modern `node:sqlite`, `node:test` and builtin subpath coverage.
+- Added package-root-aware Next.js routing, propagated client runtime boundaries, config
+  `extends`/path overrides, structured suppression lifecycle commands, and static template and
+  `import.meta.url` asset dependency parsing.
+- Added syntax-only, edge-local and global-cycle performance profiles across the 10k, 50k and
+  scheduled 100k gates, with reproducible runner metadata and a real Next.js 13–16 build matrix.
+
+### Changed
+
+- Replaced repeated dependency-depth searches with one multi-source traversal and added constant-
+  allocation graph degree queries.
+- Split resolver builtin and TypeScript configuration services from the resolver facade, shared an
+  atomic JSON repository between cache and baseline persistence, and made MCP reuse persistent
+  workspace snapshots.
+- Parsed and resolved cache misses in deterministic batches with at most eight workers, streamed
+  semantic rule identities directly into scoped per-rule cache partitions, and reused immutable
+  analysis snapshots on no-op editor executions.
+- Moved rule option ownership into the central rule registry, hardened public analysis types for
+  additive evolution, and expanded deterministic per-rule and false-positive coverage.
+
+### Fixed
+
+- Prevented a real package named `test` from being collapsed into `node:test`, and classified
+  prefix-only builtins and arbitrary monorepo router roots correctly.
+- Made warning-budget/baseline semantics explicit, made baseline writes crash-safe, and reported
+  unused or expired path and identity suppressions with their owner and ticket metadata.
+- Reworked release governance so signed tags are created only from commits that already passed the
+  exact pre-tag quality, test, audit, performance and v1-readiness checks.
+
 ## [0.0.26] - 2026-09-02
 
 ### Fixed
@@ -292,7 +326,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.26...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.27...HEAD
+[0.0.27]: https://github.com/Don-Erfan/wae/compare/v0.0.26...v0.0.27
 [0.0.26]: https://github.com/Don-Erfan/wae/compare/v0.0.25...v0.0.26
 [0.0.25]: https://github.com/Don-Erfan/wae/compare/v0.0.24...v0.0.25
 [0.0.24]: https://github.com/Don-Erfan/wae/compare/v0.0.23...v0.0.24

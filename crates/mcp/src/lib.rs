@@ -1,14 +1,64 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use wae_core::domain::{ModuleId, ModuleKind};
-use wae_engine::{AnalyzeRequest, Engine};
+use wae_engine::{Analysis, WorkspaceSession};
 
 #[derive(Clone, Debug)]
 pub struct ServerPolicy {
     allowed_roots: Vec<PathBuf>,
     allow_any_root: bool,
     max_request_bytes: usize,
+}
+
+pub struct McpServer {
+    default_root: PathBuf,
+    policy: ServerPolicy,
+    sessions: Mutex<HashMap<PathBuf, Arc<WorkspaceSession>>>,
+}
+
+impl McpServer {
+    pub fn new(default_root: impl Into<PathBuf>, policy: ServerPolicy) -> Self {
+        Self { default_root: default_root.into(), policy, sessions: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn handle_line(&self, line: &str) -> Option<Value> {
+        if line.len() > self.policy.max_request_bytes {
+            return Some(error(
+                Value::Null,
+                -32001,
+                "request exceeds configured byte quota".into(),
+            ));
+        }
+        match serde_json::from_str(line) {
+            Ok(message) => self.handle_message(message),
+            Err(parse_error) => {
+                Some(error(Value::Null, -32700, format!("parse error: {parse_error}")))
+            }
+        }
+    }
+
+    pub fn handle_message(&self, message: Value) -> Option<Value> {
+        handle_message_with_server(message, self)
+    }
+
+    fn analyze(&self, root: &Path, refresh: bool) -> Result<Arc<Analysis>, String> {
+        let session = {
+            let mut sessions =
+                self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                sessions
+                    .entry(root.to_path_buf())
+                    .or_insert_with(|| Arc::new(WorkspaceSession::new(root))),
+            )
+        };
+        let force = refresh || session.snapshot().is_none();
+        session
+            .analyze_changes(&session.begin_analysis(), &BTreeMap::new(), force)
+            .map_err(|error| format!("{error:?}"))
+    }
 }
 
 impl ServerPolicy {
@@ -41,17 +91,11 @@ impl ServerPolicy {
 }
 
 pub fn handle_line(line: &str, default_root: &Path, policy: &ServerPolicy) -> Option<Value> {
-    if line.len() > policy.max_request_bytes {
-        return Some(error(Value::Null, -32001, "request exceeds configured byte quota".into()));
-    }
-    match serde_json::from_str(line) {
-        Ok(message) => handle_message_with_policy(message, default_root, policy),
-        Err(parse_error) => Some(error(Value::Null, -32700, format!("parse error: {parse_error}"))),
-    }
+    McpServer::new(default_root, policy.clone()).handle_line(line)
 }
 
 pub fn handle_message(message: Value, default_root: &Path) -> Option<Value> {
-    handle_message_with_policy(message, default_root, &ServerPolicy::confined(default_root))
+    McpServer::new(default_root, ServerPolicy::confined(default_root)).handle_message(message)
 }
 
 pub fn handle_message_with_policy(
@@ -59,6 +103,10 @@ pub fn handle_message_with_policy(
     default_root: &Path,
     policy: &ServerPolicy,
 ) -> Option<Value> {
+    McpServer::new(default_root, policy.clone()).handle_message(message)
+}
+
+fn handle_message_with_server(message: Value, server: &McpServer) -> Option<Value> {
     let id = message.get("id").cloned()?;
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Some(error(id, -32600, "invalid JSON-RPC version".into()));
@@ -75,8 +123,9 @@ pub fn handle_message_with_policy(
         "tools/call" => Ok(call_tool(
             message.pointer("/params/name").and_then(Value::as_str).unwrap_or_default(),
             message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({})),
-            default_root,
-            policy,
+            &server.default_root,
+            &server.policy,
+            server,
         )),
         _ => return Some(error(id, -32601, format!("unknown method `{method}`"))),
     };
@@ -147,8 +196,14 @@ fn root_schema() -> Value {
     })
 }
 
-fn call_tool(name: &str, arguments: Value, default_root: &Path, policy: &ServerPolicy) -> Value {
-    match execute_tool(name, arguments, default_root, policy) {
+fn call_tool(
+    name: &str,
+    arguments: Value,
+    default_root: &Path,
+    policy: &ServerPolicy,
+    server: &McpServer,
+) -> Value {
+    match execute_tool(name, arguments, default_root, policy, server) {
         Ok(structured) => {
             let text = serde_json::to_string_pretty(&structured)
                 .unwrap_or_else(|error| format!("could not serialize tool result: {error}"));
@@ -170,6 +225,7 @@ fn execute_tool(
     arguments: Value,
     default_root: &Path,
     policy: &ServerPolicy,
+    server: &McpServer,
 ) -> Result<Value, String> {
     let requested = arguments
         .get("root")
@@ -182,7 +238,7 @@ fn execute_tool(
     let root = confined_root(&requested, policy)?;
     let structured = match name {
         "architecture_check" => {
-            let analysis = analyze(&root)?;
+            let analysis = server.analyze(&root, true)?;
             json!({
                 "schemaVersion": analysis.schema_version,
                 "sourceModules": analysis.project.modules.iter().filter(|module| module.kind == ModuleKind::Source).count(),
@@ -218,7 +274,7 @@ fn execute_tool(
         "dependency_path" => {
             let from = arguments.get("from").and_then(Value::as_str).ok_or("from is required")?;
             let to = arguments.get("to").and_then(Value::as_str).ok_or("to is required")?;
-            let analysis = analyze(&root)?;
+            let analysis = server.analyze(&root, false)?;
             let path = analysis
                 .graph
                 .shortest_path(&ModuleId(from.into()), &ModuleId(to.into()))
@@ -226,7 +282,7 @@ fn execute_tool(
             json!({ "from": from, "to": to, "path": path })
         }
         "architecture_model" => {
-            let analysis = analyze(&root)?;
+            let analysis = server.analyze(&root, false)?;
             let modules = analysis
                 .project
                 .modules
@@ -264,7 +320,7 @@ fn execute_tool(
         "dependency_policy" => {
             let from = arguments.get("from").and_then(Value::as_str).ok_or("from is required")?;
             let to = arguments.get("to").and_then(Value::as_str).ok_or("to is required")?;
-            let analysis = analyze(&root)?;
+            let analysis = server.analyze(&root, false)?;
             let edge_exists = analysis
                 .project
                 .dependencies
@@ -310,10 +366,6 @@ fn confined_root(requested: &Path, policy: &ServerPolicy) -> Result<PathBuf, Str
             requested.display()
         ))
     }
-}
-
-fn analyze(root: &Path) -> Result<wae_engine::Analysis, String> {
-    Engine::default().analyze(AnalyzeRequest::new(root)).map_err(|error| format!("{error:?}"))
 }
 
 fn error(id: Value, code: i64, message: String) -> Value {
@@ -369,6 +421,30 @@ mod tests {
         .unwrap();
         assert_eq!(response["result"]["structuredContent"]["sourceModules"], 1);
         assert_eq!(response["result"]["isError"], false);
+    }
+
+    #[test]
+    fn persistent_server_reuses_the_last_checked_workspace_snapshot_for_queries() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/basic");
+        let canonical = root.canonicalize().unwrap();
+        let server = McpServer::new(&canonical, ServerPolicy::confined(&canonical));
+        let check = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "architecture_check", "arguments": {} }
+        });
+        assert_eq!(server.handle_message(check).unwrap()["result"]["isError"], false);
+        let model = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "architecture_model", "arguments": {} }
+        });
+        assert_eq!(server.handle_message(model).unwrap()["result"]["isError"], false);
+        let session =
+            Arc::clone(server.sessions.lock().unwrap().get(&canonical).expect("workspace session"));
+        assert!(session.last_execution().reused_snapshot);
     }
 
     #[test]

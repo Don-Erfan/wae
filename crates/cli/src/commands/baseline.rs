@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::{Diagnostic, Severity};
-use wae_engine::FailurePolicy;
+use wae_engine::{AtomicJsonRepository, FailurePolicy};
 
 const BASELINE_SCHEMA_VERSION: u32 = 3;
 
@@ -104,6 +104,16 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
         .iter()
         .filter(|diagnostic| !diagnostic.suppressed && diagnostic.severity == Severity::Info)
         .count();
+    if failure_policy.fail_on() == wae_config::FailOn::Error
+        && failure_policy
+            .max_warnings()
+            .is_some_and(|maximum| failure_policy.warning_count(diagnostics) > maximum)
+    {
+        return Err(
+            "the aggregate warning budget is exceeded and cannot be baselined; reduce warnings, increase output.max_warnings, or set output.fail_on: warning to baseline individual warnings"
+                .into(),
+        );
+    }
     let mut sorted = diagnostics
         .iter()
         .filter(|diagnostic| failure_policy.is_failure(diagnostic))
@@ -124,13 +134,9 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
     let recorded = entries.len();
     let created_at_unix =
         SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs();
-    let contents = serde_json::to_string_pretty(&BaselineFile {
-        schema_version: BASELINE_SCHEMA_VERSION,
-        created_at_unix,
-        entries,
-    })
-    .map_err(|error| error.to_string())?;
-    fs::write(&path, format!("{contents}\n")).map_err(|error| error.to_string())?;
+    let baseline =
+        BaselineFile { schema_version: BASELINE_SCHEMA_VERSION, created_at_unix, entries };
+    AtomicJsonRepository::write(&path, &baseline)?;
     Ok(SaveResult { path, recorded, suppressed, informational })
 }
 
@@ -216,13 +222,12 @@ pub fn prune(root: &Path, diagnostics: &[Diagnostic]) -> Result<(PathBuf, usize,
     });
     let removed = before - entries.len();
     let remaining = entries.len();
-    let contents = serde_json::to_string_pretty(&BaselineFile {
+    let baseline = BaselineFile {
         schema_version: BASELINE_SCHEMA_VERSION,
         created_at_unix: stored.created_at_unix,
         entries,
-    })
-    .map_err(|error| error.to_string())?;
-    fs::write(&path, format!("{contents}\n")).map_err(|error| error.to_string())?;
+    };
+    AtomicJsonRepository::write(&path, &baseline)?;
     Ok((path, removed, remaining))
 }
 
@@ -266,6 +271,24 @@ mod tests {
         assert_eq!(saved.informational, 1);
         let baseline = load(&root).unwrap();
         assert!(baseline.contains(&kept.fingerprint));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_aggregate_warning_budgets_that_a_fingerprint_baseline_cannot_represent() {
+        let root = std::env::temp_dir()
+            .join(format!("wae-baseline-warning-budget-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\noutput:\n  fail_on: error\n  max_warnings: 0\n",
+        )
+        .unwrap();
+        let mut warning = Diagnostic::new("ARCH-001", "warning");
+        warning.severity = Severity::Warning;
+        let error = save(&root, &[warning]).unwrap_err();
+        assert!(error.contains("aggregate warning budget"));
+        assert!(!root.join(".wae/baseline.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

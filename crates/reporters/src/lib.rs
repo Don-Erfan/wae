@@ -236,6 +236,10 @@ fn sarif_level(severity: &Severity) -> &'static str {
 mod tests {
     use super::*;
 
+    fn analysis(diagnostics: Vec<Diagnostic>) -> Analysis {
+        Analysis::new(Default::default(), Default::default(), diagnostics)
+    }
+
     #[test]
     fn bundled_machine_output_schema_is_valid_and_version_synchronized() {
         let schema: serde_json::Value =
@@ -245,31 +249,13 @@ mod tests {
     }
     #[test]
     fn empty_json_has_a_versioned_schema() {
-        let analysis = Analysis {
-            schema_version: 1,
-            project: Default::default(),
-            graph: Default::default(),
-            ownership: Default::default(),
-            diagnostics: vec![],
-            failure_policy: Default::default(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = analysis(vec![]);
         assert!(json_report(&analysis).unwrap().contains("\"schemaVersion\": 1"));
     }
 
     #[test]
     fn sarif_report_has_the_standard_envelope() {
-        let analysis = Analysis {
-            schema_version: 1,
-            project: Default::default(),
-            graph: Default::default(),
-            ownership: Default::default(),
-            diagnostics: vec![],
-            failure_policy: Default::default(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = analysis(vec![]);
         let output = sarif(&analysis).unwrap();
         assert!(output.contains("2.1.0"));
         assert!(output.contains("\"name\": \"WAE\""));
@@ -277,16 +263,7 @@ mod tests {
 
     #[test]
     fn jsonl_events_are_individually_versioned() {
-        let analysis = Analysis {
-            schema_version: 1,
-            project: Default::default(),
-            graph: Default::default(),
-            ownership: Default::default(),
-            diagnostics: vec![Diagnostic::new("ARCH-001", "cycle")],
-            failure_policy: Default::default(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = analysis(vec![Diagnostic::new("ARCH-001", "cycle")]);
         let output = jsonl(&analysis).unwrap();
         for line in output.lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -299,16 +276,7 @@ mod tests {
         let mut diagnostic = Diagnostic::new("ARCH-003", "Layer violation");
         diagnostic.severity = Severity::Warning;
         diagnostic.refresh_fingerprint();
-        let analysis = Analysis {
-            schema_version: 1,
-            project: Default::default(),
-            graph: Default::default(),
-            ownership: Default::default(),
-            diagnostics: vec![diagnostic],
-            failure_policy: Default::default(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = analysis(vec![diagnostic]);
         let value: serde_json::Value = serde_json::from_str(&sarif(&analysis).unwrap()).unwrap();
         assert_eq!(value["runs"][0]["invocations"][0]["executionSuccessful"], true);
         assert_eq!(value["runs"][0]["tool"]["driver"]["rules"][0]["id"], "ARCH-003");
@@ -327,16 +295,7 @@ mod tests {
         info.severity = Severity::Info;
         let mut suppressed = Diagnostic::new("ARCH-004", "suppressed");
         suppressed.suppressed = true;
-        let analysis = Analysis {
-            schema_version: 1,
-            project: Default::default(),
-            graph: Default::default(),
-            ownership: Default::default(),
-            diagnostics: vec![Diagnostic::new("ARCH-001", "failure"), info, suppressed],
-            failure_policy: Default::default(),
-            incremental: Default::default(),
-            timings: Default::default(),
-        };
+        let analysis = analysis(vec![Diagnostic::new("ARCH-001", "failure"), info, suppressed]);
         let value: serde_json::Value =
             serde_json::from_str(&json_report(&analysis).unwrap()).unwrap();
         assert_eq!(value["failureCount"], 1);

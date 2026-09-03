@@ -775,7 +775,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "wae-cli"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "ctrlc",
  "serde",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "wae-config"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "globset",
  "serde",
@@ -800,14 +800,14 @@ dependencies = [
 
 [[package]]
 name = "wae-core"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "wae-discovery"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "serde",
  "serde_json",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "wae-engine"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "criterion",
  "fs2",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "wae-framework"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "serde_json",
  "wae-core",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "wae-graph"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "criterion",
  "wae-core",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "wae-lsp"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "crossbeam-channel",
  "lsp-server",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "wae-mcp"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "serde_json",
  "wae-core",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "wae-parser"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "serde_json",
  "tree-sitter",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "wae-reporters"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "serde_json",
  "wae-config",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "wae-resolver"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "globset",
  "ignore",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "wae-rules"
-version = "0.0.26"
+version = "0.0.27"
 dependencies = [
  "globset",
  "wae-config",

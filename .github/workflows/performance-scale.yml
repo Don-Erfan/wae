@@ -22,6 +22,7 @@ jobs:
       WAE_ENGINE_LARGE_COLD_BUDGET_MS: "120000"
       WAE_ENGINE_LARGE_WARM_BUDGET_MS: "15000"
       WAE_ENGINE_LARGE_EDIT_BUDGET_MS: "15000"
+      WAE_ENGINE_LARGE_SEMANTIC_EDIT_BUDGET_MS: "30000"
       WAE_ENGINE_LARGE_RSS_BUDGET_KB: "1572864"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -35,10 +36,38 @@ jobs:
           cargo test -p wae-engine --release --locked --test real_world_scale \
             large_full_engine_cold_warm_and_edit_are_bounded \
             -- --ignored --exact --nocapture 2>&1 | tee target/performance/engine-100k.txt
+      - name: Record reproducible performance environment
+        if: always()
+        env:
+          WAE_JOB_CONCLUSION: ${{ job.status }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, platform, subprocess
+          from pathlib import Path
+
+          output = {
+              "schemaVersion": 2,
+              "commitSha": os.environ["GITHUB_SHA"],
+              "runUrl": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "jobName": "engine-100k",
+              "conclusion": os.environ["WAE_JOB_CONCLUSION"],
+              "runner": {
+                  "os": platform.platform(),
+                  "image": os.environ.get("ImageOS"),
+                  "imageVersion": os.environ.get("ImageVersion"),
+                  "cpu": platform.processor() or Path("/proc/cpuinfo").read_text().split("model name", 1)[-1].splitlines()[0].lstrip("\t: "),
+              },
+              "rustc": subprocess.check_output(["rustc", "-Vv"], text=True).strip(),
+              "profiles": ["cold", "warm", "syntax-only", "edge-local", "global-cycle"],
+              "sampleLogs": ["engine-100k.txt"],
+          }
+          Path("target/performance/metadata.json").write_text(json.dumps(output, indent=2) + "\n")
+          PY
       - name: Retain 100k scale history
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: engine-100k-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/performance/engine-100k.txt
+          path: target/performance/
           if-no-files-found: error

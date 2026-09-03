@@ -138,18 +138,38 @@ impl RuleSet {
     }
 
     pub fn evaluate_profiled(&self, context: &RuleContext<'_>) -> Result<RuleEvaluation, String> {
+        self.evaluate_profiled_selected(context, None)
+    }
+
+    pub fn enabled_rule_ids(&self, context: &RuleContext<'_>) -> Vec<&'static str> {
+        self.rules
+            .iter()
+            .filter(|rule| context.config.configured || rule.metadata().id == "ARCH-001")
+            .filter(|rule| context.config.rule_enabled_anywhere(rule.metadata().id))
+            .map(|rule| rule.metadata().id)
+            .collect()
+    }
+
+    pub fn evaluate_profiled_rules(
+        &self,
+        context: &RuleContext<'_>,
+        rule_ids: &HashSet<String>,
+    ) -> Result<RuleEvaluation, String> {
+        self.evaluate_profiled_selected(context, Some(rule_ids))
+    }
+
+    fn evaluate_profiled_selected(
+        &self,
+        context: &RuleContext<'_>,
+        selected: Option<&HashSet<String>>,
+    ) -> Result<RuleEvaluation, String> {
         let enabled = self
             .rules
             .iter()
             .filter(|rule| context.config.configured || rule.metadata().id == "ARCH-001")
-            .filter_map(|rule| {
-                context
-                    .config
-                    .rules
-                    .get(rule.metadata().id)
-                    .and_then(|value| value.severity())
-                    .map(|severity| (rule.as_ref(), severity))
-            })
+            .filter(|rule| selected.is_none_or(|ids| ids.contains(rule.metadata().id)))
+            .filter(|rule| context.config.rule_enabled_anywhere(rule.metadata().id))
+            .map(|rule| rule.as_ref())
             .collect::<Vec<_>>();
         let parallel = context.project.modules.len() >= 100
             && enabled.len() >= 4
@@ -158,9 +178,7 @@ impl RuleSet {
             std::thread::scope(|scope| {
                 let handles = enabled
                     .iter()
-                    .map(|(rule, severity)| {
-                        scope.spawn(move || evaluate_one(*rule, severity.clone(), context))
-                    })
+                    .map(|rule| scope.spawn(move || evaluate_one(*rule, context)))
                     .collect::<Vec<_>>();
                 handles
                     .into_iter()
@@ -174,7 +192,7 @@ impl RuleSet {
         } else {
             enabled
                 .into_iter()
-                .map(|(rule, severity)| evaluate_one(rule, severity, context))
+                .map(|rule| evaluate_one(rule, context))
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut diagnostics = Vec::new();
@@ -190,16 +208,21 @@ impl RuleSet {
 
 fn evaluate_one(
     rule: &dyn Rule,
-    severity: wae_core::domain::Severity,
     context: &RuleContext<'_>,
 ) -> Result<(Vec<Diagnostic>, RuleProfile), String> {
     let started = std::time::Instant::now();
     let mut diagnostics = Vec::new();
     rule.evaluate(context, &mut diagnostics)?;
-    for diagnostic in &mut diagnostics {
-        diagnostic.severity = severity.clone();
+    diagnostics.retain_mut(|diagnostic| {
+        let path =
+            diagnostic.primary_location.as_ref().map_or("", |location| location.file.as_str());
+        let Some(severity) = context.config.rule_severity_for_path(rule.metadata().id, path) else {
+            return false;
+        };
+        diagnostic.severity = severity;
         diagnostic.refresh_fingerprint();
-    }
+        true
+    });
     let profile = RuleProfile {
         rule_id: rule.metadata().id,
         elapsed_ns: started.elapsed().as_nanos(),
@@ -577,7 +600,8 @@ mod tests {
             dependency("src/features/payment/service.ts", "src/features/user/internal/token.ts");
         let project = Project { dependencies: vec![edge.clone()], ..Project::default() };
         let graph = ModuleGraph::from_project(&project);
-        let mut config = Config { configured: true, ..Config::default() };
+        let mut config = Config::default();
+        config.configured = true;
         config.rules.insert(
             "ARCH-004".into(),
             wae_config::RuleConfig::Severity(wae_core::domain::Severity::Info),
