@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.28] - 2026-09-03
+
+### Fixed
+
+- Download verified VS Code and JetBrains packages from the successful pre-tag CI run by its
+  exact run ID instead of incorrectly searching for those artifacts inside the binary-build run.
+- Retained the immutable signed `v0.0.27` tag after its release aggregation correctly stopped
+  before publishing incomplete GitHub or npm artifacts.
+
 ## [0.0.27] - 2026-09-03
 
 ### Added
@@ -326,7 +335,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.27...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.28...HEAD
+[0.0.28]: https://github.com/Don-Erfan/wae/compare/v0.0.27...v0.0.28
 [0.0.27]: https://github.com/Don-Erfan/wae/compare/v0.0.26...v0.0.27
 [0.0.26]: https://github.com/Don-Erfan/wae/compare/v0.0.25...v0.0.26
 [0.0.25]: https://github.com/Don-Erfan/wae/compare/v0.0.24...v0.0.25

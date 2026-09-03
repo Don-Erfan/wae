@@ -22,6 +22,8 @@ jobs:
   verify:
     name: Verify release source
     runs-on: ubuntu-latest
+    outputs:
+      readiness-run-id: ${{ steps.readiness.outputs.run-id }}
     permissions:
       contents: read
       actions: read
@@ -39,6 +41,7 @@ jobs:
           test -n "$tag_url"
           test "$(curl --fail --silent --show-error --location "$tag_url" | jq -r '.verification.verified')" = "true"
       - name: Require a successful pre-tag readiness run for the exact commit
+        id: readiness
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -57,6 +60,11 @@ jobs:
               exit 1
             }
           done
+          run_id=$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${commit}&status=success&per_page=20" \
+            --jq '.workflow_runs | map(select(.event == "push")) | first | .id')
+          test -n "$run_id"
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
@@ -152,10 +160,11 @@ jobs:
 
   release:
     name: Upload binaries to GitHub Release
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
       id-token: write
       attestations: write
     steps:
@@ -176,6 +185,8 @@ jobs:
         with:
           name: ide-clients
           path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.verify.outputs.readiness-run-id }}
 
       - name: Verify and aggregate binary checksums
         shell: bash
