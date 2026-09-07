@@ -9,7 +9,7 @@ use wae_config::Config;
 use wae_core::domain::{Dependency, Diagnostic, Import, ModuleSemantics, ResolvedDependency};
 use wae_parser::PARSER_CACHE_VERSION;
 
-use crate::{AnalysisError, AtomicJsonRepository};
+use crate::{AnalysisError, JsonRepository};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CachedModuleAnalysis {
@@ -147,6 +147,20 @@ impl AnalysisCache {
             .cloned()
     }
 
+    pub(crate) fn previous_module(&mut self, module: &str) -> Option<CachedModuleAnalysis> {
+        if self.enabled {
+            let shard = shard_id(module);
+            if self.loaded_shards.insert(shard) {
+                self.file.files.extend(read_shard(&shard_path(&self.path, shard)));
+            }
+        }
+        self.enabled.then(|| self.file.files.get(module)).flatten().cloned()
+    }
+
+    pub(crate) fn stale_modules(&self) -> impl Iterator<Item = &String> {
+        self.stale_files.iter()
+    }
+
     pub(crate) fn insert(
         &mut self,
         module: String,
@@ -176,6 +190,13 @@ impl AnalysisCache {
             .then(|| self.file.rule_partitions.get(rule_id))
             .flatten()
             .filter(|cached| cached.input_hash == input_hash)
+            .map(|cached| cached.diagnostics.clone())
+    }
+
+    pub(crate) fn previous_rule_partition(&self, rule_id: &str) -> Option<Vec<Diagnostic>> {
+        self.enabled
+            .then(|| self.file.rule_partitions.get(rule_id))
+            .flatten()
             .map(|cached| cached.diagnostics.clone())
     }
 
@@ -235,7 +256,7 @@ impl AnalysisCache {
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), AnalysisError> {
-    AtomicJsonRepository::write(path, value).map_err(AnalysisError::Project)
+    JsonRepository::write(path, value).map_err(AnalysisError::Project)
 }
 
 fn unresolved_candidate_became_live(

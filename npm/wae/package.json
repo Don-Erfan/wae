@@ -1,6 +1,6 @@
 {
   "name": "@don-erfan/wae",
-  "version": "0.0.28",
+  "version": "0.0.29",
   "description": "WAE CLI wrapper for frontend architecture checks",
   "license": "MIT",
   "repository": {
@@ -26,11 +26,18 @@
     "wae-mcp": "bin/wae-mcp.js"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js",
+    "recover:binaries": "node scripts/postinstall.js",
     "pack:check": "npm pack --dry-run",
-    "test:installer": "node --test test/postinstall.test.js"
+    "test:installer": "node --test test/*.test.js"
   },
   "wae": {
     "githubRepo": "Don-Erfan/wae"
+  },
+  "optionalDependencies": {
+    "@don-erfan/wae-linux-x64": "0.0.29",
+    "@don-erfan/wae-linux-arm64": "0.0.29",
+    "@don-erfan/wae-darwin-x64": "0.0.29",
+    "@don-erfan/wae-darwin-arm64": "0.0.29",
+    "@don-erfan/wae-win32-x64": "0.0.29"
   }
 }

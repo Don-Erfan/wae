@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use globset::GlobBuilder;
 use wae_core::domain::{DependencyTarget, Diagnostic, ModuleId, PackageName, SourceLocation};
 use wae_core::rule_registry::{self, RuleDescriptor};
@@ -63,6 +61,9 @@ impl Rule for ForbiddenPackageDependencyRule {
             })
             .collect::<Result<Vec<_>, _>>()?;
         for edge in context.package_graph.edges() {
+            if !context.includes_package_edge(&edge.from, &edge.to) {
+                continue;
+            }
             if policies
                 .iter()
                 .any(|(from, to)| from.is_match(&edge.from.0) && to.is_match(&edge.to.0))
@@ -91,25 +92,21 @@ impl Rule for UndeclaredWorkspaceDependencyRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        let packages = context
-            .project
-            .modules
-            .iter()
-            .map(|module| (&module.id, &module.package))
-            .collect::<HashMap<_, _>>();
-        for dependency in &context.project.resolved_dependencies {
+        for dependency in context.resolved_dependencies() {
             let DependencyTarget::WorkspacePackage { package: target, module } = &dependency.target
             else {
                 continue;
             };
-            let Some(importer_package) = packages.get(&dependency.from) else {
-                continue;
-            };
-            if **importer_package == *target {
+            if !context.includes_edge(&dependency.from, module) {
                 continue;
             }
-            let Some(declared) = context.declared_package_dependencies.get(*importer_package)
-            else {
+            let Some(importer_package) = context.module_packages.get(&dependency.from) else {
+                continue;
+            };
+            if importer_package == target {
+                continue;
+            }
+            let Some(declared) = context.declared_package_dependencies.get(importer_package) else {
                 continue;
             };
             if !declared.contains(target) {
@@ -143,13 +140,7 @@ impl Rule for CrossPackageRelativeImportRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        let packages = context
-            .project
-            .modules
-            .iter()
-            .map(|module| (&module.id, &module.package))
-            .collect::<HashMap<_, _>>();
-        for dependency in &context.project.resolved_dependencies {
+        for dependency in context.resolved_dependencies() {
             if !dependency.specifier.starts_with('.') {
                 continue;
             }
@@ -158,10 +149,13 @@ impl Rule for CrossPackageRelativeImportRule {
                 | DependencyTarget::WorkspacePackage { module, .. } => module,
                 _ => continue,
             };
-            let Some(importer_package) = packages.get(&dependency.from) else {
+            if !context.includes_edge(&dependency.from, target_id) {
+                continue;
+            }
+            let Some(importer_package) = context.module_packages.get(&dependency.from) else {
                 continue;
             };
-            let Some(target_package) = packages.get(target_id) else {
+            let Some(target_package) = context.module_packages.get(target_id) else {
                 continue;
             };
             if importer_package != target_package {
@@ -188,9 +182,9 @@ fn package_edge_location(
     to: &PackageName,
 ) -> Option<SourceLocation> {
     context.project.dependencies.iter().find_map(|dependency| {
-        let source = context.project.modules.iter().find(|module| module.id == dependency.from)?;
-        let target = context.project.modules.iter().find(|module| module.id == dependency.to)?;
-        (&source.package == from && &target.package == to).then(|| dependency.location.clone())
+        let source = context.module_packages.get(&dependency.from)?;
+        let target = context.module_packages.get(&dependency.to)?;
+        (source == from && target == to).then(|| dependency.location.clone())
     })
 }
 

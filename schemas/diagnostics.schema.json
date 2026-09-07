@@ -14,10 +14,40 @@
     "dependencies": { "type": "integer", "minimum": 0 },
     "architectureCoverage": { "$ref": "#/$defs/architectureCoverage" },
     "failureCount": { "type": "integer", "minimum": 0 },
+    "warningCount": { "type": "integer", "minimum": 0 },
+    "failurePolicy": { "$ref": "#/$defs/failurePolicy" },
+    "incremental": { "$ref": "#/$defs/incremental" },
     "regression": { "$ref": "#/$defs/regression" },
     "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
   },
   "$defs": {
+    "failurePolicy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["failOn", "maxWarnings"],
+      "properties": {
+        "failOn": { "enum": ["error", "warning"] },
+        "maxWarnings": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "incremental": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cacheEnabled", "restoredModules", "analyzedModules", "affectedModules", "inspectedEdges", "retainedDiagnostics", "addedDiagnostics", "removedDiagnostics", "restoredRules", "evaluatedRules", "fullRuleEvaluations", "scopedRuleEvaluations", "ruleSnapshotReused"],
+      "properties": {
+        "cacheEnabled": { "type": "boolean" },
+        "restoredModules": { "type": "integer", "minimum": 0 },
+        "analyzedModules": { "type": "integer", "minimum": 0 },
+        "affectedModules": { "type": "integer", "minimum": 0 },
+        "inspectedEdges": { "type": "integer", "minimum": 0 },
+        "retainedDiagnostics": { "type": "integer", "minimum": 0 },
+        "addedDiagnostics": { "type": "integer", "minimum": 0 },
+        "removedDiagnostics": { "type": "integer", "minimum": 0 },
+        "restoredRules": { "type": "integer", "minimum": 0 },
+        "evaluatedRules": { "type": "integer", "minimum": 0 },
+        "fullRuleEvaluations": { "type": "integer", "minimum": 0 },
+        "scopedRuleEvaluations": { "type": "integer", "minimum": 0 },
+        "ruleSnapshotReused": { "type": "boolean" }
+      }
+    },
     "architectureCoverage": {
       "type": "object", "additionalProperties": false,
       "required": ["percent", "assignedModules", "exemptedModules", "unassignedModules"],

@@ -1,0 +1,11 @@
+{
+  "name": "@don-erfan/wae-linux-x64",
+  "version": "0.0.29",
+  "description": "Linux x64 native binaries for WAE",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Don-Erfan/wae.git" },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "preferUnplugged": true,
+  "files": ["bin"]
+}

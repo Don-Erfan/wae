@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use globset::{GlobBuilder, GlobMatcher};
 use wae_config::Config;
 use wae_core::domain::{
-    ArchitectureOwnershipIndex, Diagnostic, FeatureId, ModuleId, PackageName, Project,
-    SourceLocation,
+    ArchitectureOwnershipIndex, Dependency, Diagnostic, FeatureId, Module, ModuleId, PackageName,
+    Project, ResolvedDependency, SourceLocation,
 };
 use wae_core::rule_registry::{self, RuleDescriptor};
 use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
@@ -25,6 +25,7 @@ use runtime_rules::{
     BrowserToServerRule, EdgeIncompatibleDependencyRule, IncompatibleRuntimeCycleRule,
 };
 
+#[derive(Clone, Copy)]
 pub struct RuleContext<'a> {
     pub project: &'a Project,
     pub graph: &'a ModuleGraph,
@@ -35,8 +36,44 @@ pub struct RuleContext<'a> {
     pub ownership: &'a ArchitectureOwnershipIndex,
     pub module_features: &'a HashMap<ModuleId, FeatureId>,
     pub module_feature_roots: &'a HashMap<ModuleId, String>,
+    pub module_packages: &'a HashMap<ModuleId, PackageName>,
     pub policies: &'a CompiledRulePolicies,
     pub declared_package_dependencies: &'a HashMap<PackageName, HashSet<PackageName>>,
+    /// Present only for incremental edge-rule evaluation. Closure and global rules always see
+    /// the complete project so reachability and aggregate invariants remain sound.
+    pub affected_modules: Option<&'a HashSet<ModuleId>>,
+    pub affected_packages: Option<&'a HashSet<PackageName>>,
+    pub affected_module_records: Option<&'a [Module]>,
+    pub affected_dependencies: Option<&'a [Dependency]>,
+    pub affected_resolved_dependencies: Option<&'a [ResolvedDependency]>,
+}
+
+impl RuleContext<'_> {
+    pub fn includes_module(&self, module: &ModuleId) -> bool {
+        self.affected_modules.is_none_or(|affected| affected.contains(module))
+    }
+
+    pub fn includes_edge(&self, from: &ModuleId, to: &ModuleId) -> bool {
+        self.affected_modules
+            .is_none_or(|affected| affected.contains(from) || affected.contains(to))
+    }
+
+    pub fn includes_package_edge(&self, from: &PackageName, to: &PackageName) -> bool {
+        self.affected_packages
+            .is_none_or(|affected| affected.contains(from) || affected.contains(to))
+    }
+
+    pub fn modules(&self) -> &[Module] {
+        self.affected_module_records.unwrap_or(&self.project.modules)
+    }
+
+    pub fn dependencies(&self) -> &[Dependency] {
+        self.affected_dependencies.unwrap_or(&self.project.dependencies)
+    }
+
+    pub fn resolved_dependencies(&self) -> &[ResolvedDependency] {
+        self.affected_resolved_dependencies.unwrap_or(&self.project.resolved_dependencies)
+    }
 }
 
 pub struct CompiledRulePolicies {
@@ -265,7 +302,10 @@ impl Rule for ForbiddenDependencyRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        for dependency in &context.project.dependencies {
+        for dependency in context.dependencies() {
+            if !context.includes_edge(&dependency.from, &dependency.to) {
+                continue;
+            }
             let from = dependency.from.0.replace('\\', "/");
             let to = dependency.to.0.replace('\\', "/");
             let configured =
@@ -298,7 +338,10 @@ impl Rule for LayerBoundaryRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        for dependency in &context.project.dependencies {
+        for dependency in context.dependencies() {
+            if !context.includes_edge(&dependency.from, &dependency.to) {
+                continue;
+            }
             let (Some(from), Some(to)) = (
                 context.module_layers.get(&dependency.from),
                 context.module_layers.get(&dependency.to),
@@ -337,7 +380,10 @@ impl Rule for FeatureBoundaryRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        for dependency in &context.project.dependencies {
+        for dependency in context.dependencies() {
+            if !context.includes_edge(&dependency.from, &dependency.to) {
+                continue;
+            }
             let Some(target_feature) = context.module_features.get(&dependency.to) else {
                 continue;
             };
@@ -380,7 +426,10 @@ impl Rule for PrivateImportRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        for dependency in &context.project.dependencies {
+        for dependency in context.dependencies() {
+            if !context.includes_edge(&dependency.from, &dependency.to) {
+                continue;
+            }
             let private = is_private_path(&dependency.to.0, context.config);
             let importer_feature = context.module_features.get(&dependency.from);
             let target_feature = context.module_features.get(&dependency.to);
@@ -493,8 +542,14 @@ mod tests {
             ownership: Box::leak(Box::new(ArchitectureOwnershipIndex::default())),
             module_features: features,
             module_feature_roots: Box::leak(Box::new(HashMap::new())),
+            module_packages: Box::leak(Box::new(HashMap::new())),
             policies: Box::leak(Box::new(CompiledRulePolicies::compile(config).unwrap())),
             declared_package_dependencies: Box::leak(Box::new(HashMap::new())),
+            affected_modules: None,
+            affected_packages: None,
+            affected_module_records: None,
+            affected_dependencies: None,
+            affected_resolved_dependencies: None,
         }
     }
 
@@ -578,8 +633,14 @@ mod tests {
                     ownership: &ArchitectureOwnershipIndex::default(),
                     module_features: &features,
                     module_feature_roots: &roots,
+                    module_packages: &HashMap::new(),
                     policies: &CompiledRulePolicies::compile(&config).unwrap(),
                     declared_package_dependencies: &HashMap::new(),
+                    affected_modules: None,
+                    affected_packages: None,
+                    affected_module_records: None,
+                    affected_dependencies: None,
+                    affected_resolved_dependencies: None,
                 },
                 &mut diagnostics,
             )

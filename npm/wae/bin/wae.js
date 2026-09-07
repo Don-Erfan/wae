@@ -1,17 +1,13 @@
 #!/usr/bin/env node
 
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { resolveBinary } = require("./platform-binary.js");
 
-const binaryName = os.platform() === "win32" ? "wae.exe" : "wae";
-const binaryPath = path.join(__dirname, binaryName);
-
-if (!fs.existsSync(binaryPath)) {
-  console.error(
-    "WAE binary was not found. Package lifecycle scripts may have been disabled; reinstall without `--ignore-scripts` or run `npm rebuild @don-erfan/wae`."
-  );
+let binaryPath;
+try {
+  binaryPath = resolveBinary("wae");
+} catch (error) {
+  console.error(error.message);
   process.exit(1);
 }
 

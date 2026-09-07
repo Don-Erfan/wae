@@ -70,8 +70,8 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 gh attestation verify wae-x86_64-unknown-linux-gnu --repo Don-Erfan/wae
-jq '.packages | length' wae-v0.0.28-assets.spdx.json
-jq '.components | length' wae-v0.0.28-dependencies.cdx.json
+jq '.packages | length' wae-v0.0.29-assets.spdx.json
+jq '.components | length' wae-v0.0.29-dependencies.cdx.json
 ```
 
 The checksum proves both downloaded inventories are the files signed by the release workflow; use
@@ -86,5 +86,5 @@ cargo test --workspace
 cargo bench --workspace --no-run
 ```
 
-See [Configuration](docs/CONFIGURATION.md), [Architecture](docs/ARCHITECTURE.md), [Acceptance](docs/ACCEPTANCE.md), [Debugging](docs/DEBUGGING.md), [IDE integrations](docs/IDE.md), [MCP/Explorer/Action integrations](docs/INTEGRATIONS.md), [Performance](docs/PERFORMANCE.md), [Reliability](docs/RELIABILITY.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
+See [Configuration](docs/CONFIGURATION.md), [Migration guide](docs/MIGRATIONS.md), [Architecture](docs/ARCHITECTURE.md), [Acceptance](docs/ACCEPTANCE.md), [Debugging](docs/DEBUGGING.md), [IDE integrations](docs/IDE.md), [MCP/Explorer/Action integrations](docs/INTEGRATIONS.md), [Performance](docs/PERFORMANCE.md), [Reliability](docs/RELIABILITY.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md).
 Release maintainers should also read [Releasing](docs/RELEASING.md).

@@ -12,7 +12,7 @@ use wae_core::domain::{
     SourceLocation,
 };
 use wae_core::rule_registry::{self, RuleScope};
-use wae_framework::{FrameworkAdapter, FrameworkRegistry, ModuleEvidence, ProjectEvidence};
+use wae_framework::{FrameworkRegistry, ModuleEvidence};
 use wae_graph::{ModuleGraph, PackageGraph, RuntimeGraph};
 use wae_parser::{JsTsParser, ParserAdapter};
 use wae_resolver::{
@@ -26,6 +26,8 @@ mod architecture_index;
 mod cache;
 mod diagnostic_arbitrator;
 mod discovery;
+mod framework_context;
+mod incremental;
 mod persistence;
 mod pipeline;
 mod resolution_context;
@@ -36,7 +38,8 @@ use architecture_index::CompiledArchitectureModel;
 use cache::{AnalysisCache, CachedModuleAnalysis, stable_hash};
 use diagnostic_arbitrator::DiagnosticArbitrator;
 use discovery::discover_modules;
-pub use persistence::AtomicJsonRepository;
+use framework_context::FrameworkContextIndex;
+pub use persistence::{AtomicFileReplacer, AtomicFileWriter, JsonRepository};
 use resolution_context::ModuleFormatResolver;
 use telemetry::PipelineTelemetry;
 pub use workspace_session::{AnalysisTicket, WorkspaceSession};
@@ -210,6 +213,13 @@ pub struct IncrementalStats {
     pub rule_snapshot_reused: bool,
     pub restored_rules: usize,
     pub evaluated_rules: usize,
+    pub full_rule_evaluations: usize,
+    pub scoped_rule_evaluations: usize,
+    pub affected_modules: usize,
+    pub inspected_edges: usize,
+    pub retained_diagnostics: usize,
+    pub added_diagnostics: usize,
+    pub removed_diagnostics: usize,
     pub environment_hash: u64,
 }
 
@@ -530,27 +540,35 @@ impl<P: ParserAdapter> Engine<P> {
     }
 }
 
+struct FrameworkClassificationContext<'a> {
+    registry: &'a FrameworkRegistry,
+    contexts: &'a FrameworkContextIndex,
+    enabled: &'a [String],
+    auto_detect: bool,
+}
+
 fn apply_framework_classification(
     project: &mut Project,
     module_id: &ModuleId,
-    root: &Path,
-    framework_adapter: Option<&dyn FrameworkAdapter>,
+    source_module_positions: &HashMap<ModuleId, usize>,
+    package_roots: &HashMap<PackageName, String>,
+    framework: &FrameworkClassificationContext<'_>,
     semantics: &ModuleSemantics,
 ) {
-    let Some(adapter) = framework_adapter else { return };
-    let package_root = project
-        .modules
-        .iter()
-        .find(|module| module.id == *module_id)
-        .and_then(|module| project.packages.iter().find(|package| package.name == module.package))
-        .map(|package| relative_resolved_path(root, &package.root_path))
-        .unwrap_or_default();
-    let classification = adapter.classify(ModuleEvidence {
-        path: &module_id.0,
-        package_root: &package_root,
-        semantics,
-    });
-    if let Some(module) = project.modules.iter_mut().find(|module| module.id == *module_id) {
+    let Some(&module_index) = source_module_positions.get(module_id) else { return };
+    let Some(module) = project.modules.get(module_index) else { return };
+    let Some(package_root) = package_roots.get(&module.package) else { return };
+    let Some(adapter) = framework.contexts.adapter_for(
+        framework.registry,
+        package_root,
+        framework.enabled,
+        framework.auto_detect,
+    ) else {
+        return;
+    };
+    let classification =
+        adapter.classify(ModuleEvidence { path: &module_id.0, package_root, semantics });
+    if let Some(module) = project.modules.get_mut(module_index) {
         module.framework_metadata = classification.metadata;
         module.runtime = classification.runtime;
     }
@@ -606,7 +624,7 @@ fn restore_cached_module(
     root: &Path,
     workspace_packages: &[WorkspacePackage],
     default_package: &Package,
-    framework_adapter: Option<&dyn FrameworkAdapter>,
+    framework: &FrameworkClassificationContext<'_>,
     architecture: &CompiledArchitectureModel,
     project: &mut Project,
     project_index: &mut ProjectIndex,
@@ -682,13 +700,21 @@ fn restore_cached_module(
             feature_roots.insert(dependency.to.clone(), feature_root);
         }
         let semantics = ModuleSemantics::default();
-        let classification = framework_adapter.map(|adapter| {
-            adapter.classify(ModuleEvidence {
-                path: &dependency.to.0,
-                package_root: &package_root,
-                semantics: &semantics,
-            })
-        });
+        let classification = framework
+            .contexts
+            .adapter_for(
+                framework.registry,
+                &package_root,
+                framework.enabled,
+                framework.auto_detect,
+            )
+            .map(|adapter| {
+                adapter.classify(ModuleEvidence {
+                    path: &dependency.to.0,
+                    package_root: &package_root,
+                    semantics: &semantics,
+                })
+            });
         project.modules.push(Module {
             id: dependency.to.clone(),
             path: ModulePath(dependency.to.0.clone()),
@@ -845,36 +871,6 @@ fn feed_dependency_target(hasher: &mut SemanticHasher, target: &DependencyTarget
             hasher.feed_str(reason);
         }
     }
-}
-
-fn framework_project_evidence(root: &Path) -> Result<ProjectEvidence, AnalysisError> {
-    let manifest_path = root.join("package.json");
-    let package_manifest = manifest_path
-        .exists()
-        .then(|| {
-            fs::read_to_string(&manifest_path)
-                .map_err(|error| {
-                    AnalysisError::Project(format!(
-                        "cannot read framework manifest `{}`: {error}",
-                        manifest_path.display()
-                    ))
-                })
-                .and_then(|source| {
-                    serde_json::from_str(&source).map_err(|error| {
-                        AnalysisError::Project(format!(
-                            "invalid framework manifest `{}`: {error}",
-                            manifest_path.display()
-                        ))
-                    })
-                })
-        })
-        .transpose()?;
-    let config_files = ["next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"]
-        .into_iter()
-        .filter(|name| root.join(name).is_file())
-        .map(str::to_owned)
-        .collect();
-    Ok(ProjectEvidence { package_manifest, config_files })
 }
 
 fn project_name(root: &Path) -> String {
@@ -1215,6 +1211,46 @@ mod tests {
             "api-route"
         );
         assert!(analysis.diagnostics.is_empty(), "{:?}", analysis.diagnostics);
+    }
+
+    #[test]
+    fn next_is_auto_detected_inside_a_non_next_monorepo_package() {
+        let root =
+            std::env::temp_dir().join(format!("wae-next-package-detection-{}", std::process::id()));
+        let app = root.join("services/store/app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(root.join("package.json"), r#"{"private":true,"workspaces":["services/*"]}"#)
+            .unwrap();
+        fs::write(
+            root.join("services/store/package.json"),
+            r#"{"name":"store","dependencies":{"next":"16.3.4"}}"#,
+        )
+        .unwrap();
+        fs::write(app.join("client.ts"), "'use client'; import './server';").unwrap();
+        fs::write(app.join("server.ts"), "import 'server-only';").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nproject:\n  include: ['services/**/*.ts']\nrules:\n  RUNTIME-001: error\n",
+        )
+        .unwrap();
+
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let client = analysis
+            .project
+            .modules
+            .iter()
+            .find(|module| module.id.0 == "services/store/app/client.ts")
+            .unwrap();
+        assert_eq!(client.runtime, Runtime::Browser);
+        assert_eq!(client.framework_metadata.adapter_id.as_deref(), Some("nextjs"));
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule_id.0 == "RUNTIME-001"
+                && diagnostic
+                    .primary_location
+                    .as_ref()
+                    .is_some_and(|location| location.file == "services/store/app/client.ts")
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

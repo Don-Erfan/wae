@@ -28,17 +28,20 @@ wae-mcp
 
 ## How it works
 
-- During installation, `postinstall` downloads the CLI, LSP and MCP platform binaries from GitHub Releases.
-- Binary assets are resolved from:
-  - `https://github.com/<repo>/releases/download/v<version>/<wae|wae-lsp|wae-mcp>-<target>[.exe]`
-- Every component is installed only after its adjacent SHA-256 file matches.
-- Repository can be configured by:
-  - `wae.githubRepo` in `package.json`
-  - `WAE_GITHUB_REPOSITORY` environment variable (overrides config)
+- npm/yarn selects one exact-version optional package for Linux x64/arm64, macOS x64/arm64, or
+  Windows x64. Each package contains the CLI, LSP and MCP native binaries.
+- Installation works with lifecycle scripts disabled and uses the package manager's integrity,
+  offline cache and lockfile normally.
+- The release workflow verifies every native binary against the checksum embedded from the signed
+  GitHub release before packaging it.
+- `npm run recover:binaries --prefix node_modules/@don-erfan/wae` retains the verified GitHub
+  downloader as an explicit recovery tool; it is never run automatically.
 - GitHub Releases include an aggregate checksum manifest, keyless Sigstore bundle, SPDX SBOM and
   provenance attestations. See the repository README for verification commands.
 
 ## Maintainer note
 
 - This package is preconfigured for `Don-Erfan/wae` releases.
-- To use another repository, change `wae.githubRepo` or set `WAE_GITHUB_REPOSITORY`.
+- Every platform package must use the same version as this wrapper and be published first.
+- npm Trusted Publishing must be configured for the wrapper and all five platform package names;
+  authorizing only `@don-erfan/wae` is not sufficient for the release workflow.

@@ -288,6 +288,15 @@ jobs:
           test "$VERSION" != "$RELEASE_TAG"
           test "$CARGO_VERSION" = "$VERSION"
           test "$NPM_VERSION" = "$VERSION"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const main = require('./npm/wae/package.json');
+          for (const directory of fs.readdirSync('npm/platform').sort()) {
+            const manifest = require(`./npm/platform/${directory}/package.json`);
+            if (manifest.version !== main.version) throw new Error(`${manifest.name} version ${manifest.version} != ${main.version}`);
+            if (main.optionalDependencies[manifest.name] !== main.version) throw new Error(`${manifest.name} is not pinned to ${main.version}`);
+          }
+          NODE
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
@@ -324,12 +333,58 @@ jobs:
           fs.writeFileSync('npm/wae/checksums.json', `${JSON.stringify(output, null, 2)}\n`);
           NODE
 
+      - name: Assemble checksum-verified platform npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const checksums = require('./npm/wae/checksums.json');
+          const targets = [
+            ['linux-x64', 'x86_64-unknown-linux-gnu', ''],
+            ['linux-arm64', 'aarch64-unknown-linux-gnu', ''],
+            ['darwin-x64', 'x86_64-apple-darwin', ''],
+            ['darwin-arm64', 'aarch64-apple-darwin', ''],
+            ['win32-x64', 'x86_64-pc-windows-msvc', '.exe'],
+          ];
+          for (const [name, target, extension] of targets) {
+            const directory = path.join('npm/platform', name, 'bin');
+            fs.mkdirSync(directory, { recursive: true });
+            fs.copyFileSync('LICENSE', path.join('npm/platform', name, 'LICENSE'));
+            for (const component of ['wae', 'wae-lsp', 'wae-mcp']) {
+              const asset = `${component}-${target}${extension}`;
+              const source = path.join('npm-assets', asset);
+              const destination = path.join(directory, `${component}${extension}`);
+              const actual = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+              if (actual !== checksums[asset]) throw new Error(`Checksum mismatch for ${asset}`);
+              fs.copyFileSync(source, destination);
+              if (!extension) fs.chmodSync(destination, 0o755);
+            }
+          }
+          NODE
+          npm/platform/linux-x64/bin/wae --version | grep -F "${{ steps.version.outputs.version }}"
+
       - name: Verify npm package contents
-        working-directory: npm/wae
         env:
           WAE_SKIP_DOWNLOAD: "1"
-        run: npm pack --dry-run
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in npm/platform/*; do
+            (cd "$package" && npm pack --dry-run)
+          done
+          (cd npm/wae && npm run test:installer && npm pack --dry-run)
 
-      - name: Publish to npmjs.com
+      - name: Publish platform packages to npmjs.com
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in npm/platform/*; do
+            (cd "$package" && npm publish --access public --provenance)
+          done
+
+      - name: Publish portable npm wrapper to npmjs.com
         working-directory: npm/wae
-        run: npm publish --access public
+        run: npm publish --access public --provenance

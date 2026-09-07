@@ -4,7 +4,11 @@
 
 1. Protect `master` and require the `quality`, `tests`, `audit`, `npm-installer`, and
    `v1 readiness` CI jobs.
-2. Configure npm Trusted Publishing for package `@don-erfan/wae`, repository `Don-Erfan/wae`, and workflow `release-binaries.yml`.
+2. Configure npm Trusted Publishing for the wrapper and every native package, repository
+   `Don-Erfan/wae`, and workflow `release-binaries.yml`:
+   `@don-erfan/wae`, `@don-erfan/wae-linux-x64`, `@don-erfan/wae-linux-arm64`,
+   `@don-erfan/wae-darwin-x64`, `@don-erfan/wae-darwin-arm64`, and
+   `@don-erfan/wae-win32-x64`.
 3. Keep Cargo, npm, and tag versions identical.
 4. Enable GitHub's immutable releases setting before publishing the first immutable release.
 
@@ -30,7 +34,10 @@ GitHub Actions builds the CLI, LSP and MCP server for every supported native tar
 asset inventory and CycloneDX dependency SBOM from the repository/Cargo.lock,
 and records GitHub SLSA build-provenance attestations for every binary. The curated section for the
 version in `CHANGELOG.md` is prepended to GitHub's generated pull-request notes. npm publication
-uses OIDC; no long-lived `NPM_TOKEN` or interactive OTP belongs in CI.
+uses OIDC; no long-lived `NPM_TOKEN` or interactive OTP belongs in CI. The native packages are
+checksum-verified, published first, and pinned as exact optional dependencies of the portable
+wrapper. The first publication of each new scoped package name may require an npm owner to
+create/authorize that package before Trusted Publishing can take over subsequent releases.
 
 Verify a downloaded release exactly as a consumer should:
 

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use wae_config::Config;
 use wae_core::domain::{Diagnostic, Severity};
-use wae_engine::{AtomicJsonRepository, FailurePolicy};
+use wae_engine::{FailurePolicy, JsonRepository};
 
 const BASELINE_SCHEMA_VERSION: u32 = 3;
 
@@ -136,7 +136,7 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
         SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_secs();
     let baseline =
         BaselineFile { schema_version: BASELINE_SCHEMA_VERSION, created_at_unix, entries };
-    AtomicJsonRepository::write(&path, &baseline)?;
+    JsonRepository::write(&path, &baseline)?;
     Ok(SaveResult { path, recorded, suppressed, informational })
 }
 
@@ -227,7 +227,7 @@ pub fn prune(root: &Path, diagnostics: &[Diagnostic]) -> Result<(PathBuf, usize,
         created_at_unix: stored.created_at_unix,
         entries,
     };
-    AtomicJsonRepository::write(&path, &baseline)?;
+    JsonRepository::write(&path, &baseline)?;
     Ok((path, removed, remaining))
 }
 

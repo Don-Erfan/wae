@@ -86,7 +86,10 @@ Diagnostics / Reporters / Integrations
 - اجرای parallel ruleها روی snapshot مشترک graph برای پروژه‌های بزرگ، با merge به ترتیب registry و خروجی deterministic (بدون parse مجدد)
 - propagation قابلیت‌های runtime با reverse multi-source reachability index، shortest-path
   evidence و RPC boundaryهای framework در `O(V+E)` برای هر runtime class
-- incremental invalidation بر اساس dependency impact
+- incremental invalidation برای ruleهای edge-local بر اساس affected region انجام می‌شود: diagnostic
+  partition خارج از ناحیه حفظ می‌شود و فقط یال‌های incident دوباره ارزیابی می‌شوند. ruleهای closure
+  و global برای حفظ correctness فعلاً fallback سراسری دارند؛ graph storage نیز در هر snapshot کامل
+  rebuild می‌شود و delta graph/SCC هنوز یک guarantee محصول نیست.
 - `ProjectIndex` مبتنی بر hash set برای lookupهای O(1) هنگام ساخت graph
 - `TsConfigIndex` با انتخاب نزدیک‌ترین config والد برای monorepoها
 - `PackageScopeIndex` محدود به ancestorهای importerهای کشف‌شده، بدون crawl کردن خروجی‌های excluded

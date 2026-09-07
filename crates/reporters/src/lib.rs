@@ -59,6 +59,15 @@ fn human(analysis: &Analysis) -> String {
         if let Some(reason) = &diagnostic.suppression_reason {
             output.push_str(&format!("\nSuppression reason: {reason}"));
         }
+        let governance = diagnostic
+            .metadata
+            .iter()
+            .filter(|(key, _)| key.starts_with("suppression."))
+            .map(|(key, value)| format!("{}={value}", key.trim_start_matches("suppression.")))
+            .collect::<Vec<_>>();
+        if !governance.is_empty() {
+            output.push_str(&format!("\nSuppression metadata: {}", governance.join(", ")));
+        }
         output.push('\n');
     }
     if !analysis.failure_policy.has_failures(&analysis.diagnostics) {
@@ -88,6 +97,21 @@ fn json_report(analysis: &Analysis) -> Result<String, serde_json::Error> {
             "failOn": analysis.failure_policy.fail_on_name(),
             "maxWarnings": analysis.failure_policy.max_warnings()
         },
+        "incremental": {
+            "cacheEnabled": analysis.incremental.cache_enabled,
+            "restoredModules": analysis.incremental.restored_modules,
+            "analyzedModules": analysis.incremental.analyzed_modules,
+            "affectedModules": analysis.incremental.affected_modules,
+            "inspectedEdges": analysis.incremental.inspected_edges,
+            "retainedDiagnostics": analysis.incremental.retained_diagnostics,
+            "addedDiagnostics": analysis.incremental.added_diagnostics,
+            "removedDiagnostics": analysis.incremental.removed_diagnostics,
+            "restoredRules": analysis.incremental.restored_rules,
+            "evaluatedRules": analysis.incremental.evaluated_rules,
+            "fullRuleEvaluations": analysis.incremental.full_rule_evaluations,
+            "scopedRuleEvaluations": analysis.incremental.scoped_rule_evaluations,
+            "ruleSnapshotReused": analysis.incremental.rule_snapshot_reused
+        },
         "diagnostics": analysis.diagnostics
     }))
 }
@@ -113,6 +137,21 @@ fn jsonl(analysis: &Analysis) -> Result<String, serde_json::Error> {
         "failurePolicy": {
             "failOn": analysis.failure_policy.fail_on_name(),
             "maxWarnings": analysis.failure_policy.max_warnings()
+        },
+        "incremental": {
+            "cacheEnabled": analysis.incremental.cache_enabled,
+            "restoredModules": analysis.incremental.restored_modules,
+            "analyzedModules": analysis.incremental.analyzed_modules,
+            "affectedModules": analysis.incremental.affected_modules,
+            "inspectedEdges": analysis.incremental.inspected_edges,
+            "retainedDiagnostics": analysis.incremental.retained_diagnostics,
+            "addedDiagnostics": analysis.incremental.added_diagnostics,
+            "removedDiagnostics": analysis.incremental.removed_diagnostics,
+            "restoredRules": analysis.incremental.restored_rules,
+            "evaluatedRules": analysis.incremental.evaluated_rules,
+            "fullRuleEvaluations": analysis.incremental.full_rule_evaluations,
+            "scopedRuleEvaluations": analysis.incremental.scoped_rule_evaluations,
+            "ruleSnapshotReused": analysis.incremental.rule_snapshot_reused
         },
     }))?];
     for diagnostic in &analysis.diagnostics {
@@ -215,13 +254,13 @@ fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {
     let locations = diagnostic.primary_location.as_ref().map(|location| vec![json!({ "physicalLocation": { "artifactLocation": { "uri": location.file }, "region": { "startLine": location.line.max(1), "startColumn": location.column.max(1) } } })]).unwrap_or_default();
     let suppressions = if diagnostic.suppressed {
         vec![json!({
-            "kind": "inSource", "status": "accepted",
+            "kind": if diagnostic.metadata.get("suppression.kind").is_some_and(|kind| kind == "source") { "inSource" } else { "external" }, "status": "accepted",
             "justification": diagnostic.suppression_reason.as_deref().unwrap_or("WAE source suppression")
         })]
     } else {
         Vec::new()
     };
-    json!({ "ruleId": diagnostic.rule_id.0, "level": level, "message": { "text": diagnostic.message }, "partialFingerprints": { "waeViolationId": diagnostic.fingerprint }, "locations": locations, "suppressions": suppressions })
+    json!({ "ruleId": diagnostic.rule_id.0, "level": level, "message": { "text": diagnostic.message }, "partialFingerprints": { "waeViolationId": diagnostic.fingerprint }, "locations": locations, "suppressions": suppressions, "properties": diagnostic.metadata })
 }
 
 fn sarif_level(severity: &Severity) -> &'static str {
@@ -246,6 +285,7 @@ mod tests {
             serde_json::from_str(include_str!("../../../schemas/diagnostics.schema.json")).unwrap();
         assert_eq!(schema["properties"]["schemaVersion"]["const"], 1);
         assert_eq!(schema["properties"]["diagnostics"]["type"], "array");
+        assert_eq!(schema["properties"]["incremental"]["$ref"], "#/$defs/incremental");
     }
     #[test]
     fn empty_json_has_a_versioned_schema() {
@@ -300,5 +340,40 @@ mod tests {
             serde_json::from_str(&json_report(&analysis).unwrap()).unwrap();
         assert_eq!(value["failureCount"], 1);
         assert_eq!(value["diagnostics"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn suppression_governance_metadata_is_consistent_in_every_reporter() {
+        let mut diagnostic = Diagnostic::new("ARCH-003", "approved migration boundary");
+        diagnostic.suppressed = true;
+        diagnostic.suppression_reason = Some("migration ARC-42".into());
+        diagnostic.metadata.insert("suppression.kind".into(), "path".into());
+        diagnostic.metadata.insert("suppression.owner".into(), "frontend-platform".into());
+        diagnostic.metadata.insert("suppression.ticket".into(), "ARC-42".into());
+        diagnostic.metadata.insert("suppression.expiresAt".into(), "2027-01-01".into());
+        diagnostic
+            .metadata
+            .insert("suppression.definedIn".into(), "wae.yaml:suppressions.paths[0]".into());
+        diagnostic.metadata.insert("suppression.matchedCount".into(), "2".into());
+        diagnostic.metadata.insert("suppression.status".into(), "active".into());
+        diagnostic.refresh_fingerprint();
+        let analysis = analysis(vec![diagnostic]);
+
+        let human = human(&analysis);
+        assert!(human.contains("owner=frontend-platform"));
+        assert!(human.contains("ticket=ARC-42"));
+        let json: serde_json::Value =
+            serde_json::from_str(&json_report(&analysis).unwrap()).unwrap();
+        assert_eq!(json["diagnostics"][0]["metadata"]["suppression.owner"], "frontend-platform");
+        let jsonl = jsonl(&analysis).unwrap();
+        let diagnostic_event: serde_json::Value =
+            serde_json::from_str(jsonl.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(diagnostic_event["diagnostic"]["metadata"]["suppression.ticket"], "ARC-42");
+        let sarif: serde_json::Value = serde_json::from_str(&sarif(&analysis).unwrap()).unwrap();
+        assert_eq!(sarif["runs"][0]["results"][0]["suppressions"][0]["kind"], "external");
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["properties"]["suppression.expiresAt"],
+            "2027-01-01"
+        );
     }
 }

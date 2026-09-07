@@ -8,10 +8,12 @@ use std::process::Command;
 
 use serde::Serialize;
 use serde_json::json;
-use wae_config::{CONFIG_FILE, Config, ConfigPreset, FailOn};
+use wae_config::{
+    CONFIG_FILE, Config, ConfigPreset, EditableConfigDocument, FailOn, suppression_provenance,
+};
 use wae_core::domain::{DependencyKind, Diagnostic, ModuleKind};
 use wae_engine::{
-    Analysis, AnalysisError, AnalyzeRequest, AtomicJsonRepository, CancellationToken, ChangeSet,
+    Analysis, AnalysisError, AnalyzeRequest, AtomicFileWriter, CancellationToken, ChangeSet,
     Engine, ImpactAnalyzer, TraceResolutionRequest, VcsPort, trace_resolution,
     validate_project_config,
 };
@@ -73,13 +75,25 @@ pub fn discover(root: &Path, json: bool, write: bool, force: bool) -> CliOutput 
 
 pub fn suppressions_list(root: &Path) -> CliOutput {
     match Config::load(root) {
-        Ok(config) => CliOutput::success(
-            serde_json::to_string_pretty(&json!({
-                "paths": config.suppressions.paths,
-                "fingerprints": config.suppressions.fingerprints,
-            }))
-            .expect("serializable suppression config"),
-        ),
+        Ok(config) => {
+            let path = root.join(CONFIG_FILE);
+            let provenance = if path.exists() {
+                match suppression_provenance(&path) {
+                    Ok(provenance) => provenance,
+                    Err(error) => return CliOutput::project_error(config_error(&error)),
+                }
+            } else {
+                Vec::new()
+            };
+            CliOutput::success(
+                serde_json::to_string_pretty(&json!({
+                    "paths": config.suppressions.paths,
+                    "fingerprints": config.suppressions.fingerprints,
+                    "entries": provenance,
+                }))
+                .expect("serializable suppression config"),
+            )
+        }
         Err(error) => CliOutput::project_error(config_error(&error)),
     }
 }
@@ -103,22 +117,46 @@ pub fn suppressions_validate(root: &Path, cancellation: &CancellationToken) -> C
 }
 
 pub fn suppressions_prune(root: &Path) -> CliOutput {
-    let mut config = match Config::load(root) {
-        Ok(config) => config,
-        Err(error) => return CliOutput::project_error(config_error(&error)),
-    };
-    let removed = config.suppressions.prune_expired(wae_config::current_epoch_day());
     let path = root.join(CONFIG_FILE);
     if !path.exists() {
         return CliOutput::project_error(format!("configuration is missing at {}", path.display()));
     }
-    let yaml = match config.to_yaml() {
-        Ok(yaml) => yaml,
-        Err(error) => return CliOutput::internal_error(config_error(&error)),
+    // Validate the complete extends graph, but edit only entries owned by the leaf document.
+    if let Err(error) = Config::load(root) {
+        return CliOutput::project_error(config_error(&error));
+    }
+    let inherited_expired = match suppression_provenance(&path) {
+        Ok(entries) => entries
+            .iter()
+            .filter(|entry| {
+                entry.inherited
+                    && entry.expires_at.as_deref().is_some_and(|date| {
+                        wae_config::expiration_day(date) <= wae_config::current_epoch_day()
+                    })
+            })
+            .count(),
+        Err(error) => return CliOutput::project_error(config_error(&error)),
     };
-    match AtomicJsonRepository::write_bytes(&path, yaml.as_bytes()) {
+    let mut document = match EditableConfigDocument::load(&path) {
+        Ok(document) => document,
+        Err(error) => return CliOutput::project_error(config_error(&error)),
+    };
+    let result = match document.prune_expired_suppressions(wae_config::current_epoch_day()) {
+        Ok(result) => result,
+        Err(error) => return CliOutput::project_error(config_error(&error)),
+    };
+    if result.removed() == 0 {
+        return CliOutput::success(format!(
+            "No expired suppressions are owned by {}; {inherited_expired} expired inherited entries remain in their defining parent files.",
+            path.display()
+        ));
+    }
+    match AtomicFileWriter::write(&path, document.source().as_bytes()) {
         Ok(()) => CliOutput::success(format!(
-            "Pruned {removed} expired suppression entries; updated {}",
+            "Pruned {} expired local suppression entries ({} path, {} fingerprint); updated {} without flattening inherited configuration. {inherited_expired} expired inherited entries remain in their defining parent files.",
+            result.removed(),
+            result.removed_paths,
+            result.removed_fingerprints,
             path.display()
         )),
         Err(error) => CliOutput::project_error(error),
@@ -279,7 +317,7 @@ fn attach_regression_summary(
 
 fn verbose_analysis(analysis: &Analysis) -> String {
     let mut report = format!(
-        "WAE timing: discovery={}ms classification={}ms parsing={}ms resolution={}ms graph={}ms rules={}ms cache={}ms reporting={}ms orchestration={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} rule-snapshot-reused={} restored-rules={} evaluated-rules={}",
+        "WAE timing: discovery={}ms classification={}ms parsing={}ms resolution={}ms graph={}ms rules={}ms cache={}ms reporting={}ms orchestration={}ms total={}ms\nIncremental: enabled={} restored={} analyzed={} affected-modules={} inspected-edges={} retained-diagnostics={} added-diagnostics={} removed-diagnostics={} rule-snapshot-reused={} restored-rules={} evaluated-rules={} full-rule-evaluations={} scoped-rule-evaluations={}",
         analysis.timings.discovery_ms,
         analysis.timings.classification_ms,
         analysis.timings.parsing_ms,
@@ -293,9 +331,16 @@ fn verbose_analysis(analysis: &Analysis) -> String {
         analysis.incremental.cache_enabled,
         analysis.incremental.restored_modules,
         analysis.incremental.analyzed_modules,
+        analysis.incremental.affected_modules,
+        analysis.incremental.inspected_edges,
+        analysis.incremental.retained_diagnostics,
+        analysis.incremental.added_diagnostics,
+        analysis.incremental.removed_diagnostics,
         analysis.incremental.rule_snapshot_reused,
         analysis.incremental.restored_rules,
         analysis.incremental.evaluated_rules,
+        analysis.incremental.full_rule_evaluations,
+        analysis.incremental.scoped_rule_evaluations,
     );
     if !analysis.timings.rules.is_empty() {
         report.push_str("\nRule profile:");

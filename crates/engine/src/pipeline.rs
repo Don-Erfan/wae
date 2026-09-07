@@ -265,18 +265,22 @@ fn execute<P: ParserAdapter>(
     let DiscoveredWorkspace { root, config, files, analysis_inputs } = discovered;
     let architecture = CompiledArchitectureModel::compile(&config)?;
     let framework_registry = FrameworkRegistry::default();
-    let framework_evidence = framework_project_evidence(&root)?;
-    let framework_adapter = framework_registry.select(
-        &framework_evidence,
-        &config.framework.enabled,
-        config.framework.auto_detect,
-    );
     let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
     let workspace_resolver =
         WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
     let package_scopes =
         PackageScopeIndex::from_importers(&root, &files).map_err(AnalysisError::Project)?;
     let workspace_packages = workspace_resolver.packages().to_vec();
+    let framework_contexts = FrameworkContextIndex::discover(
+        &root,
+        workspace_packages.iter().map(|package| package.root.clone()),
+    )?;
+    let framework_classification = FrameworkClassificationContext {
+        registry: &framework_registry,
+        contexts: &framework_contexts,
+        enabled: &config.framework.enabled,
+        auto_detect: config.framework.auto_detect,
+    };
     let declared_package_dependencies = workspace_packages
         .iter()
         .map(|package| {
@@ -315,6 +319,16 @@ fn execute<P: ParserAdapter>(
     };
     let mut incremental =
         IncrementalStats { cache_enabled: cache.enabled(), environment_hash, ..Default::default() };
+    let stale_modules = cache.stale_modules().cloned().collect::<Vec<_>>();
+    let mut affected_modules = stale_modules.iter().cloned().map(ModuleId).collect::<HashSet<_>>();
+    for stale in &stale_modules {
+        if let Some(previous) = cache.previous_module(stale) {
+            for dependency in previous.dependencies {
+                affected_modules.insert(dependency.from);
+                affected_modules.insert(dependency.to);
+            }
+        }
+    }
     let mut suppressions = Vec::new();
     telemetry.discovery = discovery_started.elapsed().saturating_sub(telemetry.cache);
 
@@ -351,6 +365,17 @@ fn execute<P: ParserAdapter>(
 
     project.packages = discovered_packages.into_values().collect();
     project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
+    let source_module_positions = project
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, module)| (module.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let package_roots = project
+        .packages
+        .iter()
+        .map(|package| (package.name.clone(), relative_resolved_path(&root, &package.root_path)))
+        .collect::<HashMap<_, _>>();
     let mut project_index = ProjectIndex::from_project(&project);
 
     for file_batch in files.chunks(PREPARATION_BATCH_SIZE) {
@@ -388,6 +413,15 @@ fn execute<P: ParserAdapter>(
                 &mut project.diagnostics,
             );
             let cached = cache.get(&module_id.0, source_hash, environment_hash);
+            if cached.is_none() {
+                affected_modules.insert(module_id.clone());
+                if let Some(previous) = cache.previous_module(&module_id.0) {
+                    for dependency in previous.dependencies {
+                        affected_modules.insert(dependency.from);
+                        affected_modules.insert(dependency.to);
+                    }
+                }
+            }
             prepared_modules.push(PreparedModule {
                 path: path.clone(),
                 module_path: ModulePath(normalize(path)),
@@ -433,8 +467,9 @@ fn execute<P: ParserAdapter>(
                     apply_framework_classification(
                         &mut project,
                         &module_id,
-                        &root,
-                        framework_adapter,
+                        &source_module_positions,
+                        &package_roots,
+                        &framework_classification,
                         &cached.semantics,
                     );
                 });
@@ -443,7 +478,7 @@ fn execute<P: ParserAdapter>(
                     &root,
                     &workspace_packages,
                     &default_package,
-                    framework_adapter,
+                    &framework_classification,
                     &architecture,
                     &mut project,
                     &mut project_index,
@@ -467,8 +502,9 @@ fn execute<P: ParserAdapter>(
                         apply_framework_classification(
                             &mut project,
                             &module_id,
-                            &root,
-                            framework_adapter,
+                            &source_module_positions,
+                            &package_roots,
+                            &framework_classification,
                             &parsed.semantics,
                         );
                     });
@@ -527,13 +563,20 @@ fn execute<P: ParserAdapter>(
                                     let classification = PipelineTelemetry::measure(
                                         &mut telemetry.classification,
                                         || {
-                                            framework_adapter.map(|adapter| {
-                                                adapter.classify(ModuleEvidence {
-                                                    path: &target_id.0,
-                                                    package_root: &package_root,
-                                                    semantics: &semantics,
+                                            framework_contexts
+                                                .adapter_for(
+                                                    &framework_registry,
+                                                    &package_root,
+                                                    &config.framework.enabled,
+                                                    config.framework.auto_detect,
+                                                )
+                                                .map(|adapter| {
+                                                    adapter.classify(ModuleEvidence {
+                                                        path: &target_id.0,
+                                                        package_root: &package_root,
+                                                        semantics: &semantics,
+                                                    })
                                                 })
-                                            })
                                         },
                                     );
                                     project.modules.push(Module {
@@ -691,8 +734,9 @@ fn execute<P: ParserAdapter>(
                         apply_framework_classification(
                             &mut project,
                             &module_id,
-                            &root,
-                            framework_adapter,
+                            &source_module_positions,
+                            &package_roots,
+                            &framework_classification,
                             &ModuleSemantics::default(),
                         );
                     });
@@ -727,6 +771,11 @@ fn execute<P: ParserAdapter>(
     project.packages.sort_by(|a, b| a.name.0.cmp(&b.name.0));
     project.modules.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     project.dependencies.sort_by(|a, b| (&a.from.0, &a.to.0).cmp(&(&b.from.0, &b.to.0)));
+    affected_modules = incremental::edge_affected_region(affected_modules, &project.dependencies);
+    let affected_rule_inputs =
+        incremental::AffectedRuleInputs::from_project(&project, &affected_modules);
+    incremental.affected_modules = affected_modules.len();
+    incremental.inspected_edges = affected_rule_inputs.dependencies.len();
     if cancellation.is_cancelled() {
         return Err(AnalysisError::Cancelled);
     }
@@ -741,6 +790,11 @@ fn execute<P: ParserAdapter>(
     let rule_policies = PipelineTelemetry::measure(&mut telemetry.rule_evaluation, || {
         CompiledRulePolicies::compile(&config).map_err(AnalysisError::Internal)
     })?;
+    let module_packages = project
+        .modules
+        .iter()
+        .map(|module| (module.id.clone(), module.package.clone()))
+        .collect::<HashMap<_, _>>();
     let context = RuleContext {
         project: &project,
         graph: &graph,
@@ -751,8 +805,14 @@ fn execute<P: ParserAdapter>(
         ownership: &ownership,
         module_features: &features,
         module_feature_roots: &feature_roots,
+        module_packages: &module_packages,
         policies: &rule_policies,
         declared_package_dependencies: &declared_package_dependencies,
+        affected_modules: None,
+        affected_packages: None,
+        affected_module_records: None,
+        affected_dependencies: None,
+        affected_resolved_dependencies: None,
     };
     let mut diagnostics = project.diagnostics.clone();
     let rule_input_hashes = analysis_rule_hashes(&project, environment_hash);
@@ -760,7 +820,10 @@ fn execute<P: ParserAdapter>(
         &mut telemetry.rule_evaluation,
         || -> Result<_, AnalysisError> {
             let mut diagnostics = Vec::new();
-            let mut missing = HashSet::new();
+            let mut full_missing = HashSet::new();
+            let mut incremental_missing = HashSet::new();
+            let mut retained_by_rule = HashMap::<String, Vec<Diagnostic>>::new();
+            let mut replaced_by_rule = HashMap::<String, Vec<Diagnostic>>::new();
             let enabled_rule_ids = engine.rules.enabled_rule_ids(&context);
 
             for rule_id in enabled_rule_ids {
@@ -773,25 +836,63 @@ fn execute<P: ParserAdapter>(
                 if let Some(cached) = cache.rule_partition(rule_id, input_hash) {
                     incremental.restored_rules += 1;
                     diagnostics.extend(cached);
+                } else if descriptor.scope() == RuleScope::Edge && !affected_modules.is_empty() {
+                    if let Some(previous) = cache.previous_rule_partition(rule_id) {
+                        let (replaced, retained): (Vec<_>, Vec<_>) =
+                            previous.into_iter().partition(|diagnostic| {
+                                incremental::diagnostic_touches_region(
+                                    diagnostic,
+                                    &affected_modules,
+                                    &project,
+                                )
+                            });
+                        incremental.retained_diagnostics += retained.len();
+                        diagnostics.extend(retained.iter().cloned());
+                        retained_by_rule.insert(rule_id.to_owned(), retained);
+                        replaced_by_rule.insert(rule_id.to_owned(), replaced);
+                        incremental_missing.insert(rule_id.to_owned());
+                    } else {
+                        full_missing.insert(rule_id.to_owned());
+                    }
                 } else {
-                    missing.insert(rule_id.to_owned());
+                    full_missing.insert(rule_id.to_owned());
                 }
             }
 
-            incremental.evaluated_rules = missing.len();
-            incremental.rule_snapshot_reused = missing.is_empty();
-            let evaluation = engine
+            incremental.full_rule_evaluations = full_missing.len();
+            incremental.scoped_rule_evaluations = incremental_missing.len();
+            incremental.evaluated_rules =
+                incremental.full_rule_evaluations + incremental.scoped_rule_evaluations;
+            incremental.rule_snapshot_reused = incremental.evaluated_rules == 0;
+            let full_evaluation = engine
                 .rules
-                .evaluate_profiled_rules(&context, &missing)
+                .evaluate_profiled_rules(&context, &full_missing)
                 .map_err(AnalysisError::Internal)?;
-            let mut evaluated_by_rule = evaluation.diagnostics.into_iter().fold(
-                HashMap::<String, Vec<Diagnostic>>::new(),
-                |mut grouped, diagnostic| {
+            let scoped_context = RuleContext {
+                affected_modules: Some(&affected_modules),
+                affected_packages: Some(&affected_rule_inputs.packages),
+                affected_module_records: Some(&affected_rule_inputs.modules),
+                affected_dependencies: Some(&affected_rule_inputs.dependencies),
+                affected_resolved_dependencies: Some(&affected_rule_inputs.resolved_dependencies),
+                ..context
+            };
+            let scoped_evaluation = engine
+                .rules
+                .evaluate_profiled_rules(&scoped_context, &incremental_missing)
+                .map_err(AnalysisError::Internal)?;
+            let mut profiles = full_evaluation.profiles;
+            profiles.extend(scoped_evaluation.profiles);
+            profiles.sort_by_key(|profile| profile.rule_id);
+            let mut evaluated_by_rule = full_evaluation
+                .diagnostics
+                .into_iter()
+                .chain(scoped_evaluation.diagnostics)
+                .fold(HashMap::<String, Vec<Diagnostic>>::new(), |mut grouped, diagnostic| {
                     grouped.entry(diagnostic.rule_id.0.clone()).or_default().push(diagnostic);
                     grouped
-                },
-            );
-            let mut missing = missing.into_iter().collect::<Vec<_>>();
+                });
+            let mut missing =
+                full_missing.into_iter().chain(incremental_missing).collect::<Vec<_>>();
             missing.sort();
             for rule_id in missing {
                 let descriptor = rule_registry::descriptor(&rule_id).ok_or_else(|| {
@@ -800,12 +901,26 @@ fn execute<P: ParserAdapter>(
                     ))
                 })?;
                 let input_hash = rule_input_hashes.for_scope(descriptor.scope());
-                let rule_diagnostics = evaluated_by_rule.remove(&rule_id).unwrap_or_default();
-                cache.set_rule_partition(rule_id, input_hash, rule_diagnostics.clone());
-                diagnostics.extend(rule_diagnostics);
+                let new_diagnostics = evaluated_by_rule.remove(&rule_id).unwrap_or_default();
+                if let Some(previous) = replaced_by_rule.remove(&rule_id) {
+                    let previous = previous
+                        .iter()
+                        .map(|diagnostic| diagnostic.fingerprint.as_str())
+                        .collect::<HashSet<_>>();
+                    let current = new_diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.fingerprint.as_str())
+                        .collect::<HashSet<_>>();
+                    incremental.added_diagnostics += current.difference(&previous).count();
+                    incremental.removed_diagnostics += previous.difference(&current).count();
+                }
+                let mut complete = retained_by_rule.remove(&rule_id).unwrap_or_default();
+                complete.extend(new_diagnostics.iter().cloned());
+                cache.set_rule_partition(rule_id, input_hash, complete);
+                diagnostics.extend(new_diagnostics);
             }
             debug_assert!(evaluated_by_rule.is_empty());
-            Ok((diagnostics, evaluation.profiles))
+            Ok((diagnostics, profiles))
         },
     )?;
     if cancellation.is_cancelled() {

@@ -91,6 +91,7 @@ fn ten_thousand_universal_modules_keep_cold_analysis_near_linear() {
     }
     let analysis = analysis.unwrap();
     let elapsed = median(&mut cold_samples);
+    let cold_p95 = percentile_95(&cold_samples);
     let budget = duration_env("WAE_ENGINE_10K_BUDGET_MS", 3_000);
     assert_eq!(analysis.project.modules.len(), MODULES);
     assert_eq!(analysis.incremental.analyzed_modules, MODULES);
@@ -110,6 +111,7 @@ fn ten_thousand_universal_modules_keep_cold_analysis_near_linear() {
     }
     let warm = warm.unwrap();
     let warm_elapsed = median(&mut warm_samples);
+    let warm_p95 = percentile_95(&warm_samples);
     assert_eq!(warm.incremental.restored_modules, MODULES);
     assert!(warm.incremental.rule_snapshot_reused);
     let session = WorkspaceSession::new(&root);
@@ -126,60 +128,92 @@ fn ten_thousand_universal_modules_keep_cold_analysis_near_linear() {
     }
     let syntax_edited = syntax_edited.unwrap();
     let syntax_edit_elapsed = median(&mut syntax_edit_samples);
+    let syntax_edit_p95 = percentile_95(&syntax_edit_samples);
     assert_eq!(syntax_edited.incremental.analyzed_modules, 1);
     assert_eq!(syntax_edited.incremental.restored_modules, MODULES - 1);
     assert!(syntax_edited.incremental.rule_snapshot_reused);
 
     let edge_session = WorkspaceSession::new(&root);
     edge_session.analyze(&edge_session.begin_analysis(), &BTreeMap::new()).unwrap();
-    let edge_started = Instant::now();
-    let edge_edited = edge_session
-        .analyze_changes(
-            &edge_session.begin_analysis(),
-            &BTreeMap::from([(
-                "src/generated/m0.ts".into(),
-                "import './m2.ts'; export const value0 = 0;".into(),
-            )]),
-            false,
-        )
-        .unwrap();
-    let edge_edit_elapsed = edge_started.elapsed();
+    let mut edge_edit_samples = Vec::new();
+    let mut edge_edited = None;
+    for revision in 0..5 {
+        let target = revision % 2 + 2;
+        let started = Instant::now();
+        let result = edge_session
+            .analyze_changes(
+                &edge_session.begin_analysis(),
+                &BTreeMap::from([(
+                    "src/generated/m0.ts".into(),
+                    format!("import './m{target}.ts'; export const value0 = {revision};"),
+                )]),
+                false,
+            )
+            .unwrap();
+        edge_edit_samples.push(started.elapsed());
+        edge_edited = Some(result);
+    }
+    let edge_edited = edge_edited.unwrap();
+    let edge_edit_elapsed = median(&mut edge_edit_samples);
+    let edge_edit_p95 = percentile_95(&edge_edit_samples);
     assert_eq!(edge_edited.incremental.analyzed_modules, 1);
     assert!(!edge_edited.incremental.rule_snapshot_reused);
+    assert!(edge_edited.incremental.affected_modules < MODULES / 100);
+    assert!(edge_edited.incremental.inspected_edges < MODULES / 100);
+    assert!(edge_edited.incremental.scoped_rule_evaluations > 0);
 
     let global_session = WorkspaceSession::new(&root);
     global_session.analyze(&global_session.begin_analysis(), &BTreeMap::new()).unwrap();
-    let global_started = Instant::now();
-    let global_edited = global_session
-        .analyze_changes(
-            &global_session.begin_analysis(),
-            &BTreeMap::from([(
-                "src/generated/m9999.ts".into(),
-                "import './m0.ts'; export const value9999 = 9999;".into(),
-            )]),
-            false,
-        )
-        .unwrap();
-    let global_edit_elapsed = global_started.elapsed();
+    let mut global_edit_samples = Vec::new();
+    let mut global_edited = None;
+    for revision in 0..5 {
+        let source = if revision % 2 == 0 {
+            format!("import './m0.ts'; export const value9999 = {};", 9_999 + revision)
+        } else {
+            format!("export const value9999 = {};", 9_999 + revision)
+        };
+        let started = Instant::now();
+        let result = global_session
+            .analyze_changes(
+                &global_session.begin_analysis(),
+                &BTreeMap::from([("src/generated/m9999.ts".into(), source)]),
+                false,
+            )
+            .unwrap();
+        global_edit_samples.push(started.elapsed());
+        global_edited = Some(result);
+    }
+    let global_edited = global_edited.unwrap();
+    let global_edit_elapsed = median(&mut global_edit_samples);
+    let global_edit_p95 = percentile_95(&global_edit_samples);
     assert_eq!(global_edited.incremental.analyzed_modules, 1);
     assert!(global_edited.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "ARCH-001"));
     let peak_rss = peak_rss_kb();
     eprintln!(
-        "WAE_ENGINE_10K cold_median_ms={} warm_median_ms={} syntax_edit_median_ms={} edge_edit_ms={} global_edit_ms={} cold_samples_ms={:?} warm_samples_ms={:?} syntax_edit_samples_ms={:?} peak_rss_kb={:?} cold_timings={:?} warm_timings={:?} syntax_edit_timings={:?} edge_edit_timings={:?} global_edit_timings={:?}",
+        "WAE_ENGINE_10K cold_median_ms={} cold_p95_ms={} warm_median_ms={} warm_p95_ms={} syntax_edit_median_ms={} syntax_edit_p95_ms={} edge_edit_median_ms={} edge_edit_p95_ms={} global_edit_median_ms={} global_edit_p95_ms={} cold_samples_ms={:?} warm_samples_ms={:?} syntax_edit_samples_ms={:?} edge_edit_samples_ms={:?} global_edit_samples_ms={:?} peak_rss_kb={:?} cold_timings={:?} warm_timings={:?} syntax_edit_timings={:?} edge_edit_timings={:?} edge_edit_incremental={:?} global_edit_timings={:?} global_edit_incremental={:?}",
         elapsed.as_millis(),
+        cold_p95.as_millis(),
         warm_elapsed.as_millis(),
+        warm_p95.as_millis(),
         syntax_edit_elapsed.as_millis(),
+        syntax_edit_p95.as_millis(),
         edge_edit_elapsed.as_millis(),
+        edge_edit_p95.as_millis(),
         global_edit_elapsed.as_millis(),
+        global_edit_p95.as_millis(),
         milliseconds(&cold_samples),
         milliseconds(&warm_samples),
         milliseconds(&syntax_edit_samples),
+        milliseconds(&edge_edit_samples),
+        milliseconds(&global_edit_samples),
         peak_rss,
         analysis.timings,
         warm.timings,
         syntax_edited.timings,
         edge_edited.timings,
+        edge_edited.incremental,
         global_edited.timings,
+        global_edited.incremental,
     );
     let warm_budget = duration_env("WAE_ENGINE_10K_WARM_BUDGET_MS", 650);
     let edit_budget = duration_env("WAE_ENGINE_10K_EDIT_BUDGET_MS", 750);
@@ -303,7 +337,10 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
     let edge_edit_elapsed = edge_started.elapsed();
     assert_eq!(edge_edit.incremental.analyzed_modules, 1);
     assert!(!edge_edit.incremental.rule_snapshot_reused);
+    assert!(edge_edit.incremental.affected_modules < modules / 100);
+    assert!(edge_edit.incremental.inspected_edges < modules / 100);
     let edge_edit_timings = edge_edit.timings.clone();
+    let edge_edit_incremental = edge_edit.incremental.clone();
     drop(edge_edit);
     drop(edge_session);
 
@@ -324,6 +361,7 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
     assert_eq!(global_edit.incremental.analyzed_modules, 1);
     assert!(global_edit.diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "ARCH-001"));
     let global_edit_timings = global_edit.timings.clone();
+    let global_edit_incremental = global_edit.incremental.clone();
     drop(global_edit);
     drop(global_session);
     let cold_budget = duration_env("WAE_ENGINE_LARGE_COLD_BUDGET_MS", 30_000);
@@ -350,7 +388,7 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
         assert!(peak_rss <= rss_budget_kb, "large analysis used {peak_rss} KiB peak RSS");
     }
     eprintln!(
-        "WAE_ENGINE_LARGE modules={modules} cold_ms={} warm_ms={} syntax_edit_ms={} edge_edit_ms={} global_edit_ms={} peak_rss_kb={peak_rss:?} cold_timings={:?} warm_timings={:?} syntax_edit_timings={:?} edge_edit_timings={:?} global_edit_timings={:?}",
+        "WAE_ENGINE_LARGE modules={modules} cold_ms={} warm_ms={} syntax_edit_ms={} edge_edit_ms={} global_edit_ms={} peak_rss_kb={peak_rss:?} cold_timings={:?} warm_timings={:?} syntax_edit_timings={:?} edge_edit_timings={:?} edge_edit_incremental={:?} global_edit_timings={:?} global_edit_incremental={:?}",
         cold_elapsed.as_millis(),
         warm_elapsed.as_millis(),
         syntax_edit_elapsed.as_millis(),
@@ -360,7 +398,9 @@ fn large_full_engine_cold_warm_and_edit_are_bounded() {
         warm_timings,
         syntax_edit_timings,
         edge_edit_timings,
+        edge_edit_incremental,
         global_edit_timings,
+        global_edit_incremental,
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -386,6 +426,10 @@ fn release_baseline(key: &str, override_name: &str, default_ms: u64) -> Duration
 fn median(samples: &mut [Duration]) -> Duration {
     samples.sort_unstable();
     samples[samples.len() / 2]
+}
+
+fn percentile_95(sorted_samples: &[Duration]) -> Duration {
+    sorted_samples[sorted_samples.len().saturating_mul(95).div_ceil(100).saturating_sub(1)]
 }
 
 fn milliseconds(samples: &[Duration]) -> Vec<u128> {

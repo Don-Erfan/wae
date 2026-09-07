@@ -97,6 +97,27 @@ pub(crate) fn apply(
             directive.matched_count += 1;
             diagnostic.suppressed = true;
             diagnostic.suppression_reason = Some(directive.reason.clone());
+            diagnostic.metadata.insert("suppression.kind".into(), "source".into());
+            diagnostic.metadata.insert("suppression.status".into(), "active".into());
+            diagnostic.metadata.insert(
+                "suppression.definedIn".into(),
+                format!("{}:{}", directive.file, directive.line),
+            );
+        }
+    }
+    let matched_by_location = directives
+        .iter()
+        .map(|directive| {
+            (format!("{}:{}", directive.file, directive.line), directive.matched_count.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+    for diagnostic in diagnostics.iter_mut().filter(|diagnostic| diagnostic.suppressed) {
+        if let Some(count) = diagnostic
+            .metadata
+            .get("suppression.definedIn")
+            .and_then(|location| matched_by_location.get(location))
+        {
+            diagnostic.metadata.insert("suppression.matchedCount".into(), count.clone());
         }
     }
     if report_unused {
@@ -159,6 +180,15 @@ pub(crate) fn apply_config(diagnostics: &mut Vec<Diagnostic>, config: &Suppressi
             fingerprint_matches[index] += 1;
             diagnostic.suppressed = true;
             diagnostic.suppression_reason = Some(entry.reason.clone());
+            annotate_config_suppression(
+                diagnostic,
+                "fingerprint",
+                index,
+                entry.owner.as_deref(),
+                entry.ticket.as_deref(),
+                entry.expires_at.as_deref(),
+            );
+            annotate_provenance(diagnostic, entry.defined_in.as_deref(), entry.inherited);
             continue;
         }
         let files = diagnostic
@@ -174,21 +204,61 @@ pub(crate) fn apply_config(diagnostics: &mut Vec<Diagnostic>, config: &Suppressi
             path_matches[*index] += 1;
             diagnostic.suppressed = true;
             diagnostic.suppression_reason = Some(entry.reason.clone());
+            annotate_config_suppression(
+                diagnostic,
+                "path",
+                *index,
+                entry.owner.as_deref(),
+                entry.ticket.as_deref(),
+                entry.expires_at.as_deref(),
+            );
+            annotate_provenance(diagnostic, entry.defined_in.as_deref(), entry.inherited);
         }
+    }
+    for diagnostic in diagnostics.iter_mut().filter(|diagnostic| diagnostic.suppressed) {
+        let Some(kind) = diagnostic.metadata.get("suppression.kind").cloned() else { continue };
+        let Some(index) = diagnostic
+            .metadata
+            .get("suppression.index")
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let count = match kind.as_str() {
+            "path" => path_matches.get(index),
+            "fingerprint" => fingerprint_matches.get(index),
+            _ => None,
+        };
+        if let Some(count) = count {
+            diagnostic.metadata.insert("suppression.matchedCount".into(), count.to_string());
+        }
+        diagnostic.metadata.remove("suppression.index");
     }
     if config.report_unused {
         for (index, entry) in config.paths.iter().enumerate() {
             if expired_paths[index] || path_matches[index] == 0 {
-                diagnostics.push(warning(
+                let mut diagnostic = warning(
                     "wae.yaml",
                     1,
                     suppression_status("path", &entry.pattern, expired_paths[index]),
-                ));
+                );
+                annotate_status(
+                    &mut diagnostic,
+                    "path",
+                    index,
+                    entry.owner.as_deref(),
+                    entry.ticket.as_deref(),
+                    entry.expires_at.as_deref(),
+                    path_matches[index],
+                    expired_paths[index],
+                );
+                annotate_provenance(&mut diagnostic, entry.defined_in.as_deref(), entry.inherited);
+                diagnostics.push(diagnostic);
             }
         }
         for (index, entry) in config.fingerprints.iter().enumerate() {
             if expired_fingerprints[index] || fingerprint_matches[index] == 0 {
-                diagnostics.push(warning(
+                let mut diagnostic = warning(
                     "wae.yaml",
                     1,
                     suppression_status(
@@ -196,10 +266,77 @@ pub(crate) fn apply_config(diagnostics: &mut Vec<Diagnostic>, config: &Suppressi
                         &entry.fingerprint,
                         expired_fingerprints[index],
                     ),
-                ));
+                );
+                annotate_status(
+                    &mut diagnostic,
+                    "fingerprint",
+                    index,
+                    entry.owner.as_deref(),
+                    entry.ticket.as_deref(),
+                    entry.expires_at.as_deref(),
+                    fingerprint_matches[index],
+                    expired_fingerprints[index],
+                );
+                annotate_provenance(&mut diagnostic, entry.defined_in.as_deref(), entry.inherited);
+                diagnostics.push(diagnostic);
             }
         }
     }
+}
+
+fn annotate_config_suppression(
+    diagnostic: &mut Diagnostic,
+    kind: &str,
+    index: usize,
+    owner: Option<&str>,
+    ticket: Option<&str>,
+    expires_at: Option<&str>,
+) {
+    diagnostic.metadata.insert("suppression.kind".into(), kind.into());
+    diagnostic.metadata.insert("suppression.status".into(), "active".into());
+    diagnostic.metadata.insert("suppression.index".into(), index.to_string());
+    diagnostic
+        .metadata
+        .insert("suppression.definedIn".into(), format!("wae.yaml:suppressions.{kind}s[{index}]"));
+    insert_optional(&mut diagnostic.metadata, "suppression.owner", owner);
+    insert_optional(&mut diagnostic.metadata, "suppression.ticket", ticket);
+    insert_optional(&mut diagnostic.metadata, "suppression.expiresAt", expires_at);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn annotate_status(
+    diagnostic: &mut Diagnostic,
+    kind: &str,
+    index: usize,
+    owner: Option<&str>,
+    ticket: Option<&str>,
+    expires_at: Option<&str>,
+    matched_count: usize,
+    expired: bool,
+) {
+    annotate_config_suppression(diagnostic, kind, index, owner, ticket, expires_at);
+    diagnostic.metadata.remove("suppression.index");
+    diagnostic
+        .metadata
+        .insert("suppression.status".into(), if expired { "expired" } else { "unused" }.into());
+    diagnostic.metadata.insert("suppression.matchedCount".into(), matched_count.to_string());
+}
+
+fn insert_optional(
+    metadata: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        metadata.insert(key.into(), value.into());
+    }
+}
+
+fn annotate_provenance(diagnostic: &mut Diagnostic, defined_in: Option<&str>, inherited: bool) {
+    if let Some(defined_in) = defined_in {
+        diagnostic.metadata.insert("suppression.definedIn".into(), defined_in.into());
+    }
+    diagnostic.metadata.insert("suppression.inherited".into(), inherited.to_string());
 }
 
 fn suppression_status(kind: &str, identity: &str, expired: bool) -> String {
@@ -258,6 +395,9 @@ mod tests {
         let mut diagnostics = vec![diagnostic("ARCH-003", 2), diagnostic("ARCH-003", 2)];
         apply(&mut diagnostics, &mut directives, true);
         assert!(diagnostics.iter().all(|diagnostic| diagnostic.suppressed));
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.metadata.get("suppression.matchedCount").map(String::as_str) == Some("2")
+        }));
         assert_eq!(directives[0].matched_count, 2);
         assert!(!diagnostics.iter().any(|diagnostic| diagnostic.rule_id.0 == "SUPPRESS-001"));
     }
@@ -315,6 +455,7 @@ mod tests {
                 owner: Some("frontend-platform".into()),
                 ticket: Some("ARC-199".into()),
                 expires_at: None,
+                ..Default::default()
             }],
             fingerprints: vec![wae_config::FingerprintSuppression {
                 fingerprint: "expired".into(),
@@ -334,5 +475,13 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.message.contains("Expired config fingerprint suppression")
         }));
+        let unused = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("Unused config path suppression"))
+            .unwrap();
+        assert_eq!(unused.metadata["suppression.owner"], "frontend-platform");
+        assert_eq!(unused.metadata["suppression.ticket"], "ARC-199");
+        assert_eq!(unused.metadata["suppression.status"], "unused");
+        assert_eq!(unused.metadata["suppression.matchedCount"], "0");
     }
 }

@@ -11,7 +11,8 @@ identities and are parsed or registry-synchronized in the Rust test suite.
 
 `wae-mcp` is a stdio JSON-RPC server implementing MCP protocol version `2025-06-18`. It exposes:
 
-- `architecture_check`: versioned diagnostics and analysis timings;
+- `architecture_check`: versioned diagnostics, incremental counters, analysis timings and bounded
+  session metrics;
 - `architecture_explain`: stable rule metadata;
 - `dependency_path`: the deterministic shortest path between two resolved modules;
 - `architecture_model`: modules, packages, layers, runtimes, framework metadata, edges and
@@ -36,8 +37,12 @@ The server is confined to its startup directory by default. Add another trusted 
 `--allow-root /absolute/path`, or use the intentionally explicit `--allow-any-root` only in an
 already sandboxed environment. Canonicalization prevents `..` and symlink escapes.
 Requests are limited to 1 MiB by default; local deployments can lower the bounded stdio quota with
-`--max-request-bytes N`. WAE intentionally exposes no network transport, so authentication belongs
-to an explicitly configured remote proxy rather than being silently omitted from a public socket.
+`--max-request-bytes N`. Long-lived servers retain at most 16 workspace snapshots and evict the
+least-recently-used or 30-minute-idle entries. Deployments can tune these bounds with
+`--max-sessions N` and `--session-ttl-seconds N`; `architecture_check` and
+`McpServer::session_metrics` expose active, capacity and cumulative eviction counts. WAE
+intentionally exposes no network transport, so authentication belongs to an explicitly configured
+remote proxy rather than being silently omitted from a public socket.
 
 Tool execution failures are returned as MCP tool results with `isError: true`; malformed or unknown
 JSON-RPC methods use protocol errors. The server writes only protocol messages to stdout.
@@ -73,9 +78,9 @@ steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.28
+  - uses: Don-Erfan/wae@v0.0.29
     with:
-      version: 0.0.28
+      version: 0.0.29
       changed: "true"
       base: origin/main
       format: sarif

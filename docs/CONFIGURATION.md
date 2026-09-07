@@ -155,7 +155,9 @@ specifiers are all marked `type`. Mixed clauses remain runtime `Static`/`ReExpor
 
 Static template specifiers such as ``import(`./worker`)`` and asset/worker references in
 `new URL('./worker.ts', import.meta.url)` are dependency edges. Templates containing substitutions
-remain intentionally unresolved dynamic expressions. AST traversal is iterative so deeply nested
+remain intentionally unresolved dynamic expressions. Static string and no-substitution template
+specifiers are cooked with ECMAScript escape semantics, including hex/Unicode escapes and line
+continuations, before resolution. AST traversal is iterative so deeply nested
 or minified valid files do not consume the Rust call stack.
 
 Absolute module specifiers are rejected because they escape the project analysis boundary.
@@ -163,10 +165,12 @@ Duplicate workspace package names are configuration errors.
 
 ## Framework adapters
 
-`framework.auto_detect` is enabled by default. Next.js is selected only when `next` appears in a
-root dependency section or a `next.config.js|mjs|cjs|ts` file exists; directory names alone are not
-authoritative evidence. To disable all adapters use `auto_detect: false` with an empty `enabled`
-list. To force the adapter for a nonstandard project use:
+`framework.auto_detect` is enabled by default. Detection is indexed independently for the workspace
+root and every declared package. Next.js is selected for a module only when `next` appears in that
+package's dependency section or a package-local `next.config.js|mjs|cjs|ts` file exists; directory
+names alone are not authoritative evidence. Explicit `enabled` adapters are workspace-wide
+fallbacks. To disable all adapters use `auto_detect: false` with an empty `enabled` list. To force
+the adapter for a nonstandard project use:
 
 ```yaml
 framework:
@@ -211,8 +215,15 @@ primary source line is only representational. Every form is validated and carrie
 reason.
 
 Suppressed diagnostics stay visible in human, JSON, JSONL, and SARIF output, but do not fail the
-check. SARIF records them as accepted in-source suppressions. Missing reasons, unknown rule IDs,
+check. Their governance metadata includes kind, status, definition, match count and any configured
+owner, ticket and expiry. SARIF distinguishes source directives from external config policy.
+Missing reasons, unknown rule IDs,
 and unused directives produce `SUPPRESS-001` warnings when the corresponding options are enabled.
+
+`wae suppressions prune` validates the resolved inheritance graph but edits only expired entries
+owned by the leaf `wae.yaml`. It preserves comments, key order, omitted defaults and `extends`, and
+does not rewrite the file on a no-op. Inherited entries must be pruned in their defining parent;
+the command never silently flattens or copies them into the child.
 
 ## Baselines
 

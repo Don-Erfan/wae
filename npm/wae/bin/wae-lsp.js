@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { resolveBinary } = require("./platform-binary.js");
 
-const binaryPath = path.join(__dirname, os.platform() === "win32" ? "wae-lsp.exe" : "wae-lsp");
-if (!fs.existsSync(binaryPath)) {
-  console.error("WAE language server was not found. Reinstall without --ignore-scripts or rebuild @don-erfan/wae.");
+let binaryPath;
+try {
+  binaryPath = resolveBinary("wae-lsp");
+} catch (error) {
+  console.error(error.message);
   process.exit(1);
 }
 const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });

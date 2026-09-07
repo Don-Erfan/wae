@@ -24,16 +24,21 @@ checks both tight absolute budgets and relative envelopes against the checked-in
 baseline in `performance/baselines/`. A 50,000-module full-engine gate runs on every change; a
 scheduled/manual workflow records the equivalent 100,000-module cold, warm, edit and peak-RSS
 contract. Artifacts retain raw sample arrays, phase timings, RSS, commit SHA, run URL, runner
-image/CPU, Rust version, job conclusion and edit-profile names.
+image/CPU, Rust version, job conclusion and edit-profile names. The 10k gate records five samples
+and both median/p95 for cold, warm, syntax, edge-local and global-cycle profiles.
 
 `wae check --verbose` includes a per-rule profile (nanoseconds and emitted diagnostic count), so
 slow rules can be attributed rather than hidden inside an aggregate rules bucket. Cache module
 shards are loaded on demand; discovered file membership avoids per-dependency filesystem stats;
 semantic graph hashing feeds the hasher directly without constructing a project-sized JSON buffer.
 Rule results are persisted per rule and keyed by the rule's declared `Edge`, `Closure` or `Global`
-semantic input scope. Cache misses are parsed and resolved in bounded parallel batches (at most
-eight workers), which improves cold throughput without making thread-stack memory scale with the
-host's CPU count.
+semantic input scope. When an edge-scope hash changes, WAE preserves diagnostics outside the
+incident module/package region and evaluates those rules against only changed edge endpoints;
+closure and global rules deliberately retain full-snapshot semantics. Machine reports expose
+`affectedModules`, `inspectedEdges`, `fullRuleEvaluations`, and `scopedRuleEvaluations` counters so
+locality is testable independently of noisy wall-clock measurements. Cache misses are parsed and
+resolved in bounded parallel batches (at most eight workers), which improves cold throughput
+without making thread-stack memory scale with the host's CPU count.
 
 ## Required CI gate
 
@@ -63,6 +68,7 @@ targets and newly satisfiable candidate paths invalidate their importers. Rule p
 reused independently when the semantic identity for their declared scope is unchanged; an
 environment change invalidates every partition.
 
-The persisted partitions avoid repeated rule work when their semantic input is unchanged. WAE
-still rebuilds the immutable module graph after a semantic edge change; incremental SCC and
-in-place adjacency deltas remain future work and are not part of the current latency guarantee.
+The persisted partitions avoid repeated rule work when their semantic input is unchanged and
+edge-local rules merge a diagnostic delta for the affected region. WAE still rebuilds the
+immutable module graph after a semantic edge change; incremental SCC and in-place adjacency
+deltas remain future work and are not part of the current latency guarantee.

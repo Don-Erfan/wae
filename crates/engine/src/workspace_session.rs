@@ -144,6 +144,13 @@ impl WorkspaceSession {
                             restored_rules: analysis.incremental.restored_rules
                                 + analysis.incremental.evaluated_rules,
                             evaluated_rules: 0,
+                            full_rule_evaluations: 0,
+                            scoped_rule_evaluations: 0,
+                            affected_modules: 0,
+                            inspected_edges: 0,
+                            retained_diagnostics: analysis.diagnostics.len(),
+                            added_diagnostics: 0,
+                            removed_diagnostics: 0,
                             environment_hash: analysis.incremental.environment_hash,
                         },
                         timings: Default::default(),
@@ -259,6 +266,103 @@ mod tests {
         fs::write(root.join("package.json"), r#"{"name":"changed-environment"}"#).unwrap();
         let forced = session.analyze_changes(&session.begin_analysis(), &overlays, true).unwrap();
         assert_ne!(forced.incremental.environment_hash, cold.incremental.environment_hash);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edge_rules_recompute_only_the_incident_region_and_retain_unrelated_diagnostics() {
+        let root = std::env::temp_dir().join(format!(
+            "wae-session-edge-region-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(root.join("src/targets")).unwrap();
+        fs::write(root.join("src/a.ts"), "import './targets/a';").unwrap();
+        fs::write(root.join("src/c.ts"), "import './targets/c';").unwrap();
+        fs::write(root.join("src/targets/a.ts"), "export {};").unwrap();
+        fs::write(root.join("src/targets/c.ts"), "export {};").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nresolution:\n  mode: bundler\ncache:\n  enabled: true\narchitecture:\n  forbidden_dependencies:\n    - from: 'src/*.ts'\n      to: 'src/targets/*.ts'\n",
+        )
+        .unwrap();
+        let session = WorkspaceSession::new(&root);
+        let cold = session.analyze(&session.begin_analysis(), &BTreeMap::new()).unwrap();
+        assert_eq!(
+            cold.diagnostics.iter().filter(|diagnostic| diagnostic.rule_id.0 == "ARCH-002").count(),
+            2
+        );
+
+        let overlays = BTreeMap::from([("src/a.ts".into(), "export const edited = true;".into())]);
+        let edited = session.analyze_changes(&session.begin_analysis(), &overlays, false).unwrap();
+        let forbidden = edited
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.rule_id.0 == "ARCH-002")
+            .collect::<Vec<_>>();
+        assert_eq!(forbidden.len(), 1);
+        assert_eq!(forbidden[0].dependency_path[0].0, "src/c.ts");
+        assert!(edited.incremental.affected_modules < edited.project.modules.len());
+        assert!(edited.incremental.inspected_edges < edited.project.dependencies.len());
+        assert!(edited.incremental.scoped_rule_evaluations > 0);
+        assert!(edited.incremental.full_rule_evaluations < edited.incremental.evaluated_rules);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_edge_rules_merge_only_diagnostics_from_affected_packages() {
+        let root = std::env::temp_dir().join(format!(
+            "wae-session-package-region-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        for package in ["a", "b", "c", "d"] {
+            fs::create_dir_all(root.join(format!("packages/{package}/src"))).unwrap();
+            fs::write(
+                root.join(format!("packages/{package}/package.json")),
+                format!(r#"{{"name":"@fixture/{package}","private":true}}"#),
+            )
+            .unwrap();
+            fs::write(
+                root.join(format!("packages/{package}/src/index.ts")),
+                "export const value = true;",
+            )
+            .unwrap();
+        }
+        fs::write(root.join("package.json"), r#"{"private":true,"workspaces":["packages/*"]}"#)
+            .unwrap();
+        fs::write(root.join("packages/a/src/index.ts"), "import '../../b/src/index';").unwrap();
+        fs::write(root.join("packages/c/src/index.ts"), "import '../../d/src/index';").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nresolution:\n  mode: bundler\ncache:\n  enabled: true\n",
+        )
+        .unwrap();
+
+        let session = WorkspaceSession::new(&root);
+        let cold = session.analyze(&session.begin_analysis(), &BTreeMap::new()).unwrap();
+        assert_eq!(
+            cold.diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.rule_id.0 == "PACKAGE-004")
+                .count(),
+            2
+        );
+
+        let overlays = BTreeMap::from([(
+            "packages/a/src/index.ts".into(),
+            "export const edited = true;".into(),
+        )]);
+        let edited = session.analyze_changes(&session.begin_analysis(), &overlays, false).unwrap();
+        let cross_package = edited
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.rule_id.0 == "PACKAGE-004")
+            .collect::<Vec<_>>();
+        assert_eq!(cross_package.len(), 1);
+        assert!(cross_package[0].message.contains("@fixture/c"));
+        assert!(edited.incremental.retained_diagnostics > 0);
+        assert!(edited.incremental.scoped_rule_evaluations > 0);
         fs::remove_dir_all(root).unwrap();
     }
 }

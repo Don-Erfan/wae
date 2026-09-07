@@ -9,6 +9,11 @@ use wae_core::{
     rule_registry,
 };
 
+mod document;
+pub use document::{
+    EditableConfigDocument, SuppressionProvenance, SuppressionPruneResult, suppression_provenance,
+};
+
 pub const CONFIG_FILE: &str = "wae.yaml";
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
@@ -313,6 +318,10 @@ pub struct PathSuppression {
     pub owner: Option<String>,
     pub ticket: Option<String>,
     pub expires_at: Option<String>,
+    #[serde(skip)]
+    pub defined_in: Option<String>,
+    #[serde(skip)]
+    pub inherited: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +332,10 @@ pub struct FingerprintSuppression {
     pub owner: Option<String>,
     pub ticket: Option<String>,
     pub expires_at: Option<String>,
+    #[serde(skip)]
+    pub defined_in: Option<String>,
+    #[serde(skip)]
+    pub inherited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +565,25 @@ impl Config {
             error.path = Some(path.display().to_string());
             error
         })?;
+        let provenance = suppression_provenance(path)?;
+        for (entry, source) in config
+            .suppressions
+            .paths
+            .iter_mut()
+            .zip(provenance.iter().filter(|entry| entry.kind == "path"))
+        {
+            entry.defined_in = Some(format!("{}:{}", source.defined_in, source.yaml_path));
+            entry.inherited = source.inherited;
+        }
+        for (entry, source) in config
+            .suppressions
+            .fingerprints
+            .iter_mut()
+            .zip(provenance.iter().filter(|entry| entry.kind == "fingerprint"))
+        {
+            entry.defined_in = Some(format!("{}:{}", source.defined_in, source.yaml_path));
+            entry.inherited = source.inherited;
+        }
         config.configured = true;
         Ok(config)
     }

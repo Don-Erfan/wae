@@ -108,6 +108,26 @@ fn is_analysis_input(name: &str) -> bool {
     )
 }
 
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn default_discovery_does_not_follow_directory_symlink_cycles() {
+        let root = std::env::temp_dir().join(format!("wae-symlink-loop-{}", std::process::id()));
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/index.ts"), "export {};").unwrap();
+        symlink(&root, root.join("src/nested/root-loop")).unwrap();
+        let config = Config::default();
+        let discovered = discover_project(&root, &config).unwrap();
+        assert_eq!(discovered.modules, vec![root.join("src/index.ts")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 pub(crate) fn build_globs(patterns: &[String]) -> Result<GlobSet, AnalysisError> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {

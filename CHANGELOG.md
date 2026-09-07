@@ -8,6 +8,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.29] - 2026-09-07
+
+### Added
+
+- Added package-scoped framework detection for mixed monorepos, affected-region execution and
+  diagnostic-delta counters for edge-local rules, and bounded MCP workspace sessions with
+  deterministic LRU/TTL eviction metrics.
+- Added source-preserving suppression pruning with inheritance provenance, full suppression
+  governance metadata in every reporter, shared ECMAScript cooking for static module specifiers,
+  and npm/Yarn/pnpm plus symlink-loop consumer fixtures.
+- Added script-free, exact-version native npm packages for every supported platform and a portable
+  wrapper that resolves those packages through ordinary optional dependencies.
+
+### Changed
+
+- Split atomic byte replacement from typed JSON persistence, extracted framework and incremental
+  indexes from orchestration, and avoided linear project scans during module classification.
+- Expanded warm/edit benchmark output with affected module, inspected edge, and retained/added/
+  removed diagnostic counters; documented full-graph fallback boundaries honestly.
+
+### Fixed
+
+- Preserved comments, key order, `extends`, and parent ownership when pruning expired suppressions;
+  no-op pruning no longer rewrites the configuration.
+- Decoded hexadecimal, Unicode, code-point, surrogate-pair, and line-continuation escapes in static
+  string and no-substitution template imports while rejecting invalid legacy numeric escapes.
+- Verified release binaries against the signed checksum trust root before assembling native npm
+  packages, allowing installs with lifecycle scripts disabled and offline package-manager caches.
+
 ## [0.0.28] - 2026-09-03
 
 ### Fixed
@@ -335,7 +364,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.28...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.29...HEAD
+[0.0.29]: https://github.com/Don-Erfan/wae/compare/v0.0.28...v0.0.29
 [0.0.28]: https://github.com/Don-Erfan/wae/compare/v0.0.27...v0.0.28
 [0.0.27]: https://github.com/Don-Erfan/wae/compare/v0.0.26...v0.0.27
 [0.0.26]: https://github.com/Don-Erfan/wae/compare/v0.0.25...v0.0.26

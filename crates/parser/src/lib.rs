@@ -9,7 +9,7 @@ use dependency_classifier::{classify_export, classify_import};
 
 /// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
 /// persist this value so parser upgrades can never reuse stale import IR.
-pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v6");
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v7");
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedModule {
@@ -310,7 +310,7 @@ fn decode_static_literal(node: Node<'_>, raw: &str) -> Option<String> {
         "template_string" => {
             let mut cursor = node.walk();
             (!node.named_children(&mut cursor).any(|child| child.kind() == "template_substitution"))
-                .then(|| raw.strip_prefix('`')?.strip_suffix('`').map(str::to_owned))
+                .then(|| decode_delimited_literal(raw, '`'))
                 .flatten()
         }
         _ => None,
@@ -327,23 +327,99 @@ fn source_location(module_path: &ModulePath, source: &str, byte_offset: usize) -
 }
 
 fn decode_string_literal(raw: &str) -> Option<String> {
-    let quote = raw.as_bytes().first().copied()?;
-    if raw.as_bytes().last().copied()? != quote || !matches!(quote, b'\'' | b'"') {
+    let quote = raw.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
         return None;
     }
-    let content = &raw[1..raw.len() - 1];
-    if quote == b'"' {
-        serde_json::from_str(raw).ok()
-    } else {
-        Some(
-            content
-                .replace("\\'", "'")
-                .replace("\\\\", "\\")
-                .replace("\\n", "\n")
-                .replace("\\r", "\r")
-                .replace("\\t", "\t"),
-        )
+    decode_delimited_literal(raw, quote)
+}
+
+fn decode_delimited_literal(raw: &str, delimiter: char) -> Option<String> {
+    let content = raw.strip_prefix(delimiter)?.strip_suffix(delimiter)?;
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(content.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        index += 1;
+        if current != '\\' {
+            output.push(current);
+            continue;
+        }
+        let escaped = *chars.get(index)?;
+        index += 1;
+        match escaped {
+            '\n' => {}
+            '\r' => {
+                if chars.get(index) == Some(&'\n') {
+                    index += 1;
+                }
+            }
+            'b' => output.push('\u{0008}'),
+            'f' => output.push('\u{000c}'),
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            'v' => output.push('\u{000b}'),
+            '0' if !chars.get(index).is_some_and(char::is_ascii_digit) => output.push('\0'),
+            '0'..='9' => return None,
+            'x' => {
+                let value = parse_fixed_hex(&chars, &mut index, 2)?;
+                output.push(char::from_u32(value)?);
+            }
+            'u' => {
+                let value = parse_unicode_escape(&chars, &mut index)?;
+                if (0xd800..=0xdbff).contains(&value) {
+                    if chars.get(index) != Some(&'\\') || chars.get(index + 1) != Some(&'u') {
+                        return None;
+                    }
+                    index += 2;
+                    let low = parse_fixed_hex(&chars, &mut index, 4)?;
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        return None;
+                    }
+                    let scalar = 0x10000 + ((value - 0xd800) << 10) + (low - 0xdc00);
+                    output.push(char::from_u32(scalar)?);
+                } else if (0xdc00..=0xdfff).contains(&value) {
+                    return None;
+                } else {
+                    output.push(char::from_u32(value)?);
+                }
+            }
+            // ECMAScript NonEscapeCharacter: a backslash before an otherwise ordinary
+            // character contributes that character to the cooked value.
+            other => output.push(other),
+        }
     }
+    Some(output)
+}
+
+fn parse_unicode_escape(chars: &[char], index: &mut usize) -> Option<u32> {
+    if chars.get(*index) == Some(&'{') {
+        *index += 1;
+        let start = *index;
+        while chars.get(*index).is_some_and(|value| value.is_ascii_hexdigit()) {
+            *index += 1;
+        }
+        if *index == start || *index - start > 6 || chars.get(*index) != Some(&'}') {
+            return None;
+        }
+        let value = chars[start..*index].iter().collect::<String>();
+        *index += 1;
+        u32::from_str_radix(&value, 16).ok().filter(|value| *value <= 0x10ffff)
+    } else {
+        parse_fixed_hex(chars, index, 4)
+    }
+}
+
+fn parse_fixed_hex(chars: &[char], index: &mut usize, width: usize) -> Option<u32> {
+    let end = index.checked_add(width)?;
+    let digits = chars.get(*index..end)?;
+    if !digits.iter().all(char::is_ascii_hexdigit) {
+        return None;
+    }
+    *index = end;
+    u32::from_str_radix(&digits.iter().collect::<String>(), 16).ok()
 }
 
 #[cfg(test)]
@@ -491,6 +567,23 @@ const page = import(
         assert_eq!(imports.len(), 2);
         assert_eq!(imports[0].specifier, "./button");
         assert_eq!(imports[1].specifier, "./page");
+    }
+
+    #[test]
+    fn cooks_ecmascript_escapes_in_static_string_and_template_specifiers() {
+        let source = r#"
+import(`./foo\x2ets`);
+import(`./caf\u{e9}`);
+import("./\u0061.js");
+import('./emoji-\uD83D\uDE00.js');
+import(`./line\
+continued.js`);
+"#;
+        let imports = JsTsParser.parse_imports(&ModulePath("src/a.ts".into()), source).unwrap();
+        assert_eq!(
+            imports.iter().map(|import| import.specifier.as_str()).collect::<Vec<_>>(),
+            vec!["./foo.ts", "./café", "./a.js", "./emoji-😀.js", "./linecontinued.js"]
+        );
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "name": "@don-erfan/wae-darwin-arm64",
+  "version": "0.0.29",
+  "description": "macOS arm64 native binaries for WAE",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Don-Erfan/wae.git" },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "preferUnplugged": true,
+  "files": ["bin"]
+}

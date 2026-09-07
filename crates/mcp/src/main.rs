@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 fn main() {
     let root = std::env::current_dir().unwrap_or_default();
@@ -20,6 +21,24 @@ fn main() {
                     std::process::exit(2);
                 };
                 policy = policy.with_max_request_bytes(bytes);
+            }
+            "--max-sessions" => {
+                let Some(sessions) = arguments
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|sessions: &usize| *sessions > 0)
+                else {
+                    eprintln!("wae-mcp: --max-sessions requires a positive integer");
+                    std::process::exit(2);
+                };
+                policy = policy.with_max_sessions(sessions);
+            }
+            "--session-ttl-seconds" => {
+                let Some(seconds) = arguments.next().and_then(|value| value.parse().ok()) else {
+                    eprintln!("wae-mcp: --session-ttl-seconds requires a non-negative integer");
+                    std::process::exit(2);
+                };
+                policy = policy.with_session_ttl(Duration::from_secs(seconds));
             }
             _ => {
                 eprintln!("wae-mcp: unknown option `{argument}`");

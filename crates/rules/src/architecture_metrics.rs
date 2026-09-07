@@ -235,7 +235,7 @@ impl Rule for ArchitectureCoverageRule {
 fn source_modules<'a>(
     context: &'a RuleContext<'a>,
 ) -> impl Iterator<Item = &'a wae_core::domain::Module> {
-    context.project.modules.iter().filter(|module| module.kind == ModuleKind::Source)
+    context.modules().iter().filter(|module| module.kind == ModuleKind::Source)
 }
 
 fn compile_entrypoints(patterns: &[String]) -> Result<Vec<GlobMatcher>, String> {

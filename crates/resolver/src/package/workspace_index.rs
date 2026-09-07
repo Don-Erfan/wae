@@ -282,3 +282,36 @@ fn compile_workspace_patterns(
     }
     Ok((includes, excludes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npm_yarn_and_pnpm_workspace_declarations_discover_the_same_packages() {
+        let cases = [
+            ("npm", r#"{"private":true,"workspaces":["packages/*"]}"#, None),
+            ("yarn", r#"{"private":true,"workspaces":{"packages":["packages/*"]}}"#, None),
+            ("pnpm", r#"{"private":true}"#, Some("packages:\n  - 'packages/*'\n")),
+        ];
+        for (manager, manifest, pnpm) in cases {
+            let root = std::env::temp_dir()
+                .join(format!("wae-{manager}-workspace-{}", std::process::id()));
+            fs::create_dir_all(root.join("packages/ui/src")).unwrap();
+            fs::write(root.join("package.json"), manifest).unwrap();
+            fs::write(
+                root.join("packages/ui/package.json"),
+                r#"{"name":"@fixture/ui","exports":"./src/index.ts"}"#,
+            )
+            .unwrap();
+            fs::write(root.join("packages/ui/src/index.ts"), "export {};").unwrap();
+            if let Some(pnpm) = pnpm {
+                fs::write(root.join("pnpm-workspace.yaml"), pnpm).unwrap();
+            }
+            let index = WorkspacePackageIndex::discover(&root).unwrap();
+            assert_eq!(index.packages().len(), 1, "package manager: {manager}");
+            assert_eq!(index.packages()[0].name, "@fixture/ui");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}

@@ -68,6 +68,10 @@
 - Minor releases: افزودن قابلیت backward-compatible
 - Major releases: اجازه breaking change با migration guide اجباری
 
+فیلدهای telemetry و metadata ممکن است به‌صورت additive در patch اضافه شوند؛ consumer باید کلیدهای
+ناشناخته را نادیده بگیرد. schema نیز envelopeهای قدیمی همان `schemaVersion` را می‌پذیرد و فیلدهای
+جدید reporter را optional تعریف می‌کند، هرچند writer فعلی همیشه آن‌ها را تولید می‌کند.
+
 ## 6) خروجی CLI و Exit Codes
 
 - `0`: موفق (بدون violation fail-level)

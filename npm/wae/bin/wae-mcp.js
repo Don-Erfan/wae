@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { resolveBinary } = require("./platform-binary.js");
 
-const binaryPath = path.join(__dirname, os.platform() === "win32" ? "wae-mcp.exe" : "wae-mcp");
-if (!fs.existsSync(binaryPath)) {
-  console.error("WAE MCP server was not found. Reinstall without --ignore-scripts or rebuild @don-erfan/wae.");
+let binaryPath;
+try {
+  binaryPath = resolveBinary("wae-mcp");
+} catch (error) {
+  console.error(error.message);
   process.exit(1);
 }
 const result = spawnSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });

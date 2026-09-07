@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wae_core::domain::{ModuleId, ModuleKind};
@@ -11,17 +13,40 @@ pub struct ServerPolicy {
     allowed_roots: Vec<PathBuf>,
     allow_any_root: bool,
     max_request_bytes: usize,
+    max_sessions: usize,
+    session_ttl: Duration,
 }
 
 pub struct McpServer {
     default_root: PathBuf,
     policy: ServerPolicy,
-    sessions: Mutex<HashMap<PathBuf, Arc<WorkspaceSession>>>,
+    sessions: Mutex<HashMap<PathBuf, SessionEntry>>,
+    evicted_sessions: AtomicU64,
+    access_clock: AtomicU64,
+}
+
+struct SessionEntry {
+    session: Arc<WorkspaceSession>,
+    last_used: Instant,
+    access_order: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionMetrics {
+    pub active: usize,
+    pub capacity: usize,
+    pub evicted: u64,
 }
 
 impl McpServer {
     pub fn new(default_root: impl Into<PathBuf>, policy: ServerPolicy) -> Self {
-        Self { default_root: default_root.into(), policy, sessions: Mutex::new(HashMap::new()) }
+        Self {
+            default_root: default_root.into(),
+            policy,
+            sessions: Mutex::new(HashMap::new()),
+            evicted_sessions: AtomicU64::new(0),
+            access_clock: AtomicU64::new(0),
+        }
     }
 
     pub fn handle_line(&self, line: &str) -> Option<Value> {
@@ -48,16 +73,54 @@ impl McpServer {
         let session = {
             let mut sessions =
                 self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(
-                sessions
-                    .entry(root.to_path_buf())
-                    .or_insert_with(|| Arc::new(WorkspaceSession::new(root))),
-            )
+            let now = Instant::now();
+            let access_order = self.access_clock.fetch_add(1, Ordering::Relaxed);
+            let before = sessions.len();
+            sessions.retain(|path, entry| {
+                path == root || now.duration_since(entry.last_used) < self.policy.session_ttl
+            });
+            self.evicted_sessions
+                .fetch_add(before.saturating_sub(sessions.len()) as u64, Ordering::Relaxed);
+            if let Some(entry) = sessions.get_mut(root) {
+                entry.last_used = now;
+                entry.access_order = access_order;
+                Arc::clone(&entry.session)
+            } else {
+                if sessions.len() >= self.policy.max_sessions {
+                    let oldest = sessions
+                        .iter()
+                        .min_by(|(left_path, left), (right_path, right)| {
+                            left.access_order
+                                .cmp(&right.access_order)
+                                .then_with(|| left_path.cmp(right_path))
+                        })
+                        .map(|(path, _)| path.clone());
+                    if let Some(oldest) = oldest {
+                        sessions.remove(&oldest);
+                        self.evicted_sessions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let session = Arc::new(WorkspaceSession::new(root));
+                sessions.insert(
+                    root.to_path_buf(),
+                    SessionEntry { session: Arc::clone(&session), last_used: now, access_order },
+                );
+                session
+            }
         };
         let force = refresh || session.snapshot().is_none();
         session
             .analyze_changes(&session.begin_analysis(), &BTreeMap::new(), force)
             .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn session_metrics(&self) -> SessionMetrics {
+        let active = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
+        SessionMetrics {
+            active,
+            capacity: self.policy.max_sessions,
+            evicted: self.evicted_sessions.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -67,6 +130,8 @@ impl ServerPolicy {
             allowed_roots: vec![default_root.to_path_buf()],
             allow_any_root: false,
             max_request_bytes: 1024 * 1024,
+            max_sessions: 16,
+            session_ttl: Duration::from_secs(30 * 60),
         }
     }
 
@@ -86,6 +151,16 @@ impl ServerPolicy {
 
     pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
         self.max_request_bytes = bytes.max(1);
+        self
+    }
+
+    pub fn with_max_sessions(mut self, sessions: usize) -> Self {
+        self.max_sessions = sessions.max(1);
+        self
+    }
+
+    pub fn with_session_ttl(mut self, ttl: Duration) -> Self {
+        self.session_ttl = ttl;
         self
     }
 }
@@ -239,6 +314,7 @@ fn execute_tool(
     let structured = match name {
         "architecture_check" => {
             let analysis = server.analyze(&root, true)?;
+            let session_metrics = server.session_metrics();
             json!({
                 "schemaVersion": analysis.schema_version,
                 "sourceModules": analysis.project.modules.iter().filter(|module| module.kind == ModuleKind::Source).count(),
@@ -255,6 +331,25 @@ fn execute_tool(
                     "reportingMs": analysis.timings.reporting_ms,
                     "orchestrationMs": analysis.timings.orchestration_ms,
                     "totalMs": analysis.timings.total_ms
+                },
+                "incremental": {
+                    "restoredModules": analysis.incremental.restored_modules,
+                    "analyzedModules": analysis.incremental.analyzed_modules,
+                    "affectedModules": analysis.incremental.affected_modules,
+                    "inspectedEdges": analysis.incremental.inspected_edges,
+                    "retainedDiagnostics": analysis.incremental.retained_diagnostics,
+                    "addedDiagnostics": analysis.incremental.added_diagnostics,
+                    "removedDiagnostics": analysis.incremental.removed_diagnostics,
+                    "restoredRules": analysis.incremental.restored_rules,
+                    "evaluatedRules": analysis.incremental.evaluated_rules,
+                    "fullRuleEvaluations": analysis.incremental.full_rule_evaluations,
+                    "scopedRuleEvaluations": analysis.incremental.scoped_rule_evaluations,
+                    "ruleSnapshotReused": analysis.incremental.rule_snapshot_reused
+                },
+                "sessionMetrics": {
+                    "active": session_metrics.active,
+                    "capacity": session_metrics.capacity,
+                    "evicted": session_metrics.evicted
                 }
             })
         }
@@ -420,6 +515,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["result"]["structuredContent"]["sourceModules"], 1);
+        assert_eq!(response["result"]["structuredContent"]["sessionMetrics"]["active"], 1);
+        assert_eq!(response["result"]["structuredContent"]["sessionMetrics"]["capacity"], 16);
         assert_eq!(response["result"]["isError"], false);
     }
 
@@ -442,9 +539,51 @@ mod tests {
             "params": { "name": "architecture_model", "arguments": {} }
         });
         assert_eq!(server.handle_message(model).unwrap()["result"]["isError"], false);
-        let session =
-            Arc::clone(server.sessions.lock().unwrap().get(&canonical).expect("workspace session"));
+        let session = Arc::clone(
+            &server.sessions.lock().unwrap().get(&canonical).expect("workspace session").session,
+        );
         assert!(session.last_execution().reused_snapshot);
+    }
+
+    #[test]
+    fn session_store_evicts_the_least_recently_used_workspace_at_capacity() {
+        let root = std::env::temp_dir().join(format!("wae-mcp-lru-{}", std::process::id()));
+        for name in ["a", "b", "c"] {
+            let workspace = root.join(name);
+            std::fs::create_dir_all(workspace.join("src")).unwrap();
+            std::fs::write(workspace.join("src/index.ts"), "export {};").unwrap();
+        }
+        let policy = ServerPolicy::confined(&root).allow_any_root().with_max_sessions(2);
+        let server = McpServer::new(&root, policy);
+        server.analyze(&root.join("a").canonicalize().unwrap(), true).unwrap();
+        server.analyze(&root.join("b").canonicalize().unwrap(), true).unwrap();
+        // Touch A, making B the least recently used entry.
+        server.analyze(&root.join("a").canonicalize().unwrap(), false).unwrap();
+        server.analyze(&root.join("c").canonicalize().unwrap(), true).unwrap();
+        let sessions = server.sessions.lock().unwrap();
+        assert!(sessions.contains_key(&root.join("a").canonicalize().unwrap()));
+        assert!(!sessions.contains_key(&root.join("b").canonicalize().unwrap()));
+        assert!(sessions.contains_key(&root.join("c").canonicalize().unwrap()));
+        drop(sessions);
+        assert_eq!(server.session_metrics(), SessionMetrics { active: 2, capacity: 2, evicted: 1 });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_store_expires_idle_workspaces_by_ttl() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let first = fixtures.join("basic").canonicalize().unwrap();
+        let second = fixtures.join("circular").canonicalize().unwrap();
+        let policy =
+            ServerPolicy::confined(&fixtures).allow_any_root().with_session_ttl(Duration::ZERO);
+        let server = McpServer::new(&fixtures, policy);
+        server.analyze(&first, true).unwrap();
+        server.analyze(&second, true).unwrap();
+        let sessions = server.sessions.lock().unwrap();
+        assert!(!sessions.contains_key(&first));
+        assert!(sessions.contains_key(&second));
+        drop(sessions);
+        assert_eq!(server.session_metrics().evicted, 1);
     }
 
     #[test]

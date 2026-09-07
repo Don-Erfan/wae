@@ -432,6 +432,31 @@ mod tests {
     }
 
     #[test]
+    fn suppression_prune_preserves_leaf_composition_and_reports_parent_ownership() {
+        let root = std::env::temp_dir()
+            .join(format!("wae-suppressions-inheritance-cli-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let parent = "version: 1\nsuppressions:\n  paths:\n    - pattern: 'src/parent/**'\n      rules: [ARCH-003]\n      reason: parent migration\n      expires_at: '2020-01-01'\n";
+        let leaf = "# local architecture policy\nextends: config/base.yaml\nversion: 1\nsuppressions:\n  fingerprints: # local exceptions\n    - fingerprint: expired-local\n      reason: local migration\n      expires_at: '2020-01-01'\noutput:\n  format: human\n";
+        std::fs::write(root.join("config/base.yaml"), parent).unwrap();
+        std::fs::write(root.join("wae.yaml"), leaf).unwrap();
+
+        let listed = run(&["suppressions".into(), "list".into()], &root);
+        assert_eq!(listed.exit_code, EXIT_PASSED);
+        assert!(listed.stdout.contains("\"inherited\": true"));
+        assert!(listed.stdout.contains("config/base.yaml"));
+        let pruned = run(&["suppressions".into(), "prune".into()], &root);
+        assert_eq!(pruned.exit_code, EXIT_PASSED, "{}", pruned.stderr);
+        assert!(pruned.stdout.contains("1 expired inherited entries remain"));
+        let updated = std::fs::read_to_string(root.join("wae.yaml")).unwrap();
+        assert!(updated.contains("# local architecture policy"));
+        assert!(updated.contains("extends: config/base.yaml"));
+        assert!(updated.contains("fingerprints: [] # local exceptions"));
+        assert_eq!(std::fs::read_to_string(root.join("config/base.yaml")).unwrap(), parent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cancellation_has_the_conventional_signal_exit_code() {
         let cancellation = CancellationToken::default();
         cancellation.cancel();
