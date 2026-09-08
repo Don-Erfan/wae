@@ -399,8 +399,6 @@ jobs:
           npm/platform/linux-x64/bin/wae --version | grep -F "${{ steps.version.outputs.version }}"
 
       - name: Verify npm package contents
-        env:
-          WAE_SKIP_DOWNLOAD: "1"
         shell: bash
         run: |
           set -euo pipefail
