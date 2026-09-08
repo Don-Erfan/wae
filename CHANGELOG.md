@@ -8,6 +8,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+
+- Accepted GNU binary-mode checksum markers for Windows release assets and added a signed,
+  idempotent npm-only recovery path that never rebuilds or overwrites an existing GitHub Release.
+
 ## [0.0.29] - 2026-09-08
 
 ### Added

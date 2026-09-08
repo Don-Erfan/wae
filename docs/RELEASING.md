@@ -57,7 +57,19 @@ manifest, binding the release inventory and dependency tree to the same workflow
 ## Recovery
 
 - Never move a published tag.
-- Fix the source, bump the version, and create a new tag.
+- If every GitHub Release asset was published successfully but the downstream npm job failed,
+  fix the release workflow on `master`, wait for CI, and recover only npm from the existing signed
+  assets with:
+
+  ```bash
+  gh workflow run release-binaries.yml -f tag=vX.Y.Z -f npm_only=true
+  ```
+
+  This mode verifies the tag's readiness checks, the Sigstore-signed `SHA256SUMS`, and every asset
+  checksum. It skips npm package versions that are already immutable, so a partially completed npm
+  publish can be resumed safely. It does not run builds or update the GitHub Release.
+- For a source, binary, metadata, or already-published package defect, fix the source, bump the
+  version, and create a new tag.
 - npm versions and release assets are immutable release records.
 - If immutable releases are enabled, never attempt to edit assets or notes after publication;
   publish every correction under a new version and signed tag.
