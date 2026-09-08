@@ -37,7 +37,7 @@ runs:
   using: composite
   steps:
     - name: Set up Node.js
-      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: 24
         package-manager-cache: false
@@ -100,7 +100,7 @@ runs:
         test -s "$WAE_ACTION_SARIF_FILE"
     - name: Upload WAE SARIF
       if: inputs.upload-sarif == 'true' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
-      uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+      uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
       with:
         sarif_file: ${{ inputs.sarif-file }}
         category: wae-architecture
