@@ -341,6 +341,10 @@ jobs:
             npm-assets/SHA256SUMS
           (cd npm-assets && sha256sum --check SHA256SUMS)
 
+      - name: Test portable npm wrapper before embedding release-specific state
+        working-directory: npm/wae
+        run: npm run test:installer
+
       - name: Embed platform checksums in the npm package
         shell: bash
         run: |
@@ -405,7 +409,7 @@ jobs:
           for package in npm/platform/*; do
             (cd "$package" && npm pack --dry-run)
           done
-          (cd npm/wae && npm run test:installer && npm pack --dry-run)
+          (cd npm/wae && npm pack --dry-run)
 
       - name: Publish platform packages to npmjs.com
         shell: bash
