@@ -22,6 +22,12 @@ pub(crate) fn discover_project(
     root: &Path,
     config: &Config,
 ) -> Result<DiscoveryResult, AnalysisError> {
+    // Compare paths in one canonical namespace. On macOS, temporary directories are commonly
+    // exposed through `/var` while `canonicalize` returns `/private/var`; comparing a canonical
+    // configured root with the caller's aliased root would incorrectly report an escape.
+    let project_root = root
+        .canonicalize()
+        .map_err(|error| AnalysisError::Project(format!("cannot open project root: {error}")))?;
     let include = build_globs(&config.project.include)?;
     let exclude = build_globs(&config.project.exclude)?;
     let mut files = Vec::new();
@@ -35,16 +41,16 @@ pub(crate) fn discover_project(
         "next.config.ts",
     ]
     .into_iter()
-    .map(|name| root.join(name))
+    .map(|name| project_root.join(name))
     .filter(|path| path.is_file())
     .collect::<Vec<_>>();
     for configured_root in &config.project.roots {
-        let scan_root = root.join(configured_root).canonicalize().map_err(|error| {
+        let scan_root = project_root.join(configured_root).canonicalize().map_err(|error| {
             AnalysisError::Project(format!(
                 "cannot open configured project root `{configured_root}`: {error}"
             ))
         })?;
-        if !scan_root.starts_with(root) {
+        if !scan_root.starts_with(&project_root) {
             return Err(AnalysisError::Project(format!(
                 "configured project root `{configured_root}` escapes the project"
             )));
@@ -63,7 +69,7 @@ pub(crate) fn discover_project(
             }
             let relative = entry
                 .path()
-                .strip_prefix(root)
+                .strip_prefix(&project_root)
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -123,7 +129,7 @@ mod tests {
         symlink(&root, root.join("src/nested/root-loop")).unwrap();
         let config = Config::default();
         let discovered = discover_project(&root, &config).unwrap();
-        assert_eq!(discovered.modules, vec![root.join("src/index.ts")]);
+        assert_eq!(discovered.modules, vec![root.canonicalize().unwrap().join("src/index.ts")]);
         fs::remove_dir_all(root).unwrap();
     }
 }
