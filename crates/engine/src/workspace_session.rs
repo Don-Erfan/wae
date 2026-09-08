@@ -271,11 +271,8 @@ mod tests {
 
     #[test]
     fn edge_rules_recompute_only_the_incident_region_and_retain_unrelated_diagnostics() {
-        let root = std::env::temp_dir().join(format!(
-            "wae-session-edge-region-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root =
+            std::env::temp_dir().join(format!("wae-session-edge-region-{}", std::process::id()));
         fs::create_dir_all(root.join("src/targets")).unwrap();
         fs::write(root.join("src/a.ts"), "import './targets/a';").unwrap();
         fs::write(root.join("src/c.ts"), "import './targets/c';").unwrap();
@@ -311,11 +308,8 @@ mod tests {
 
     #[test]
     fn package_edge_rules_merge_only_diagnostics_from_affected_packages() {
-        let root = std::env::temp_dir().join(format!(
-            "wae-session-package-region-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root =
+            std::env::temp_dir().join(format!("wae-session-package-region-{}", std::process::id()));
         for package in ["a", "b", "c", "d"] {
             fs::create_dir_all(root.join(format!("packages/{package}/src"))).unwrap();
             fs::write(
