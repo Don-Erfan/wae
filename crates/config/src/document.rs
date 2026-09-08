@@ -39,6 +39,10 @@ pub struct SuppressionProvenance {
     pub inherited: bool,
 }
 
+fn portable_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[derive(Default)]
 struct ProvenanceSet {
     paths: Option<Vec<SuppressionProvenance>>,
@@ -72,11 +76,9 @@ fn provenance_set(
         )
     })?;
     if let Some(cycle_start) = loading.iter().position(|candidate| candidate == &path) {
-        let mut cycle = loading[cycle_start..]
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>();
-        cycle.push(path.display().to_string());
+        let mut cycle =
+            loading[cycle_start..].iter().map(|path| portable_path(path)).collect::<Vec<_>>();
+        cycle.push(portable_path(&path));
         return Err(config_error(
             ConfigErrorKind::ConflictingConfig,
             Some("extends".into()),
@@ -140,7 +142,7 @@ fn provenance_set(
                     owner: entry.owner,
                     ticket: entry.ticket,
                     expires_at: entry.expires_at,
-                    defined_in: path.display().to_string(),
+                    defined_in: portable_path(&path),
                     yaml_path: format!("suppressions.paths[{index}]"),
                     inherited: path != leaf,
                 })
@@ -161,7 +163,7 @@ fn provenance_set(
                     owner: entry.owner,
                     ticket: entry.ticket,
                     expires_at: entry.expires_at,
-                    defined_in: path.display().to_string(),
+                    defined_in: portable_path(&path),
                     yaml_path: format!("suppressions.fingerprints[{index}]"),
                     inherited: path != leaf,
                 })
@@ -482,6 +484,14 @@ mod tests {
         document.prune_expired_suppressions(expiration_day("2026-01-01")).unwrap();
         assert!(document.source().contains("fingerprints: [] # owned\r\n"));
         assert!(!document.source().replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn provenance_paths_use_portable_separators() {
+        assert_eq!(
+            portable_path(Path::new(r"C:\repo\config\base.yaml")),
+            "C:/repo/config/base.yaml"
+        );
     }
 
     #[test]
