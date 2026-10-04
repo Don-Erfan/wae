@@ -545,7 +545,7 @@ mod tests {
             ])
             .unwrap(),
             Command::BaselineList { rule: Some(rule), config: Some(config) }
-                if rule == "ARCH-003" && config == PathBuf::from("custom.yaml")
+                if rule == "ARCH-003" && config.as_os_str() == "custom.yaml"
         ));
     }
 
