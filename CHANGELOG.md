@@ -38,6 +38,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   synchronized the composite Action's default engine version with the npm wrapper.
 - Rejected parser-incompatible cache manifests before reading or merging their module shards, so
   upgraded analyses cannot reuse stale semantic IR while rewriting the cache under a new contract.
+- Updated the pinned fuzzing CLI to a release compatible with current nightly Rust toolchains.
 - Accepted GNU binary-mode checksum markers for Windows release assets and added a signed,
   idempotent npm-only recovery path that never rebuilds or overwrites an existing GitHub Release.
 
