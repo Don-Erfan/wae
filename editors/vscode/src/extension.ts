@@ -14,7 +14,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         { scheme: "file", language: "typescript" },
         { scheme: "file", language: "typescriptreact" }
       ],
-      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/{wae.yaml,package.json,tsconfig.json,jsconfig.json}") }
+      synchronize: { fileEvents: vscode.workspace.createFileSystemWatcher("**/{wae.yaml,package.json,tsconfig.json,jsconfig.json}") },
+      middleware: {
+        executeCommand: async (command, args, next) => {
+          if (command === "wae.showSuggestion") {
+            const payload = args?.[0] as string | { suggestion?: string } | undefined;
+            const suggestion = typeof payload === "string" ? payload : payload?.suggestion;
+            await vscode.window.showInformationMessage(
+              suggestion ?? "No WAE suggestion was provided."
+            );
+            return;
+          }
+          if (command === "wae.suppressWithReason") {
+            return addDocumentedSuppression(args?.[0] as SuppressionPayload);
+          }
+          return next(command, args);
+        }
+      }
     };
     client = new LanguageClient("wae", "Web Architecture Engine", serverOptions, clientOptions);
     await client.start();
@@ -25,12 +41,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("wae.graph", () => terminalCommand("wae graph")),
     vscode.commands.registerCommand("wae.reload", async () => {
       if (client) await client.restart(); else await start();
-    }),
-    vscode.commands.registerCommand("wae.showSuggestion", (payload: string | { suggestion?: string }) => {
-      const suggestion = typeof payload === "string" ? payload : payload?.suggestion;
-      void vscode.window.showInformationMessage(suggestion ?? "No WAE suggestion was provided.");
-    }),
-    vscode.commands.registerCommand("wae.suppressWithReason", addDocumentedSuppression)
+    })
   );
   await start();
 }

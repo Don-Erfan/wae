@@ -42,6 +42,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Refreshed the checked-in 10k-module performance baseline on the release runner while preserving
   the stricter absolute warm/edit budgets, and pinned the VS Code dependency tree to the patched
   `brace-expansion` 2.x release.
+- Routed server-advertised VS Code commands through language-client middleware, preserving generic
+  LSP command handling without registering duplicate commands in the Extension Host.
 - Accepted GNU binary-mode checksum markers for Windows release assets and added a signed,
   idempotent npm-only recovery path that never rebuilds or overwrites an existing GitHub Release.
 
