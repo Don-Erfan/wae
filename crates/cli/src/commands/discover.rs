@@ -54,9 +54,21 @@ fn human(report: DiscoveryReport, wrote: bool, root: &Path) -> CliOutput {
     if !report.feature_clusters.is_empty() {
         lines.push(format!("Feature clusters: {}", report.feature_clusters.join(", ")));
     }
+    lines.push(match report.proposal_coverage.percent {
+        Some(percent) => format!(
+            "Suggested layer coverage: {percent}% ({}/{})",
+            report.proposal_coverage.modules_matched_by_suggested_layers,
+            report.proposal_coverage.source_modules
+        ),
+        None => "Suggested layer coverage: unavailable (no JS/TS source modules discovered)".into(),
+    });
+    if !report.unknowns.is_empty() {
+        lines.push("Unknowns requiring maintainer review:".into());
+        lines.extend(report.unknowns.iter().map(|item| format!("- {item}")));
+    }
     if wrote {
         lines.push(format!(
-            "Approved configuration written to {}",
+            "Candidate configuration written to {} (maintainer confirmation still required)",
             root.join(CONFIG_FILE).display()
         ));
     } else {
@@ -84,6 +96,7 @@ mod tests {
         assert_eq!(preview.exit_code, 0);
         assert!(!root.join(CONFIG_FILE).exists());
         assert!(preview.stdout.contains("NextJs"));
+        assert!(preview.stdout.contains("Unknowns requiring maintainer review"));
         assert_eq!(run(&root, false, true, false).exit_code, 0);
         assert_eq!(run(&root, false, true, false).exit_code, 2);
         assert_eq!(run(&root, true, true, true).exit_code, 0);

@@ -51,7 +51,7 @@ Diagnostics / Reporters / Integrations
   classification، parse، resolution، graph build، rule evaluation و cache commit عبور می‌دهد؛
   telemetry هر phase مستقل و قابل reconcile است.
 - `Strategy / Adapter`: قرارداد `ParserAdapter` جزئیات parser را از IR و engine جدا می‌کند.
-- `Strategy / Adapter`: قرارداد `FrameworkAdapter` تشخیص project و classification ماژول را از engine/core جدا نگه می‌دارد؛ `NextJsAdapter` اولین strategy اجرایی است.
+- `Strategy / Adapter`: قرارداد `FrameworkAdapter` تشخیص project و classification ماژول را از engine/core جدا نگه می‌دارد؛ `NextJsAdapter` اولین strategy اجرایی است. Adapterها capability عمومی مانند `rpcBoundary` را روی metadata می‌گذارند و runtime graph هیچ role اختصاصی Next.js را تفسیر نمی‌کند.
 - `Chain of Responsibility`: `ResolverPipeline` handlerهای relative، alias، workspace و external package را به‌ترتیب اجرا می‌کند.
 - `Strategy`: `ResolutionKindProvider` نوع `import`/`require` را از syntax و mode تعیین می‌کند و `ConditionSetProvider` conditionهای Node10، Node16، NodeNext و Bundler را مستقل و قابل‌آزمون نگه می‌دارد.
 - `Composite`: `RuleSet` ruleهای مستقل را روی یک `RuleContext` و graph مشترک اجرا می‌کند.

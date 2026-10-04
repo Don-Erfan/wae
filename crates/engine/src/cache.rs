@@ -67,6 +67,10 @@ pub(crate) struct AnalysisCache {
 }
 
 impl AnalysisCache {
+    fn snapshot_compatible(&self) -> bool {
+        self.file.schema_version == 3 && self.file.parser_version == PARSER_CACHE_VERSION
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
@@ -127,7 +131,7 @@ impl AnalysisCache {
         hash: u64,
         environment_hash: u64,
     ) -> Option<CachedModuleAnalysis> {
-        if self.enabled {
+        if self.enabled && self.snapshot_compatible() {
             let shard = shard_id(module);
             if self.loaded_shards.insert(shard) {
                 self.file.files.extend(read_shard(&shard_path(&self.path, shard)));
@@ -148,7 +152,7 @@ impl AnalysisCache {
     }
 
     pub(crate) fn previous_module(&mut self, module: &str) -> Option<CachedModuleAnalysis> {
-        if self.enabled {
+        if self.enabled && self.snapshot_compatible() {
             let shard = shard_id(module);
             if self.loaded_shards.insert(shard) {
                 self.file.files.extend(read_shard(&shard_path(&self.path, shard)));
@@ -229,7 +233,10 @@ impl AnalysisCache {
         affected_shards.extend(self.stale_files.iter().map(|module| shard_id(module)));
         for shard in affected_shards {
             let path = shard_path(&self.path, shard);
-            let mut records = read_shard(&path);
+            // Never merge module IR produced by another parser contract into a freshly written
+            // manifest. Every live module is dirty after an incompatible snapshot is rejected.
+            let mut records =
+                if self.snapshot_compatible() { read_shard(&path) } else { BTreeMap::new() };
             records.retain(|module, _| self.live_files.contains(module));
             for (module, cached) in
                 self.dirty_files.iter().filter(|(module, _)| shard_id(module) == shard)

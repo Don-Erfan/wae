@@ -300,7 +300,8 @@ pub fn trace_resolution(request: TraceResolutionRequest) -> Result<ResolutionTra
         }
         None => Config::load(&root).map_err(AnalysisError::Config)?,
     };
-    let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
+    let tsconfigs = TsConfigIndex::from_importers(&root, std::slice::from_ref(&importer))
+        .map_err(AnalysisError::Project)?;
     let workspaces = WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
     let scopes = PackageScopeIndex::from_importers(&root, std::slice::from_ref(&importer))
         .map_err(AnalysisError::Project)?;
@@ -597,8 +598,8 @@ fn propagate_client_runtime(project: &mut Project, graph: &ModuleGraph) {
         .iter()
         .filter(|module| {
             (!can_inherit_browser(module) && module.runtime != Runtime::Browser)
-                || module.framework_metadata.attributes.get("role").map(String::as_str)
-                    == Some("server-action-module")
+                || module.framework_metadata.attributes.get("rpcBoundary").map(String::as_str)
+                    == Some("true")
         })
         .map(|module| module.id.clone())
         .collect::<HashSet<_>>();
@@ -980,7 +981,15 @@ fn unresolved_diagnostic(import: &wae_core::domain::Import) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wae_parser::PARSER_CACHE_VERSION;
+    use wae_parser::{JsTsParser, PARSER_CACHE_VERSION, ParserAdapter};
+
+    fn parsed_comments(source: &str) -> Vec<wae_core::domain::SourceComment> {
+        JsTsParser
+            .parse_module(&ModulePath("src/app.ts".into()), source)
+            .unwrap()
+            .semantics
+            .comments
+    }
 
     #[test]
     fn source_suppressions_require_reasons_and_report_unused_directives() {
@@ -988,7 +997,9 @@ mod tests {
         let mut diagnostics = Vec::new();
         suppression::collect(
             "src/app.ts",
-            "// wae-ignore ARCH-003 -- migration ticket ARC-12\nimport './feature';\n// wae-ignore ARCH-004 -- temporary",
+            &parsed_comments(
+                "// wae-ignore ARCH-003 -- migration ticket ARC-12\nimport './feature';\n// wae-ignore ARCH-004 -- temporary",
+            ),
             true,
             &mut directives,
             &mut diagnostics,
@@ -1014,7 +1025,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         suppression::collect(
             "src/app.ts",
-            "// wae-ignore ARCH-003",
+            &parsed_comments("// wae-ignore ARCH-003"),
             true,
             &mut directives,
             &mut diagnostics,
@@ -1204,6 +1215,10 @@ mod tests {
         assert_eq!(
             module("src/app/actions.ts").framework_metadata.attributes["role"],
             "server-action-module"
+        );
+        assert_eq!(
+            module("src/app/actions.ts").framework_metadata.attributes["rpcBoundary"],
+            "true"
         );
         assert_eq!(module("src/middleware.ts").runtime, Runtime::Edge);
         assert_eq!(
@@ -1562,58 +1577,329 @@ mod tests {
     }
 
     #[test]
-    fn rule_family_precision_and_recall_corpus_has_no_unexpected_diagnostics() {
+    fn per_rule_golden_corpus_matches_exact_subject_location_and_suppression_state() {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-        let cases: [(&str, &[&str]); 5] = [
-            ("basic", &[]),
-            ("circular", &["ARCH"]),
-            ("layers", &["ARCH"]),
-            ("policies", &["ARCH", "PACKAGE"]),
-            ("runtime", &["ARCH", "RUNTIME"]),
-        ];
-        let mut true_positives = HashMap::<&str, usize>::new();
-        let mut false_positives = HashMap::<String, usize>::new();
-        let mut false_negatives = HashMap::<&str, usize>::new();
-        for (fixture, expected_families) in cases {
-            let analysis =
-                Engine::default().analyze(AnalyzeRequest::new(fixtures.join(fixture))).unwrap();
-            let actual = analysis
+        type Golden<'a> = (&'a str, &'a str, &'a str, bool);
+        let snapshot = |analysis: &Analysis| {
+            let mut actual = analysis
                 .diagnostics
                 .iter()
-                .map(|diagnostic| diagnostic.rule_id.0.split('-').next().unwrap())
-                .collect::<HashSet<_>>();
-            for family in expected_families {
-                if actual.contains(family) {
-                    *true_positives.entry(family).or_default() += 1;
-                } else {
-                    *false_negatives.entry(family).or_default() += 1;
-                }
-            }
-            for family in actual {
-                if !expected_families.contains(&family) {
-                    *false_positives.entry(family.into()).or_default() += 1;
-                }
-            }
+                .map(|diagnostic| {
+                    (
+                        diagnostic.rule_id.0.clone(),
+                        diagnostic
+                            .primary_location
+                            .as_ref()
+                            .map_or_else(String::new, |location| location.file.clone()),
+                        diagnostic
+                            .dependency_path
+                            .iter()
+                            .map(|module| module.0.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" -> "),
+                        diagnostic.suppressed,
+                    )
+                })
+                .collect::<Vec<_>>();
+            actual.sort();
+            actual
+        };
+        let assert_golden = |name: &str, analysis: &Analysis, expected: &[Golden<'_>]| {
+            let mut expected = expected
+                .iter()
+                .map(|(rule, location, subject, suppressed)| {
+                    ((*rule).into(), (*location).into(), (*subject).into(), *suppressed)
+                })
+                .collect::<Vec<(String, String, String, bool)>>();
+            expected.sort();
+            assert_eq!(snapshot(analysis), expected, "per-rule oracle mismatch for `{name}`");
+        };
+        let cases: [(&str, &[Golden<'_>]); 7] = [
+            ("basic", &[]),
+            (
+                "circular",
+                &[("ARCH-001", "src/a.ts", "src/a.ts -> src/b.ts -> src/c.ts -> src/a.ts", false)],
+            ),
+            (
+                "layers",
+                &[(
+                    "ARCH-003",
+                    "src/entities/user.ts",
+                    "src/entities/user.ts -> src/app/navigation.ts",
+                    false,
+                )],
+            ),
+            (
+                "features",
+                &[(
+                    "ARCH-005",
+                    "src/features/payment/service.ts",
+                    "src/features/payment/service.ts -> src/features/user/internal/utils.ts",
+                    false,
+                )],
+            ),
+            (
+                "monorepo",
+                &[(
+                    "ARCH-002",
+                    "packages/ui/src/button.ts",
+                    "packages/ui/src/button.ts -> apps/web/src/index.ts",
+                    false,
+                )],
+            ),
+            (
+                "policies",
+                &[
+                    (
+                        "ARCH-001",
+                        "packages/a/src/index.ts",
+                        "packages/a/src/index.ts -> packages/b/src/index.ts -> packages/a/src/index.ts",
+                        false,
+                    ),
+                    (
+                        "ARCH-006",
+                        "packages/b/src/deep.ts",
+                        "packages/a/src/index.ts -> packages/b/src/index.ts -> packages/b/src/deep.ts",
+                        false,
+                    ),
+                    (
+                        "ARCH-006",
+                        "packages/b/src/leaf.ts",
+                        "packages/a/src/index.ts -> packages/b/src/index.ts -> packages/b/src/deep.ts -> packages/b/src/leaf.ts",
+                        false,
+                    ),
+                    ("ARCH-007", "packages/a/src/index.ts", "packages/a/src/index.ts", false),
+                    ("ARCH-007", "packages/b/src/index.ts", "packages/b/src/index.ts", false),
+                    ("ARCH-008", "packages/a/src/index.ts", "packages/a/src/index.ts", false),
+                    ("ARCH-008", "packages/a/src/shared.ts", "packages/a/src/shared.ts", false),
+                    ("ARCH-009", "apps/web/src/index.ts", "apps/web/src/index.ts", false),
+                    ("ARCH-009", "packages/a/src/orphan.ts", "packages/a/src/orphan.ts", false),
+                    ("ARCH-010", "apps/web/src/index.ts", "apps/web/src/index.ts", false),
+                    (
+                        "PACKAGE-001",
+                        "packages/a/src/index.ts",
+                        "package:@fixture/a -> package:@fixture/b -> package:@fixture/a",
+                        false,
+                    ),
+                    (
+                        "PACKAGE-002",
+                        "packages/a/src/index.ts",
+                        "package:@fixture/a -> package:@fixture/b",
+                        false,
+                    ),
+                    (
+                        "PACKAGE-003",
+                        "apps/web/src/index.ts",
+                        "apps/web/src/index.ts -> packages/a/src/index.ts",
+                        false,
+                    ),
+                    (
+                        "PACKAGE-004",
+                        "packages/a/src/index.ts",
+                        "packages/a/src/index.ts -> packages/b/src/internal.ts",
+                        false,
+                    ),
+                ],
+            ),
+            (
+                "runtime",
+                &[
+                    (
+                        "ARCH-001",
+                        "src/app/client.tsx",
+                        "src/app/client.tsx -> src/app/server.ts -> src/app/client.tsx",
+                        false,
+                    ),
+                    (
+                        "RUNTIME-001",
+                        "src/app/client.tsx",
+                        "src/app/client.tsx -> src/app/server.ts",
+                        false,
+                    ),
+                    (
+                        "RUNTIME-002",
+                        "src/app/client.tsx",
+                        "src/app/client.tsx -> src/node-only.ts",
+                        false,
+                    ),
+                    (
+                        "RUNTIME-003",
+                        "src/app/client.tsx",
+                        "src/app/client.tsx -> external:node-only-kit",
+                        false,
+                    ),
+                    (
+                        "RUNTIME-004",
+                        "src/app/api/route.ts",
+                        "src/app/api/route.ts -> src/node-only.ts",
+                        false,
+                    ),
+                    ("RUNTIME-005", "src/shared.ts", "src/shared.ts -> src/app/server.ts", false),
+                    (
+                        "RUNTIME-006",
+                        "src/app/client.tsx",
+                        "src/app/client.tsx -> src/app/server.ts -> src/app/client.tsx",
+                        false,
+                    ),
+                ],
+            ),
+        ];
+        let mut observed = HashSet::new();
+        for (fixture, expected) in cases {
+            let analysis =
+                Engine::default().analyze(AnalyzeRequest::new(fixtures.join(fixture))).unwrap();
+            assert_golden(fixture, &analysis, expected);
+            observed
+                .extend(analysis.diagnostics.iter().map(|diagnostic| diagnostic.rule_id.0.clone()));
         }
 
-        let clean = std::env::temp_dir().join(format!("wae-clean-corpus-{}", std::process::id()));
-        fs::create_dir_all(clean.join("src")).unwrap();
-        for index in 0..100 {
-            fs::write(
-                clean.join(format!("src/module-{index}.ts")),
-                format!("export const value{index} = {index};"),
-            )
+        let feature =
+            std::env::temp_dir().join(format!("wae-rule-golden-feature-{}", std::process::id()));
+        fs::create_dir_all(feature.join("src/app")).unwrap();
+        fs::create_dir_all(feature.join("src/features/user")).unwrap();
+        fs::write(
+            feature.join("src/app/page.ts"),
+            "import { user } from '../features/user/model'; export { user };",
+        )
+        .unwrap();
+        fs::write(feature.join("src/features/user/model.ts"), "export const user = true;").unwrap();
+        fs::write(
+            feature.join("wae.yaml"),
+            "version: 1\nrules:\n  ARCH-005:\n    enabled: false\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&feature)).unwrap();
+        assert_golden(
+            "ARCH-004 standalone",
+            &analysis,
+            &[(
+                "ARCH-004",
+                "src/app/page.ts",
+                "src/app/page.ts -> src/features/user/model.ts",
+                false,
+            )],
+        );
+        observed.insert("ARCH-004".into());
+        fs::remove_dir_all(feature).unwrap();
+
+        let coverage =
+            std::env::temp_dir().join(format!("wae-rule-golden-coverage-{}", std::process::id()));
+        fs::create_dir_all(coverage.join("src/app")).unwrap();
+        fs::write(coverage.join("src/app/page.ts"), "export const page = true;").unwrap();
+        fs::write(coverage.join("src/orphan.ts"), "export const orphan = true;").unwrap();
+        fs::write(
+            coverage.join("wae.yaml"),
+            "version: 1\narchitecture:\n  coverage:\n    minimum: 100\n  layers:\n    app:\n      patterns: ['src/app/**']\nrules:\n  ARCH-010:\n    enabled: false\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&coverage)).unwrap();
+        assert_golden(
+            "ARCH-011 standalone",
+            &analysis,
+            &[("ARCH-011", "src/orphan.ts", "src/orphan.ts", false)],
+        );
+        observed.insert("ARCH-011".into());
+        fs::remove_dir_all(coverage).unwrap();
+
+        let suppressed =
+            std::env::temp_dir().join(format!("wae-rule-golden-suppressed-{}", std::process::id()));
+        fs::create_dir_all(suppressed.join("src")).unwrap();
+        fs::write(
+            suppressed.join("src/a.ts"),
+            "// wae-ignore-file ARCH-001 -- accepted migration cycle ARC-42\nimport './a';",
+        )
+        .unwrap();
+        fs::write(suppressed.join("wae.yaml"), "version: 1\n").unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&suppressed)).unwrap();
+        assert_golden(
+            "suppressed diagnostic state",
+            &analysis,
+            &[("ARCH-001", "src/a.ts", "src/a.ts -> src/a.ts", true)],
+        );
+        fs::remove_dir_all(suppressed).unwrap();
+
+        let missing = wae_core::rule_registry::configurable_ids()
+            .filter(|rule| !observed.contains(*rule))
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "rules missing from exact golden corpus: {missing:?}");
+    }
+
+    #[test]
+    fn exported_declarations_and_dynamic_import_options_reach_the_real_graph() {
+        let root = std::env::temp_dir().join(format!("wae-export-graph-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/index.ts"),
+            "export const load = () => import('./dep');\nexport const data = () => import('./data.json', { with: { type: 'json' } });",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/dep.ts"), "export const value = true;").unwrap();
+        std::fs::write(root.join("src/data.json"), "{}").unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\nresolution:\n  mode: bundler\n")
             .unwrap();
-        }
-        let clean_analysis = Engine::default().analyze(AnalyzeRequest::new(&clean)).unwrap();
-        assert!(clean_analysis.diagnostics.is_empty(), "{:?}", clean_analysis.diagnostics);
-        fs::remove_dir_all(clean).unwrap();
+        let analysis =
+            Engine::default().analyze(AnalyzeRequest::new(&root).without_cache()).unwrap();
+        let targets = analysis
+            .project
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.from.0 == "src/index.ts")
+            .map(|dependency| dependency.to.0.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(targets.contains("src/dep.ts"));
+        assert!(targets.contains("src/data.json"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
-        assert!(false_positives.is_empty(), "false positives by family: {false_positives:?}");
-        assert!(false_negatives.is_empty(), "false negatives by family: {false_negatives:?}");
-        assert_eq!(true_positives.get("ARCH"), Some(&4));
-        assert_eq!(true_positives.get("PACKAGE"), Some(&1));
-        assert_eq!(true_positives.get("RUNTIME"), Some(&1));
+    #[test]
+    fn runtime_rules_ignore_direct_and_transitive_type_only_dependencies() {
+        let root = std::env::temp_dir().join(format!("wae-runtime-types-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"dependencies":{"next":"15.2.6"}}"#).unwrap();
+        std::fs::write(
+            root.join("src/client.ts"),
+            "'use client';\nimport type { Stats } from 'node:fs';\nimport type { Secret } from './server';\nexport type Result = Stats & Secret;",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/server.ts"),
+            "import 'server-only';\nexport type Secret = { value: string };",
+        )
+        .unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\n").unwrap();
+        let analysis =
+            Engine::default().analyze(AnalyzeRequest::new(&root).without_cache()).unwrap();
+        assert!(
+            analysis.diagnostics.iter().all(|diagnostic| {
+                !matches!(diagnostic.rule_id.0.as_str(), "RUNTIME-001" | "RUNTIME-002")
+            }),
+            "{:?}",
+            analysis.diagnostics
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn comment_like_template_text_cannot_suppress_a_real_cycle() {
+        let root =
+            std::env::temp_dir().join(format!("wae-template-suppress-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/a.ts"),
+            "const docs = `\n// wae-ignore-file ARCH-001 -- sample documentation\n`;\nimport './b';",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/b.ts"), "import './a';").unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\n").unwrap();
+        let analysis =
+            Engine::default().analyze(AnalyzeRequest::new(&root).without_cache()).unwrap();
+        let cycle = analysis
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.rule_id.0 == "ARCH-001")
+            .expect("cycle diagnostic");
+        assert!(!cycle.suppressed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1641,6 +1927,23 @@ mod tests {
         fs::create_dir_all(root.join("dist")).unwrap();
         fs::write(root.join("src/good.ts"), "export const good = true;").unwrap();
         fs::write(root.join("dist/package.json"), "not-json").unwrap();
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nproject:\n  roots: [src]\n  include: ['**/*.ts']\n  exclude: ['dist/**']\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(analysis.project.modules.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_tsconfig_outside_source_scope_is_ignored() {
+        let root = std::env::temp_dir().join(format!("wae-scoped-tsconfig-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("src/good.ts"), "export const good = true;").unwrap();
+        fs::write(root.join("dist/tsconfig.json"), "{ invalid }").unwrap();
         fs::write(
             root.join("wae.yaml"),
             "version: 1\nproject:\n  roots: [src]\n  include: ['**/*.ts']\n  exclude: ['dist/**']\n",
@@ -1695,7 +1998,9 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
         stale["parser_version"] = serde_json::Value::String("stale-parser".into());
         fs::write(&cache, serde_json::to_vec(&stale).unwrap()).unwrap();
-        Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let reparsed = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        assert_eq!(reparsed.incremental.analyzed_modules, 1);
+        assert_eq!(reparsed.incremental.restored_modules, 0);
         let refreshed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
         assert_eq!(refreshed["parser_version"], PARSER_CACHE_VERSION);

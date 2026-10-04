@@ -196,6 +196,16 @@ pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
         max_warnings,
         cancellation,
     } = options;
+    let resolved_config = match config_path.as_ref().map_or_else(
+        || Config::load(root),
+        |path| {
+            let path = if path.is_absolute() { path.clone() } else { root.join(path) };
+            Config::load_file(&path)
+        },
+    ) {
+        Ok(config) => config,
+        Err(error) => return CliOutput::project_error(config_error(&error)),
+    };
     let mut request = AnalyzeRequest::new(root).with_cancellation(cancellation);
     if let Some(path) = &config_path {
         request = request.with_config(path);
@@ -210,7 +220,7 @@ pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
     analysis.failure_policy = analysis.failure_policy.with_overrides(fail_on, max_warnings);
     let mut regression = None;
     if changed {
-        let signatures = match baseline::load(root) {
+        let signatures = match baseline::load_with_config(root, &resolved_config) {
             Ok(value) => value,
             Err(error) => return CliOutput::project_error(error),
         };
@@ -249,21 +259,7 @@ pub fn check(root: &Path, options: CheckOptions) -> CliOutput {
     }
     let format = match format {
         Some(format) => format,
-        None => match config_path
-            .as_ref()
-            .map_or_else(
-                || Config::load(root),
-                |path| {
-                    let path = if path.is_absolute() { path.clone() } else { root.join(path) };
-                    Config::load_file(&path)
-                },
-            )
-            .map_err(|error| error.message)
-            .map(|config| config.output.format)
-        {
-            Ok(format) => format,
-            Err(error) => return CliOutput::project_error(error),
-        },
+        None => resolved_config.output.format,
     };
     let has_failures = analysis.failure_policy.has_failures(&analysis.diagnostics);
     let reporting_started = std::time::Instant::now();
@@ -355,12 +351,20 @@ fn verbose_analysis(analysis: &Analysis) -> String {
     report
 }
 
-pub fn baseline_create(root: &Path, cancellation: &CancellationToken) -> CliOutput {
-    let analysis = match analyze(root, cancellation) {
+pub fn baseline_create(
+    root: &Path,
+    config_path: Option<&Path>,
+    cancellation: &CancellationToken,
+) -> CliOutput {
+    let config = match selected_config(root, config_path) {
+        Ok(config) => config,
+        Err(output) => return output,
+    };
+    let analysis = match analyze_with_config(root, config_path, cancellation) {
         Ok(result) => result,
         Err(output) => return output,
     };
-    match baseline::save(root, &analysis.diagnostics) {
+    match baseline::save_with_config(root, &analysis.diagnostics, &config) {
         Ok(result) => CliOutput::success(format!(
             "Recorded {} fail-level violations in {} (excluded: {} suppressed, {} informational)",
             result.recorded,
@@ -372,8 +376,12 @@ pub fn baseline_create(root: &Path, cancellation: &CancellationToken) -> CliOutp
     }
 }
 
-pub fn baseline_list(root: &Path, rule: Option<&str>) -> CliOutput {
-    match baseline::list(root, rule).and_then(|entries| {
+pub fn baseline_list(root: &Path, rule: Option<&str>, config_path: Option<&Path>) -> CliOutput {
+    let config = match selected_config(root, config_path) {
+        Ok(config) => config,
+        Err(output) => return output,
+    };
+    match baseline::list_with_config(root, rule, &config).and_then(|entries| {
         serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())
     }) {
         Ok(entries) => CliOutput::success(entries),
@@ -381,12 +389,20 @@ pub fn baseline_list(root: &Path, rule: Option<&str>) -> CliOutput {
     }
 }
 
-pub fn baseline_prune(root: &Path, cancellation: &CancellationToken) -> CliOutput {
-    let analysis = match analyze(root, cancellation) {
+pub fn baseline_prune(
+    root: &Path,
+    config_path: Option<&Path>,
+    cancellation: &CancellationToken,
+) -> CliOutput {
+    let config = match selected_config(root, config_path) {
+        Ok(config) => config,
+        Err(output) => return output,
+    };
+    let analysis = match analyze_with_config(root, config_path, cancellation) {
         Ok(result) => result,
         Err(output) => return output,
     };
-    match baseline::prune(root, &analysis.diagnostics) {
+    match baseline::prune_with_config(root, &analysis.diagnostics, &config) {
         Ok((path, removed, remaining)) => CliOutput::success(format!(
             "Pruned {removed} expired or resolved baseline entries from {}; {remaining} remain.",
             path.display()
@@ -598,6 +614,33 @@ fn analyze(root: &Path, cancellation: &CancellationToken) -> Result<Analysis, Cl
     Engine::default()
         .analyze(AnalyzeRequest::new(root).with_cancellation(cancellation.clone()))
         .map_err(map_analysis_error)
+}
+
+fn analyze_with_config(
+    root: &Path,
+    config_path: Option<&Path>,
+    cancellation: &CancellationToken,
+) -> Result<Analysis, CliOutput> {
+    let mut request = AnalyzeRequest::new(root).with_cancellation(cancellation.clone());
+    if let Some(path) = config_path {
+        request = request.with_config(path);
+    }
+    Engine::default().analyze(request).map_err(map_analysis_error)
+}
+
+fn selected_config(root: &Path, config_path: Option<&Path>) -> Result<Config, CliOutput> {
+    config_path
+        .map_or_else(
+            || Config::load(root),
+            |path| {
+                Config::load_file(&if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    root.join(path)
+                })
+            },
+        )
+        .map_err(|error| CliOutput::project_error(config_error(&error)))
 }
 fn map_analysis_error(error: AnalysisError) -> CliOutput {
     match error {

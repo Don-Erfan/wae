@@ -2,8 +2,9 @@
 
 WAE has two Criterion suites:
 
-- `wae-graph/graph_scaling` measures graph construction at 1k, 10k, 50k and 100k modules and
-  SCC, reachability and estimated owned heap capacity at 1k, 10k and 50k.
+- `wae-graph/graph_scaling` measures chain graph construction at 1k, 10k, 50k and 100k modules,
+  compares chain, high-fan-out star and clustered-SCC topologies at 10k, and measures SCC,
+  reachability and estimated owned heap capacity at 1k, 10k and 50k.
 - `wae-engine/incremental` measures cold, warm, syntax-only, edge-local and global-cycle edits at
   1k and 10k modules. Every edit profile must restore unchanged modules and analyze only its
   overlay; syntax-only edits must restore every rule partition.

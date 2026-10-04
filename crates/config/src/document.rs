@@ -276,7 +276,28 @@ impl EditableConfigDocument {
         })?;
         let section_end = mapping_end(&lines, suppressions, indentation(&lines[suppressions]));
         prune_sequence(&mut lines, suppressions, section_end, "paths", &expired_paths, &self.path)?;
-        self.source = lines.concat();
+        let candidate = lines.concat();
+        // Treat source editing as a transaction: the candidate must remain valid YAML and retain
+        // exactly the expected live entries before callers are allowed to atomically replace the
+        // original file.
+        yaml_serde::from_str::<yaml_serde::Value>(&candidate).map_err(|error| {
+            edit_error(&self.path, &format!("pruned configuration is invalid YAML: {error}"))
+        })?;
+        let verified: LeafSuppressions = yaml_serde::from_str(&candidate).map_err(|error| {
+            edit_error(&self.path, &format!("cannot validate pruned suppression entries: {error}"))
+        })?;
+        let expected_paths = leaf.suppressions.paths.len().saturating_sub(expired_paths.len());
+        let expected_fingerprints =
+            leaf.suppressions.fingerprints.len().saturating_sub(expired_fingerprints.len());
+        if verified.suppressions.paths.len() != expected_paths
+            || verified.suppressions.fingerprints.len() != expected_fingerprints
+        {
+            return Err(edit_error(
+                &self.path,
+                "prune validation failed because non-target suppression entries changed",
+            ));
+        }
+        self.source = candidate;
         Ok(SuppressionPruneResult {
             removed_paths: expired_paths.len(),
             removed_fingerprints: expired_fingerprints.len(),
@@ -319,9 +340,18 @@ fn prune_sequence(
         ));
     }
     let sequence_end = mapping_end(lines, key_line, key_indent).min(section_end);
-    let item_starts = (key_line + 1..sequence_end)
+    let item_indent = (key_line + 1..sequence_end)
         .filter(|&line| {
             indentation(&lines[line]) > key_indent && lines[line].trim_start().starts_with("- ")
+        })
+        .map(|line| indentation(&lines[line]))
+        .min()
+        .ok_or_else(|| {
+            edit_error(path, &format!("cannot locate block-list items in `suppressions.{key}`"))
+        })?;
+    let item_starts = (key_line + 1..sequence_end)
+        .filter(|&line| {
+            indentation(&lines[line]) == item_indent && lines[line].trim_start().starts_with("- ")
         })
         .collect::<Vec<_>>();
     if item_starts.len() <= expired.iter().copied().max().unwrap_or(0) {
@@ -484,6 +514,19 @@ mod tests {
         document.prune_expired_suppressions(expiration_day("2026-01-01")).unwrap();
         assert!(document.source().contains("fingerprints: [] # owned\r\n"));
         assert!(!document.source().replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn prune_distinguishes_top_level_entries_from_nested_rule_sequence_items() {
+        let source = "version: 1\nsuppressions:\n  paths:\n    - pattern: a.ts\n      rules:\n        - ARCH-001\n      reason: expired fixture entry\n      expires_at: '2020-01-01'\n    - pattern: b.ts\n      rules:\n        - ARCH-001\n      reason: keep this entry\n      expires_at: '2099-01-01'\n";
+        let mut document =
+            EditableConfigDocument { path: PathBuf::from("/tmp/wae.yaml"), source: source.into() };
+        let result = document.prune_expired_suppressions(expiration_day("2026-01-01")).unwrap();
+        assert_eq!(result.removed_paths, 1);
+        assert!(!document.source().contains("pattern: a.ts"));
+        assert!(document.source().contains("pattern: b.ts"));
+        let parsed: yaml_serde::Value = yaml_serde::from_str(document.source()).unwrap();
+        assert_eq!(parsed["suppressions"]["paths"].as_sequence().unwrap().len(), 1);
     }
 
     #[test]

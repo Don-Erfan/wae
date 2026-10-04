@@ -312,6 +312,21 @@ jobs:
           cargo run --quiet -p wae-cli -- explore --output target/architecture-explorer.html
           grep -q 'WAE Architecture Explorer' target/architecture-explorer.html
           grep -q 'application/json' target/architecture-explorer.html
+      - name: Dogfood a full clean check on WAE's JavaScript and TypeScript tooling
+        shell: bash
+        run: |
+          cargo run --quiet -p wae-cli -- check --no-cache --format json > target/self-check.json
+          test "$(jq -r '.failureCount' target/self-check.json)" = "0"
+          test "$(jq -r '.architectureCoverage.percent' target/self-check.json)" = "100"
+      - name: Exercise clean Next.js, Nx and Turborepo CLI consumer contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for fixture in consumer-next nx-workspace turbo-workspace; do
+            (cd "fixtures/$fixture" && ../../target/debug/wae-cli check --no-cache --format json) \
+              > "target/${fixture}-contract.json"
+            test "$(jq -r '.failureCount' "target/${fixture}-contract.json")" = "0"
+          done
       - name: Audit a pinned real-world Next.js consumer
         shell: bash
         run: |

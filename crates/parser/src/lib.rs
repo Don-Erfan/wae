@@ -1,7 +1,7 @@
 use tree_sitter::{Node, Parser, Tree};
 use wae_core::domain::{
     Import, ImportKind, ModuleId, ModulePath, ModuleSemantics, ParseError, ParseErrorKind,
-    SourceLocation,
+    SourceComment, SourceLocation,
 };
 
 mod dependency_classifier;
@@ -9,7 +9,7 @@ use dependency_classifier::{classify_export, classify_import};
 
 /// Increment the explicit suffix when parser behavior or grammar inputs change. Cache consumers
 /// persist this value so parser upgrades can never reuse stale import IR.
-pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v7");
+pub const PARSER_CACHE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), ":js-ts-ast-v8");
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedModule {
@@ -53,6 +53,7 @@ impl ParserAdapter for JsTsParser {
             a.specifier == b.specifier && a.location == b.location && a.kind == b.kind
         });
         let mut semantics = collect_semantics(tree.root_node(), source);
+        semantics.comments = collect_comments(tree.root_node(), source);
         semantics.marker_imports = imports
             .iter()
             .filter(|import| matches!(import.specifier.as_str(), "server-only" | "client-only"))
@@ -62,6 +63,34 @@ impl ParserAdapter for JsTsParser {
         semantics.marker_imports.dedup();
         Ok(ParsedModule { imports, semantics })
     }
+}
+
+fn collect_comments(root: Node<'_>, source: &str) -> Vec<SourceComment> {
+    let mut comments = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "comment" {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                let point = node.start_position();
+                comments.push(SourceComment {
+                    text: text.to_owned(),
+                    line: point.row + 1,
+                    column: point.column + 1,
+                    standalone: source[..node.start_byte()]
+                        .rsplit_once('\n')
+                        .map_or(&source[..node.start_byte()], |(_, tail)| tail)
+                        .trim()
+                        .is_empty(),
+                });
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        pending.extend(children.into_iter().rev());
+    }
+    comments.sort_by_key(|comment| (comment.line, comment.column));
+    comments
 }
 
 fn collect_semantics(root: Node<'_>, source: &str) -> ModuleSemantics {
@@ -198,8 +227,13 @@ fn collect_dependencies(
                         specifier,
                         classify_export(node, source),
                     );
+                    // A direct re-export has no executable declaration body to inspect.
+                    false
+                } else {
+                    // Exported declarations can contain dynamic import/require calls. Adding an
+                    // `export` modifier must never erase dependencies from the normalized IR.
+                    true
                 }
-                false
             }
             "call_expression" => {
                 collect_call(node, module_path, source, output);
@@ -260,7 +294,7 @@ fn collect_call(node: Node<'_>, module_path: &ModulePath, source: &str, output: 
     let Some(argument) = named.next() else { return };
     // Only literal module specifiers are statically resolvable. Expressions and
     // template substitutions intentionally do not become graph edges.
-    if named.next().is_none() {
+    if kind == ImportKind::Dynamic || named.next().is_none() {
         push_literal_import(output, module_path, source, argument, kind);
     }
 }
@@ -467,6 +501,37 @@ const ignoredTemplate = import(`./${name}`);
         assert!(imports[7..10].iter().all(|import| import.kind == ImportKind::Require));
         assert_eq!(imports[10].kind, ImportKind::Dynamic);
         assert_eq!(imports[11].kind, ImportKind::Static);
+    }
+
+    #[test]
+    fn export_modifiers_preserve_nested_runtime_dependencies() {
+        for extension in ["js", "jsx", "ts", "tsx"] {
+            for (source, expected) in [
+                ("export const load = () => import('./variable');", "./variable"),
+                ("export async function load() { return import('./function'); }", "./function"),
+                ("export default () => require('./default');", "./default"),
+                ("export const nested = () => () => import('./nested');", "./nested"),
+            ] {
+                let imports = JsTsParser
+                    .parse_imports(&ModulePath(format!("src/a.{extension}")), source)
+                    .unwrap();
+                assert_eq!(imports.len(), 1, "extension={extension}, source={source}");
+                assert_eq!(imports[0].specifier, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_import_options_do_not_hide_the_literal_specifier() {
+        let imports = JsTsParser
+            .parse_imports(
+                &ModulePath("src/data.ts".into()),
+                "const data = import('./data.json', { with: { type: 'json' } });",
+            )
+            .unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].specifier, "./data.json");
+        assert_eq!(imports[0].kind, ImportKind::Dynamic);
     }
 
     #[test]

@@ -159,6 +159,17 @@ pub mod domain {
         /// Framework marker packages imported for their side effects, such as Next.js
         /// `server-only` and `client-only`. The parser records syntax facts; adapters own meaning.
         pub marker_imports: Vec<String>,
+        /// Lexically valid source comments. Consumers must never infer directives by scanning raw
+        /// lines because comment-like text can occur inside strings, templates, JSX and regexes.
+        pub comments: Vec<SourceComment>,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SourceComment {
+        pub text: String,
+        pub line: usize,
+        pub column: usize,
+        pub standalone: bool,
     }
 
     /// Open layer identity; configured layer names remain first-class in the IR.
@@ -883,7 +894,10 @@ mod tests {
 
     #[test]
     fn banner_format_is_stable() {
-        assert_eq!(banner_lines(), ["Web Architecture Engine", "v0.0.29"]);
+        assert_eq!(
+            banner_lines(),
+            ["Web Architecture Engine", concat!("v", env!("CARGO_PKG_VERSION"))]
+        );
     }
 
     #[test]

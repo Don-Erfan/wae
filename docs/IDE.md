@@ -7,13 +7,18 @@ fingerprint and suppression behavior with the CLI. The server supports:
 - live diagnostics for open unsaved JS/TS documents through content-hashed overlays (the source
   tree is never modified and stale cache entries cannot match different disk content);
 - architecture hover with package, layer, runtime and framework ownership;
-- a preferred refactoring suggestion plus a separate rule-scoped suppression command that requires
-  a concrete reason before applying a real `WorkspaceEdit` (placeholder suppressions are rejected);
+- a preferred refactoring suggestion, an interactive rule-scoped suppression command in clients
+  that implement it, and a portable standard `WorkspaceEdit` template whose blank reason remains
+  invalid until the maintainer documents the exception;
 - configuration reload without restarting the editor.
 
-The server owns one long-lived `WorkspaceSession`. Document bursts are debounced for 75ms, each
-analysis has a generation ID, starting newer work cancels the previous token, analysis runs off the
-protocol event loop, and stale results are never published.
+The server owns one long-lived `WorkspaceSession` per canonical workspace folder and routes a
+document to the longest matching root. Folder add/remove notifications create or dispose sessions,
+and removal clears previously published diagnostics. Document bursts are debounced for 75ms per
+workspace, each analysis has a generation ID, starting newer work cancels the previous token,
+analysis runs off the protocol event loop, and stale results are never published. Positions are
+advertised and emitted as UTF-16 code units as required by the default LSP encoding. Suppressed
+diagnostics are not published as active IDE errors.
 
 Build the server with `cargo build -p wae-lsp --release`, or install `@don-erfan/wae` to receive
 the checksum-verified `wae-lsp` sidecar. It communicates over stdio.
@@ -38,4 +43,9 @@ VSIX/JetBrains ZIP artifacts; release checksums and the keyless Sigstore bundle 
 packages.
 
 Both clients treat `wae-lsp` as the single source of diagnostics; neither reimplements rules or
-resolution logic.
+resolution logic. VS Code supplies the richer interactive suppression-reason prompt. JetBrains
+uses the platform's standard CodeAction/WorkspaceEdit path: choose the suppression-template quick
+fix and complete the mandatory reason after `--`. `workspace/executeCommand` is also advertised
+and handled by the server, so suggestion commands no longer become silent no-ops in generic LSP
+clients. Plugin verification proves binary/API compatibility; the framed protocol tests prove the
+shared actions and diagnostics contract.

@@ -28,6 +28,9 @@ resolution:
 
 architecture:
   layers:
+    tooling:
+      patterns: ["editors/**", "npm/**"]
+      canImport: []
     app:
       patterns: ["**/app/**"]
       canImport: ["features", "entities", "shared"]

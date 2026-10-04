@@ -61,11 +61,16 @@ enum Command {
         fail_on: Option<FailOn>,
         max_warnings: Option<usize>,
     },
-    BaselineCreate,
+    BaselineCreate {
+        config: Option<PathBuf>,
+    },
     BaselineList {
         rule: Option<String>,
+        config: Option<PathBuf>,
     },
-    BaselinePrune,
+    BaselinePrune {
+        config: Option<PathBuf>,
+    },
     SuppressionsList,
     SuppressionsValidate,
     SuppressionsPrune,
@@ -130,9 +135,15 @@ pub fn run_with_cancellation(
                 cancellation: cancellation.clone(),
             },
         ),
-        Command::BaselineCreate => commands::baseline_create(cwd, cancellation),
-        Command::BaselineList { rule } => commands::baseline_list(cwd, rule.as_deref()),
-        Command::BaselinePrune => commands::baseline_prune(cwd, cancellation),
+        Command::BaselineCreate { config } => {
+            commands::baseline_create(cwd, config.as_deref(), cancellation)
+        }
+        Command::BaselineList { rule, config } => {
+            commands::baseline_list(cwd, rule.as_deref(), config.as_deref())
+        }
+        Command::BaselinePrune { config } => {
+            commands::baseline_prune(cwd, config.as_deref(), cancellation)
+        }
         Command::SuppressionsList => commands::suppressions_list(cwd),
         Command::SuppressionsValidate => commands::suppressions_validate(cwd, cancellation),
         Command::SuppressionsPrune => commands::suppressions_prune(cwd),
@@ -163,20 +174,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
         "config" if args.get(1).map(String::as_str) == Some("validate") => {
             parse_config_validate(&args[2..])
         }
-        "baseline" if args.get(1).map(String::as_str) == Some("create") && args.len() == 2 => {
-            Ok(Command::BaselineCreate)
-        }
-        "baseline" if args.get(1).map(String::as_str) == Some("prune") && args.len() == 2 => {
-            Ok(Command::BaselinePrune)
-        }
-        "baseline" if args.get(1).map(String::as_str) == Some("list") => {
-            let rule = match &args[2..] {
-                [] => None,
-                [flag, rule] if flag == "--rule" => Some(rule.clone()),
-                _ => return Err("baseline list accepts only `--rule RULE_ID`".into()),
-            };
-            Ok(Command::BaselineList { rule })
-        }
+        "baseline" => parse_baseline(&args[1..]),
         "suppressions" if args.get(1).map(String::as_str) == Some("list") && args.len() == 2 => {
             Ok(Command::SuppressionsList)
         }
@@ -194,6 +192,35 @@ fn parse(args: &[String]) -> Result<Command, String> {
         "--version" | "-V" if args.len() == 1 => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         _ => Err(format!("Invalid command or arguments: {}", args.join(" "))),
+    }
+}
+
+fn parse_baseline(args: &[String]) -> Result<Command, String> {
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err("baseline requires create, list, or prune".into());
+    };
+    let mut rule = None;
+    let mut config = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--rule" if action == "list" => {
+                index += 1;
+                rule = Some(args.get(index).ok_or("--rule requires a value")?.clone());
+            }
+            "--config" => {
+                index += 1;
+                config = Some(PathBuf::from(args.get(index).ok_or("--config requires a value")?));
+            }
+            value => return Err(format!("unsupported baseline option `{value}`")),
+        }
+        index += 1;
+    }
+    match action {
+        "create" => Ok(Command::BaselineCreate { config }),
+        "list" => Ok(Command::BaselineList { rule, config }),
+        "prune" => Ok(Command::BaselinePrune { config }),
+        value => Err(format!("unknown baseline action `{value}`")),
     }
 }
 
@@ -348,7 +375,7 @@ fn usage() -> String {
     "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n        [--fail-on error|warning] [--max-warnings N]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  suppressions list|validate|prune\n                               Inspect, audit, or remove expired config suppressions\n  config validate [--show-overlaps] [--show-coverage] [--show-unassigned]\n                               Validate config, ownership and coverage\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
     .replace(
         "baseline create              Explicitly record current violations",
-        "baseline create|list|prune   Create, inspect, or remove stale baseline entries",
+        "baseline create|list|prune [--config PATH]\n                               Create, inspect, or prune using the selected config",
     )
 }
 
@@ -506,6 +533,23 @@ mod tests {
     }
 
     #[test]
+    fn baseline_commands_accept_the_same_custom_config_selector_as_check() {
+        assert!(matches!(
+            parse(&[
+                "baseline".into(),
+                "list".into(),
+                "--rule".into(),
+                "ARCH-003".into(),
+                "--config".into(),
+                "custom.yaml".into(),
+            ])
+            .unwrap(),
+            Command::BaselineList { rule: Some(rule), config: Some(config) }
+                if rule == "ARCH-003" && config == PathBuf::from("custom.yaml")
+        ));
+    }
+
+    #[test]
     fn check_supports_custom_config_no_cache_and_verbose_timing() {
         let root = std::env::temp_dir().join(format!("wae-observability-{}", std::process::id()));
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -530,6 +574,30 @@ mod tests {
         assert!(output.stderr.contains("WAE timing:"));
         assert!(output.stderr.contains("enabled=false"));
         assert!(!root.join(".wae/cache").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_check_uses_baseline_from_the_selected_custom_config() {
+        let root = std::env::temp_dir().join(format!("wae-custom-baseline-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "export const value = 1;").unwrap();
+        std::fs::write(
+            root.join("custom.yaml"),
+            "version: 1\nbaseline:\n  file: baseline-custom.json\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("baseline-custom.json"),
+            r#"{"schemaVersion":3,"createdAtUnix":0,"entries":[]}"#,
+        )
+        .unwrap();
+        let output = run(
+            &["check".into(), "--changed".into(), "--config".into(), "custom.yaml".into()],
+            &root,
+        );
+        assert!(!output.stderr.contains(".wae/baseline.json"), "{}", output.stderr);
+        assert!(!output.stderr.contains("baseline is missing"), "{}", output.stderr);
         std::fs::remove_dir_all(root).unwrap();
     }
 

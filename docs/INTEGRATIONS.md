@@ -17,7 +17,8 @@ identities and are parsed or registry-synchronized in the Rust test suite.
 - `dependency_path`: the deterministic shortest path between two resolved modules;
 - `architecture_model`: modules, packages, layers, runtimes, framework metadata, edges and
   diagnostics.
-- `dependency_policy`: whether an existing resolved edge is allowed and the diagnostics governing it.
+- `dependency_policy`: an `allowed`, `denied`, or `indeterminate` decision for a resolved edge,
+  including cycle/package-path attribution and suppression state.
 
 After installing the npm package, configure an MCP client to run the project-local executable:
 
@@ -43,6 +44,10 @@ least-recently-used or 30-minute-idle entries. Deployments can tune these bounds
 `McpServer::session_metrics` expose active, capacity and cumulative eviction counts. WAE
 intentionally exposes no network transport, so authentication belongs to an explicitly configured
 remote proxy rather than being silently omitted from a public socket.
+
+Every graph/path/policy query refreshes its workspace session against current disk content before
+answering; a previous `architecture_check` is not an implicit frozen snapshot. TTL expiry is tested
+before an entry is touched, including a repeated request for the same root.
 
 Tool execution failures are returned as MCP tool results with `isError: true`; malformed or unknown
 JSON-RPC methods use protocol errors. The server writes only protocol messages to stdout.
@@ -78,9 +83,9 @@ steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.29
+  - uses: Don-Erfan/wae@v0.0.30
     with:
-      version: 0.0.29
+      version: 0.0.30
       changed: "true"
       base: origin/main
       format: sarif

@@ -114,7 +114,7 @@ impl FrameworkAdapter for NextJsAdapter {
         } else {
             "none"
         };
-        let role = if file.starts_with("middleware.") || stem == "middleware" {
+        let role = if is_middleware_entry(&segments, stem) {
             "middleware"
         } else if app_index.is_some() {
             match stem {
@@ -183,6 +183,10 @@ impl FrameworkAdapter for NextJsAdapter {
             ("runtimeSource".into(), runtime_source.into()),
             ("useClient".into(), use_client.to_string()),
             ("useServer".into(), use_server.to_string()),
+            // Runtime traversal consumes this framework-neutral capability instead of
+            // coupling itself to a Next.js-specific role name. Future adapters can mark
+            // their own RPC/server-function boundary without teaching the graph about them.
+            ("rpcBoundary".into(), use_server.to_string()),
             ("serverOnly".into(), server_only.to_string()),
             ("clientOnly".into(), client_only.to_string()),
         ]);
@@ -199,6 +203,11 @@ fn router_root_index(segments: &[&str], router: &str) -> Option<usize> {
         ["src", second, ..] if *second == router => Some(1),
         _ => None,
     }
+}
+
+fn is_middleware_entry(segments: &[&str], stem: &str) -> bool {
+    stem == "middleware"
+        && (segments.len() == 1 || (segments.len() == 2 && segments.first() == Some(&"src")))
 }
 
 fn package_relative_path<'a>(path: &'a str, package_root: &str) -> &'a str {
@@ -309,12 +318,31 @@ mod tests {
             semantics: &server_action,
         });
         assert_eq!(action.metadata.attributes["role"], "server-action-module");
+        assert_eq!(action.metadata.attributes["rpcBoundary"], "true");
         let middleware = adapter.classify(ModuleEvidence {
             path: "src/middleware.ts",
             package_root: "",
             semantics: &empty,
         });
         assert_eq!(middleware.runtime, Runtime::Edge);
+    }
+
+    #[test]
+    fn middleware_convention_is_anchored_to_the_package_root_or_src_root() {
+        let adapter = NextJsAdapter;
+        let semantics = ModuleSemantics::default();
+        for path in ["middleware.ts", "src/middleware.ts"] {
+            let classification =
+                adapter.classify(ModuleEvidence { path, package_root: "", semantics: &semantics });
+            assert_eq!(classification.runtime, Runtime::Edge, "path={path}");
+            assert_eq!(classification.metadata.attributes["role"], "middleware");
+        }
+        for path in ["src/utils/middleware.ts", "features/middleware.ts"] {
+            let classification =
+                adapter.classify(ModuleEvidence { path, package_root: "", semantics: &semantics });
+            assert_eq!(classification.runtime, Runtime::Universal, "path={path}");
+            assert_eq!(classification.metadata.attributes["role"], "module");
+        }
     }
 
     #[test]

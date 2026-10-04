@@ -73,10 +73,13 @@ pub(crate) fn discover_project(
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .replace('\\', "/");
+            if exclude.is_match(&relative) {
+                continue;
+            }
             if is_analysis_input(entry.file_name().to_string_lossy().as_ref()) {
                 analysis_inputs.push(entry.path().to_path_buf());
             }
-            if !include.is_match(&relative) || exclude.is_match(&relative) {
+            if !include.is_match(&relative) {
                 continue;
             }
             let length =

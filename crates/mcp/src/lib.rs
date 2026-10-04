@@ -76,9 +76,10 @@ impl McpServer {
             let now = Instant::now();
             let access_order = self.access_clock.fetch_add(1, Ordering::Relaxed);
             let before = sessions.len();
-            sessions.retain(|path, entry| {
-                path == root || now.duration_since(entry.last_used) < self.policy.session_ttl
-            });
+            // Expiry is evaluated before touching the requested entry. Exempting the current root
+            // made a zero-TTL session live forever whenever the same workspace was queried again.
+            sessions
+                .retain(|_, entry| now.duration_since(entry.last_used) < self.policy.session_ttl);
             self.evicted_sessions
                 .fetch_add(before.saturating_sub(sessions.len()) as u64, Ordering::Relaxed);
             if let Some(entry) = sessions.get_mut(root) {
@@ -369,7 +370,7 @@ fn execute_tool(
         "dependency_path" => {
             let from = arguments.get("from").and_then(Value::as_str).ok_or("from is required")?;
             let to = arguments.get("to").and_then(Value::as_str).ok_or("to is required")?;
-            let analysis = server.analyze(&root, false)?;
+            let analysis = server.analyze(&root, true)?;
             let path = analysis
                 .graph
                 .shortest_path(&ModuleId(from.into()), &ModuleId(to.into()))
@@ -377,7 +378,7 @@ fn execute_tool(
             json!({ "from": from, "to": to, "path": path })
         }
         "architecture_model" => {
-            let analysis = server.analyze(&root, false)?;
+            let analysis = server.analyze(&root, true)?;
             let modules = analysis
                 .project
                 .modules
@@ -415,7 +416,7 @@ fn execute_tool(
         "dependency_policy" => {
             let from = arguments.get("from").and_then(Value::as_str).ok_or("from is required")?;
             let to = arguments.get("to").and_then(Value::as_str).ok_or("to is required")?;
-            let analysis = server.analyze(&root, false)?;
+            let analysis = server.analyze(&root, true)?;
             let edge_exists = analysis
                 .project
                 .dependencies
@@ -424,10 +425,7 @@ fn execute_tool(
             let diagnostics = analysis
                 .diagnostics
                 .iter()
-                .filter(|diagnostic| {
-                    diagnostic.dependency_path.first().is_some_and(|module| module.0 == from)
-                        && diagnostic.dependency_path.last().is_some_and(|module| module.0 == to)
-                })
+                .filter(|diagnostic| diagnostic_governs_edge(diagnostic, &analysis, from, to))
                 .collect::<Vec<_>>();
             let allowed = edge_exists.then(|| {
                 diagnostics.iter().all(|diagnostic| !analysis.failure_policy.is_failure(diagnostic))
@@ -437,12 +435,42 @@ fn execute_tool(
                 "to": to,
                 "edgeExists": edge_exists,
                 "allowed": allowed,
+                "decision": match allowed {
+                    Some(true) => "allowed",
+                    Some(false) => "denied",
+                    None => "indeterminate",
+                },
+                "suppressedDiagnostics": diagnostics.iter().filter(|diagnostic| diagnostic.suppressed).count(),
                 "diagnostics": diagnostics
             })
         }
         _ => return Err(format!("unknown tool `{name}`")),
     };
     Ok(structured)
+}
+
+fn diagnostic_governs_edge(
+    diagnostic: &wae_core::domain::Diagnostic,
+    analysis: &Analysis,
+    from: &str,
+    to: &str,
+) -> bool {
+    if diagnostic.dependency_path.windows(2).any(|edge| edge[0].0 == from && edge[1].0 == to) {
+        return true;
+    }
+    let packages = analysis
+        .project
+        .modules
+        .iter()
+        .map(|module| (module.id.0.as_str(), module.package.0.as_str()))
+        .collect::<HashMap<_, _>>();
+    let (Some(from_package), Some(to_package)) = (packages.get(from), packages.get(to)) else {
+        return false;
+    };
+    diagnostic.dependency_path.windows(2).any(|edge| {
+        edge[0].0.strip_prefix("package:") == Some(*from_package)
+            && edge[1].0.strip_prefix("package:") == Some(*to_package)
+    })
 }
 
 fn confined_root(requested: &Path, policy: &ServerPolicy) -> Result<PathBuf, String> {
@@ -521,28 +549,42 @@ mod tests {
     }
 
     #[test]
-    fn persistent_server_reuses_the_last_checked_workspace_snapshot_for_queries() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/basic");
+    fn persistent_server_refreshes_queries_after_files_change_on_disk() {
+        let root = std::env::temp_dir().join(format!("wae-mcp-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "import './b';").unwrap();
+        std::fs::write(root.join("src/b.ts"), "import './a';").unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\n").unwrap();
         let canonical = root.canonicalize().unwrap();
         let server = McpServer::new(&canonical, ServerPolicy::confined(&canonical));
-        let check = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "architecture_check", "arguments": {} }
-        });
-        assert_eq!(server.handle_message(check).unwrap()["result"]["isError"], false);
         let model = json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
             "params": { "name": "architecture_model", "arguments": {} }
         });
-        assert_eq!(server.handle_message(model).unwrap()["result"]["isError"], false);
+        let before = server.handle_message(model.clone()).unwrap();
+        assert!(
+            before["result"]["structuredContent"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["rule_id"] == "ARCH-001")
+        );
+        std::fs::write(root.join("src/b.ts"), "export const fixed = true;").unwrap();
+        let after = server.handle_message(model).unwrap();
+        assert!(
+            !after["result"]["structuredContent"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["rule_id"] == "ARCH-001")
+        );
         let session = Arc::clone(
             &server.sessions.lock().unwrap().get(&canonical).expect("workspace session").session,
         );
-        assert!(session.last_execution().reused_snapshot);
+        assert!(!session.last_execution().reused_snapshot);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -654,6 +696,37 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|diagnostic| { diagnostic["rule_id"] == "ARCH-002" })
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_policy_attributes_cycle_diagnostics_to_each_cycle_edge() {
+        let root = std::env::temp_dir().join(format!("wae-mcp-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "import './b';").unwrap();
+        std::fs::write(root.join("src/b.ts"), "import './a';").unwrap();
+        std::fs::write(root.join("wae.yaml"), "version: 1\n").unwrap();
+        let response = handle_message(
+            json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": { "name": "dependency_policy", "arguments": {
+                    "from": "src/a.ts", "to": "src/b.ts"
+                }}
+            }),
+            &root,
+        )
+        .unwrap();
+        let policy = &response["result"]["structuredContent"];
+        assert_eq!(policy["edgeExists"], true);
+        assert_eq!(policy["allowed"], false);
+        assert_eq!(policy["decision"], "denied");
+        assert!(
+            policy["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| { diagnostic["rule_id"] == "ARCH-001" })
         );
         std::fs::remove_dir_all(root).unwrap();
     }

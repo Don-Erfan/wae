@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use wae_core::domain::{Dependency, ModuleId, PackageName, Project, Runtime};
+use wae_core::domain::{Dependency, DependencyKind, ModuleId, PackageName, Project, Runtime};
 
 #[derive(Clone, Debug, Default)]
 pub struct ModuleGraph {
@@ -65,6 +65,12 @@ impl ModuleGraph {
     }
 
     pub fn edge_count(&self) -> usize {
+        self.typed_edge_count()
+    }
+
+    /// Number of dependency edges after exact `(source, target, kind)` deduplication. Coupling
+    /// degree methods intentionally count distinct neighboring modules instead.
+    pub fn typed_edge_count(&self) -> usize {
         self.edges.len()
     }
 
@@ -115,7 +121,7 @@ impl ModuleGraph {
     }
 
     pub fn out_degree(&self, node: &ModuleId) -> usize {
-        self.node_indices.get(node).map_or(0, |index| self.outgoing[*index].len())
+        self.node_indices.get(node).map_or(0, |index| distinct_sorted(&self.outgoing[*index]))
     }
 
     pub fn incoming(&self, node: &ModuleId) -> Vec<ModuleId> {
@@ -127,7 +133,7 @@ impl ModuleGraph {
     }
 
     pub fn in_degree(&self, node: &ModuleId) -> usize {
-        self.node_indices.get(node).map_or(0, |index| self.incoming[*index].len())
+        self.node_indices.get(node).map_or(0, |index| distinct_sorted(&self.incoming[*index]))
     }
 
     /// Computes deterministic shortest paths from all roots with one O(V+E) traversal.
@@ -481,6 +487,10 @@ impl ModuleGraph {
     }
 }
 
+fn distinct_sorted(values: &[usize]) -> usize {
+    usize::from(!values.is_empty()) + values.windows(2).filter(|pair| pair[0] != pair[1]).count()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeRequirement {
     pub runtime: Runtime,
@@ -525,12 +535,19 @@ impl RuntimeGraph {
             .modules
             .iter()
             .filter(|module| {
-                module.framework_metadata.attributes.get("role").map(String::as_str)
-                    == Some("server-action-module")
+                module.framework_metadata.attributes.get("rpcBoundary").map(String::as_str)
+                    == Some("true")
             })
             .map(|module| module.id.clone())
             .collect();
-        let graph = ModuleGraph::from_project(project);
+        // Type-only imports remain useful to architecture rules, but TypeScript erases them from
+        // emitted JavaScript. Runtime propagation must therefore use a typed projection rather
+        // than the complete architecture graph.
+        let mut runtime_project = project.clone();
+        runtime_project
+            .dependencies
+            .retain(|dependency| dependency.kind != DependencyKind::TypeOnly);
+        let graph = ModuleGraph::from_project(&runtime_project);
         let mut runtime_reachability = HashMap::new();
         for runtime in [Runtime::Browser, Runtime::Server, Runtime::Edge, Runtime::Node] {
             let targets = runtimes
@@ -1038,13 +1055,47 @@ mod tests {
     }
 
     #[test]
+    fn runtime_graph_excludes_type_only_edges_but_keeps_mixed_runtime_edges() {
+        let package = Package { name: PackageName("web".into()), root_path: "/app".into() };
+        let mut browser = module(&package, "browser");
+        browser.runtime = Runtime::Browser;
+        let mut server = module(&package, "server");
+        server.runtime = Runtime::Server;
+        let type_only =
+            Dependency { kind: DependencyKind::TypeOnly, ..dependency("browser", "server") };
+        let type_project = ProjectBuilder::new()
+            .add_package(package.clone())
+            .add_module(browser.clone())
+            .add_module(server.clone())
+            .add_dependency(type_only)
+            .build();
+        assert!(
+            RuntimeGraph::from_project(&type_project)
+                .shortest_path_to_runtime(&ModuleId("browser".into()), &[Runtime::Server])
+                .is_none()
+        );
+
+        let runtime_project = ProjectBuilder::new()
+            .add_package(package)
+            .add_module(browser)
+            .add_module(server)
+            .add_dependency(dependency("browser", "server"))
+            .build();
+        assert!(
+            RuntimeGraph::from_project(&runtime_project)
+                .shortest_path_to_runtime(&ModuleId("browser".into()), &[Runtime::Server])
+                .is_some()
+        );
+    }
+
+    #[test]
     fn server_actions_are_rpc_boundaries_for_runtime_propagation() {
         let package = Package { name: PackageName("web".into()), root_path: "/app".into() };
         let mut browser = module(&package, "browser");
         browser.runtime = Runtime::Browser;
         let mut action = module(&package, "action");
         action.runtime = Runtime::Server;
-        action.framework_metadata.attributes.insert("role".into(), "server-action-module".into());
+        action.framework_metadata.attributes.insert("rpcBoundary".into(), "true".into());
         let mut node = module(&package, "node");
         node.runtime = Runtime::Node;
         let project = ProjectBuilder::new()
@@ -1072,6 +1123,38 @@ mod tests {
     }
 
     #[test]
+    fn rpc_boundary_is_framework_neutral_and_not_inferred_from_role_names() {
+        let package = Package { name: PackageName("web".into()), root_path: "/app".into() };
+        let mut browser = module(&package, "browser");
+        browser.runtime = Runtime::Browser;
+        let mut boundary = module(&package, "boundary");
+        boundary.runtime = Runtime::Server;
+        boundary
+            .framework_metadata
+            .attributes
+            .insert("role".into(), "some-framework-specific-role".into());
+        boundary.framework_metadata.attributes.insert("rpcBoundary".into(), "true".into());
+        let mut node = module(&package, "node");
+        node.runtime = Runtime::Node;
+        let project = ProjectBuilder::new()
+            .add_package(package)
+            .add_module(browser)
+            .add_module(boundary)
+            .add_module(node)
+            .add_dependency(dependency("browser", "boundary"))
+            .add_dependency(dependency("boundary", "node"))
+            .build();
+        assert!(
+            RuntimeGraph::from_project(&project)
+                .shortest_path_to_runtime(
+                    &ModuleId("browser".into()),
+                    &[Runtime::Server, Runtime::Node]
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn graph_deduplicates_edges_and_sorts_public_output() {
         let package =
             Package { name: PackageName(String::from("web")), root_path: String::from("/app") };
@@ -1086,11 +1169,30 @@ mod tests {
             .build();
         let graph = ModuleGraph::from_project(&project);
         assert_eq!(graph.edge_count(), 2);
+        assert_eq!(graph.typed_edge_count(), 2);
         assert_eq!(
             graph.nodes().iter().map(|node| node.0.as_str()).collect::<Vec<_>>(),
             vec!["A", "B", "C"]
         );
         assert_eq!(graph.edges()[0].from.0, "A");
+    }
+
+    #[test]
+    fn coupling_degree_counts_distinct_neighbors_not_typed_edges() {
+        let package = Package { name: PackageName("web".into()), root_path: "/app".into() };
+        let dynamic = Dependency { kind: DependencyKind::Dynamic, ..dependency("A", "B") };
+        let graph = ModuleGraph::from_project(
+            &ProjectBuilder::new()
+                .add_package(package.clone())
+                .add_module(module(&package, "A"))
+                .add_module(module(&package, "B"))
+                .add_dependency(dependency("A", "B"))
+                .add_dependency(dynamic)
+                .build(),
+        );
+        assert_eq!(graph.edge_count(), 2);
+        assert_eq!(graph.out_degree(&ModuleId("A".into())), 1);
+        assert_eq!(graph.in_degree(&ModuleId("B".into())), 1);
     }
 
     #[test]

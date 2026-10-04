@@ -92,10 +92,19 @@ impl BaselineMatcher {
     }
 }
 
+#[cfg(test)]
 pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
+    save_with_config(root, diagnostics, &config)
+}
+
+pub fn save_with_config(
+    root: &Path,
+    diagnostics: &[Diagnostic],
+    config: &Config,
+) -> Result<SaveResult, String> {
     let failure_policy = FailurePolicy::from_output(&config.output);
-    let path = root.join(config.baseline.file);
+    let path = root.join(&config.baseline.file);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -140,9 +149,14 @@ pub fn save(root: &Path, diagnostics: &[Diagnostic]) -> Result<SaveResult, Strin
     Ok(SaveResult { path, recorded, suppressed, informational })
 }
 
+#[cfg(test)]
 pub fn load(root: &Path) -> Result<BaselineMatcher, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
-    let path = root.join(config.baseline.file);
+    load_with_config(root, &config)
+}
+
+pub fn load_with_config(root: &Path, config: &Config) -> Result<BaselineMatcher, String> {
+    let path = root.join(&config.baseline.file);
     if !path.exists() {
         return Err(format!(
             "baseline is missing at {}; run `wae baseline create` explicitly",
@@ -188,9 +202,18 @@ fn read_stored(path: &Path) -> Result<StoredBaseline, String> {
     serde_json::from_str(&source).map_err(|error| format!("invalid baseline: {error}"))
 }
 
+#[cfg(test)]
 pub fn list(root: &Path, rule: Option<&str>) -> Result<Vec<BaselineEntry>, String> {
     let config = Config::load(root).map_err(|error| error.message)?;
-    let path = root.join(config.baseline.file);
+    list_with_config(root, rule, &config)
+}
+
+pub fn list_with_config(
+    root: &Path,
+    rule: Option<&str>,
+    config: &Config,
+) -> Result<Vec<BaselineEntry>, String> {
+    let path = root.join(&config.baseline.file);
     let stored = read_stored(&path)?;
     if !matches!(stored.schema_version, 2 | BASELINE_SCHEMA_VERSION) {
         return Err("baseline list requires schema v2 or newer; recreate the baseline".into());
@@ -202,9 +225,18 @@ pub fn list(root: &Path, rule: Option<&str>) -> Result<Vec<BaselineEntry>, Strin
         .collect())
 }
 
+#[cfg(test)]
 pub fn prune(root: &Path, diagnostics: &[Diagnostic]) -> Result<(PathBuf, usize, usize), String> {
     let config = Config::load(root).map_err(|error| error.message)?;
-    let path = root.join(config.baseline.file);
+    prune_with_config(root, diagnostics, &config)
+}
+
+pub fn prune_with_config(
+    root: &Path,
+    diagnostics: &[Diagnostic],
+    config: &Config,
+) -> Result<(PathBuf, usize, usize), String> {
+    let path = root.join(&config.baseline.file);
     let stored = read_stored(&path)?;
     if !matches!(stored.schema_version, 2 | BASELINE_SCHEMA_VERSION) {
         return Err("baseline prune requires schema v2 or newer; recreate the baseline".into());

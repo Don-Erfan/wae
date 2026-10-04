@@ -1,6 +1,6 @@
 {
   "name": "@don-erfan/wae",
-  "version": "0.0.29",
+  "version": "0.0.30",
   "description": "WAE CLI wrapper for frontend architecture checks",
   "license": "MIT",
   "repository": {
@@ -34,10 +34,10 @@
     "githubRepo": "Don-Erfan/wae"
   },
   "optionalDependencies": {
-    "@don-erfan/wae-linux-x64": "0.0.29",
-    "@don-erfan/wae-linux-arm64": "0.0.29",
-    "@don-erfan/wae-darwin-x64": "0.0.29",
-    "@don-erfan/wae-darwin-arm64": "0.0.29",
-    "@don-erfan/wae-win32-x64": "0.0.29"
+    "@don-erfan/wae-linux-x64": "0.0.30",
+    "@don-erfan/wae-linux-arm64": "0.0.30",
+    "@don-erfan/wae-darwin-x64": "0.0.30",
+    "@don-erfan/wae-darwin-arm64": "0.0.30",
+    "@don-erfan/wae-win32-x64": "0.0.30"
   }
 }

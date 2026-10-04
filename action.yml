@@ -8,7 +8,7 @@ inputs:
   version:
     description: Exact @don-erfan/wae version to install.
     required: false
-    default: "0.0.26"
+    default: "0.0.30"
   changed:
     description: Check only new fail-level violations in the Git affected closure.
     required: false
@@ -53,6 +53,7 @@ runs:
         WAE_ACTION_SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
         set -euo pipefail
+        echo "WAE GitHub Action resolved engine version: $WAE_ACTION_VERSION"
         case "$WAE_ACTION_VERSION" in
           *[!0-9A-Za-z._-]*) echo "Invalid WAE version" >&2; exit 2 ;;
         esac

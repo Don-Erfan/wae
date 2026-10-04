@@ -13,6 +13,8 @@ use super::{
 pub struct TsConfigPaths {
     pub base_url: PathBuf,
     pub aliases: Vec<PathAlias>,
+    /// Whether a compilerOptions.baseUrl declaration permits bare specifiers to resolve from it.
+    pub resolve_bare_specifiers: bool,
 }
 
 pub struct TsConfigLoader;
@@ -24,7 +26,11 @@ impl TsConfigLoader {
             .map(|name| project_root.join(name))
             .find(|path| path.is_file());
         let Some(path) = path else {
-            return Ok(TsConfigPaths { base_url: project_root.to_path_buf(), aliases: Vec::new() });
+            return Ok(TsConfigPaths {
+                base_url: project_root.to_path_buf(),
+                aliases: Vec::new(),
+                resolve_bare_specifiers: false,
+            });
         };
         let mut visited = BTreeSet::new();
         let resolved = load_tsconfig(&path, &mut visited)?;
@@ -36,7 +42,11 @@ impl TsConfigLoader {
         aliases.sort_by(|left, right| {
             alias_specificity(&right.pattern).cmp(&alias_specificity(&left.pattern))
         });
-        Ok(TsConfigPaths { base_url: PathBuf::new(), aliases })
+        Ok(TsConfigPaths {
+            base_url: resolved.base_url,
+            aliases,
+            resolve_bare_specifiers: resolved.explicit_base_url,
+        })
     }
 }
 
@@ -75,7 +85,62 @@ impl TsConfigIndex {
         if configs.is_empty() {
             configs.push(ScopedTsConfig {
                 directory: project_root.to_path_buf(),
-                paths: TsConfigPaths { base_url: project_root.to_path_buf(), aliases: Vec::new() },
+                paths: TsConfigPaths {
+                    base_url: project_root.to_path_buf(),
+                    aliases: Vec::new(),
+                    resolve_bare_specifiers: false,
+                },
+            });
+        }
+        configs.sort_by(|left, right| {
+            right
+                .directory
+                .components()
+                .count()
+                .cmp(&left.directory.components().count())
+                .then_with(|| left.directory.cmp(&right.directory))
+        });
+        Ok(Self { configs })
+    }
+
+    /// Builds the configured-project index only from source importers and their ancestors.
+    /// Unrelated generated/output trees cannot poison analysis, while every actually applicable
+    /// config and its `extends` closure is still loaded by `TsConfigLoader`.
+    pub fn from_importers(project_root: &Path, importers: &[PathBuf]) -> Result<Self, String> {
+        let project_root = project_root.canonicalize().map_err(|error| error.to_string())?;
+        let mut directories = BTreeSet::new();
+        for importer in importers {
+            let mut directory = importer.parent();
+            while let Some(candidate) = directory {
+                if !normalized_path_is_within(candidate, &project_root) {
+                    break;
+                }
+                if ["tsconfig.json", "jsconfig.json"]
+                    .into_iter()
+                    .any(|name| candidate.join(name).is_file())
+                {
+                    directories.insert(candidate.to_path_buf());
+                }
+                if normalize(candidate) == normalize(&project_root) {
+                    break;
+                }
+                directory = candidate.parent();
+            }
+        }
+        let mut configs = directories
+            .into_iter()
+            .map(|directory| {
+                TsConfigLoader::load(&directory).map(|paths| ScopedTsConfig { directory, paths })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if configs.is_empty() {
+            configs.push(ScopedTsConfig {
+                directory: project_root.clone(),
+                paths: TsConfigPaths {
+                    base_url: project_root,
+                    aliases: Vec::new(),
+                    resolve_bare_specifiers: false,
+                },
             });
         }
         configs.sort_by(|left, right| {
@@ -120,23 +185,41 @@ impl ResolutionHandler for IndexedAliasResolver {
     fn try_resolve(&self, request: &ResolutionRequest<'_>) -> Option<Resolution> {
         let importer = Path::new(&request.importer.0);
         let paths = self.index.paths_for(importer)?;
-        AliasResolver {
+        let aliased = AliasResolver {
             root: paths.base_url.clone(),
             aliases: paths.aliases.clone(),
             mode: request.mode,
         }
-        .try_resolve(request)
+        .try_resolve(request);
+        if aliased.is_some() {
+            return aliased;
+        }
+        if !paths.resolve_bare_specifiers || request.specifier.starts_with(['.', '/', '#']) {
+            return None;
+        }
+        super::resolve_file_with_mode(&paths.base_url.join(request.specifier), request.mode)
+            .map(Resolution::Module)
     }
 
     fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
         let importer = Path::new(&request.importer.0);
         let Some(paths) = self.index.paths_for(importer) else { return Vec::new() };
-        AliasResolver {
+        let mut candidates = AliasResolver {
             root: paths.base_url.clone(),
             aliases: paths.aliases.clone(),
             mode: request.mode,
         }
-        .candidate_paths(request)
+        .candidate_paths(request);
+        if candidates.is_empty()
+            && paths.resolve_bare_specifiers
+            && !request.specifier.starts_with(['.', '/', '#'])
+        {
+            candidates.extend(super::relative::resolution_candidates(
+                &paths.base_url.join(request.specifier),
+                request.mode,
+            ));
+        }
+        candidates
     }
 }
 
@@ -144,6 +227,7 @@ impl ResolutionHandler for IndexedAliasResolver {
 struct ResolvedTsConfig {
     base_url: PathBuf,
     aliases: BTreeMap<String, Vec<String>>,
+    explicit_base_url: bool,
 }
 
 fn load_tsconfig(path: &Path, visited: &mut BTreeSet<PathBuf>) -> Result<ResolvedTsConfig, String> {
@@ -169,11 +253,16 @@ fn load_tsconfig(path: &Path, visited: &mut BTreeSet<PathBuf>) -> Result<Resolve
                 canonical.display()
             ));
         }
-        None => ResolvedTsConfig { base_url: directory.to_path_buf(), aliases: BTreeMap::new() },
+        None => ResolvedTsConfig {
+            base_url: directory.to_path_buf(),
+            aliases: BTreeMap::new(),
+            explicit_base_url: false,
+        },
     };
     let compiler = &json["compilerOptions"];
     if let Some(base_url) = compiler.get("baseUrl").and_then(|value| value.as_str()) {
         resolved.base_url = directory.join(base_url);
+        resolved.explicit_base_url = true;
     }
     if let Some(paths) = compiler.get("paths").and_then(|value| value.as_object()) {
         for (pattern, targets) in paths {

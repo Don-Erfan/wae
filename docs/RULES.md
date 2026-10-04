@@ -27,8 +27,10 @@ Limits shortest transitive dependency depth from explicitly configured `entrypoi
 
 ## ARCH-007 / ARCH-008
 
-Limit direct unique outgoing (`max_fan_out`) and incoming (`max_fan_in`) module coupling. External
-and excluded nodes remain visible in the graph, so the reported count matches the analyzed model.
+Limit direct distinct-neighbor outgoing (`max_fan_out`) and incoming (`max_fan_in`) module
+coupling. Multiple typed edges to the same module count once for these rules; the graph's separate
+`typed_edge_count` retains static/dynamic/type/re-export/require edge multiplicity. External and
+excluded nodes remain visible in the graph, so the reported count matches the analyzed model.
 
 ## ARCH-009
 

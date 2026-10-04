@@ -35,6 +35,16 @@ test("wrapper and native manifests stay exact-versioned and script-free", () => 
   }
 });
 
+test("GitHub Action default stays synchronized with the wrapper version", () => {
+  const wrapper = require("../package.json");
+  const action = fs.readFileSync(path.join(__dirname, "../../../action.yml"), "utf8");
+  const versionInput = action.match(
+    /inputs:\s*[\s\S]*?version:\s*[\s\S]*?default:\s*["']([^"']+)["']/
+  );
+  assert.ok(versionInput, "action.yml must declare an exact default engine version");
+  assert.equal(versionInput[1], wrapper.version);
+});
+
 test("resolves a binary from a script-free optional platform package", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wae-platform-package-"));
   const binary = path.join(root, "@don-erfan", "wae-linux-x64", "bin", "wae");

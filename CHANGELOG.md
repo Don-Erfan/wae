@@ -8,8 +8,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.0.30] - 2026-10-04
+
+### Added
+
+- Added exact per-diagnostic golden coverage for all 21 configurable rules, including subject path,
+  primary location and suppression state; added exported-declaration, dynamic-import-options,
+  type-only runtime, scoped-tsconfig, lexical-suppression and multi-root LSP regressions.
+- Added multi-root LSP sessions, UTF-16 position conversion, portable suppression-template
+  WorkspaceEdits, server-side command handling, and fresh-on-query MCP workspace semantics.
+- Added discovery unknowns, proposal layer coverage and an explicit maintainer-confirmation flag.
+
+### Changed
+
+- Made runtime traversal consume the framework-neutral `rpcBoundary` capability, count distinct
+  fan-in/fan-out neighbors, and exclude type-only dependencies from runtime reachability.
+- Scoped TypeScript configuration discovery to importer ancestors, honored explicit `baseUrl`
+  without `paths`, and kept package fallback precedence when no local baseUrl target exists.
+- Made MCP dependency decisions edge-aware for cycle/package paths and return explicit
+  allowed/denied/indeterminate outcomes with suppressed-diagnostic evidence.
+
 ### Fixed
 
+- Preserved imports nested in exported declarations and accepted dynamic-import option arguments.
+- Prevented template/string/JSX text from becoming source suppressions and made suppression pruning
+  validate the fully edited YAML transaction before replacing the source document.
+- Honored custom config baseline paths in changed checks and every baseline subcommand.
+- Anchored Next.js middleware conventions to package roots, hid suppressed LSP diagnostics, and
+  synchronized the composite Action's default engine version with the npm wrapper.
+- Rejected parser-incompatible cache manifests before reading or merging their module shards, so
+  upgraded analyses cannot reuse stale semantic IR while rewriting the cache under a new contract.
 - Accepted GNU binary-mode checksum markers for Windows release assets and added a signed,
   idempotent npm-only recovery path that never rebuilds or overwrites an existing GitHub Release.
 
@@ -369,7 +397,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.29...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.30...HEAD
+[0.0.30]: https://github.com/Don-Erfan/wae/compare/v0.0.29...v0.0.30
 [0.0.29]: https://github.com/Don-Erfan/wae/compare/v0.0.28...v0.0.29
 [0.0.28]: https://github.com/Don-Erfan/wae/compare/v0.0.27...v0.0.28
 [0.0.27]: https://github.com/Don-Erfan/wae/compare/v0.0.26...v0.0.27

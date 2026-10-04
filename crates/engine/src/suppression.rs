@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use globset::Glob;
 use wae_config::SuppressionConfig;
 use wae_core::{
-    domain::{Diagnostic, Severity, SourceLocation},
+    domain::{Diagnostic, Severity, SourceComment, SourceLocation},
     rule_registry,
 };
 
@@ -19,15 +19,18 @@ pub(crate) struct SuppressionDirective {
 
 pub(crate) fn collect(
     file: &str,
-    source: &str,
+    comments: &[SourceComment],
     require_reason: bool,
     directives: &mut Vec<SuppressionDirective>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (index, line) in source.lines().enumerate() {
-        // Suppressions are deliberately restricted to standalone line comments. This avoids
-        // interpreting examples in string literals, templates and documentation as directives.
-        let Some(comment) = line.trim_start().strip_prefix("//") else { continue };
+    for source_comment in comments {
+        // Tree-sitter supplies lexical comment spans, so comment-like text in templates, strings,
+        // JSX and regular expressions cannot become policy directives.
+        if !source_comment.standalone {
+            continue;
+        }
+        let Some(comment) = source_comment.text.strip_prefix("//") else { continue };
         let comment = comment.trim_start();
         let (declaration, file_scope) =
             if let Some(declaration) = comment.strip_prefix("wae-ignore-file") {
@@ -44,7 +47,7 @@ pub(crate) fn collect(
         let (rule_id, reason) = declaration
             .split_once("--")
             .map_or((declaration, ""), |(rule, reason)| (rule.trim(), reason.trim()));
-        let line_number = index + 1;
+        let line_number = source_comment.line;
         let error = if rule_registry::descriptor(rule_id).is_none() {
             Some(format!("Suppression references unknown rule `{rule_id}`"))
         } else if require_reason && reason.is_empty() {
@@ -358,6 +361,16 @@ fn warning(file: &str, line: usize, message: String) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wae_core::domain::ModulePath;
+    use wae_parser::{JsTsParser, ParserAdapter};
+
+    fn comments(source: &str) -> Vec<SourceComment> {
+        JsTsParser
+            .parse_module(&ModulePath("src/app.tsx".into()), source)
+            .unwrap()
+            .semantics
+            .comments
+    }
 
     fn diagnostic(rule: &str, line: usize) -> Diagnostic {
         let mut diagnostic = Diagnostic::new(rule, "test");
@@ -372,7 +385,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         collect(
             "src/app.ts",
-            r#"const example = "// wae-ignore ARCH-001 -- documentation";"#,
+            &comments(r#"const example = "// wae-ignore ARCH-001 -- documentation";"#),
             true,
             &mut directives,
             &mut diagnostics,
@@ -387,7 +400,7 @@ mod tests {
         let mut collection_diagnostics = Vec::new();
         collect(
             "src/app.ts",
-            "// wae-ignore ARCH-003 -- approved boundary\nimports();",
+            &comments("// wae-ignore ARCH-003 -- approved boundary\nimports();"),
             true,
             &mut directives,
             &mut collection_diagnostics,
@@ -408,7 +421,7 @@ mod tests {
         let mut collection_diagnostics = Vec::new();
         collect(
             "src/app.ts",
-            "// wae-ignore-file ARCH-003 -- legacy module\nimports();",
+            &comments("// wae-ignore-file ARCH-003 -- legacy module\nimports();"),
             true,
             &mut directives,
             &mut collection_diagnostics,
@@ -417,6 +430,26 @@ mod tests {
         apply(&mut diagnostics, &mut directives, true);
         assert!(diagnostics[0].suppressed);
         assert_eq!(diagnostics[0].suppression_reason.as_deref(), Some("legacy module"));
+    }
+
+    #[test]
+    fn template_string_jsx_and_regular_string_examples_are_not_suppressions() {
+        let source = r#"
+const template = `
+// wae-ignore-file ARCH-001 -- documentation only
+`;
+const ordinary = "// wae-ignore ARCH-001 -- docs";
+const jsx = <pre>// wae-ignore ARCH-001 -- docs</pre>;
+// wae-ignore ARCH-003 -- actual policy
+import './dependency';
+"#;
+        let mut directives = Vec::new();
+        let mut diagnostics = Vec::new();
+        collect("src/app.tsx", &comments(source), true, &mut directives, &mut diagnostics);
+        assert!(diagnostics.is_empty());
+        assert_eq!(directives.len(), 1);
+        assert_eq!(directives[0].rule_id, "ARCH-003");
+        assert!(!directives[0].file_scope);
     }
 
     #[test]

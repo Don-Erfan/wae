@@ -365,7 +365,11 @@ mod tests {
     fn tsconfig_scopes_match_equivalent_windows_verbatim_paths() {
         let index = TsConfigIndex::single(
             PathBuf::from(r"\\?\C:\repo"),
-            TsConfigPaths { base_url: PathBuf::new(), aliases: Vec::new() },
+            TsConfigPaths {
+                base_url: PathBuf::new(),
+                aliases: Vec::new(),
+                resolve_bare_specifiers: false,
+            },
         );
         assert!(index.paths_for(Path::new(r"C:\repo\src\app.ts")).is_some());
         assert!(index.paths_for(Path::new(r"C:\repository\app.ts")).is_none());
@@ -997,6 +1001,40 @@ mod tests {
                 Some(Resolution::Module(path)) if path.0.contains(&format!("/{package}/src/{package}/value.ts"))
             ));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_base_url_resolves_bare_internal_modules_without_paths() {
+        let root = std::env::temp_dir().join(format!("wae-base-url-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"baseUrl":"./src"}}"#)
+            .unwrap();
+        fs::write(root.join("src/utils.ts"), "export const value = true;").unwrap();
+        let importer = root.join("src/index.ts");
+        fs::write(&importer, "import 'utils';").unwrap();
+        let index = TsConfigIndex::from_importers(&root, std::slice::from_ref(&importer)).unwrap();
+        let resolver = IndexedAliasResolver::new(index);
+        assert!(matches!(
+            resolve_with(&resolver, &importer, "utils"),
+            Some(Resolution::Module(path)) if path.0.ends_with("src/utils.ts")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn importer_scoped_tsconfig_index_ignores_unrelated_invalid_output_configs() {
+        let root = std::env::temp_dir().join(format!("wae-ts-scope-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        let importer = root.join("src/index.ts");
+        fs::write(&importer, "export {};").unwrap();
+        fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{}}"#).unwrap();
+        fs::write(root.join("dist/tsconfig.json"), "{ invalid }").unwrap();
+        assert!(
+            TsConfigIndex::from_importers(&root, std::slice::from_ref(&importer)).is_ok(),
+            "an unrelated generated tsconfig must not poison source analysis"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

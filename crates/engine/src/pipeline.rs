@@ -265,7 +265,7 @@ fn execute<P: ParserAdapter>(
     let DiscoveredWorkspace { root, config, files, analysis_inputs } = discovered;
     let architecture = CompiledArchitectureModel::compile(&config)?;
     let framework_registry = FrameworkRegistry::default();
-    let tsconfigs = TsConfigIndex::discover(&root).map_err(AnalysisError::Project)?;
+    let tsconfigs = TsConfigIndex::from_importers(&root, &files).map_err(AnalysisError::Project)?;
     let workspace_resolver =
         WorkspacePackageIndex::discover(&root).map_err(AnalysisError::Project)?;
     let package_scopes =
@@ -405,13 +405,6 @@ fn execute<P: ParserAdapter>(
                 }
             };
             let source_hash = stable_hash(source.as_bytes());
-            suppression::collect(
-                &module_id.0,
-                &source,
-                config.suppressions.require_reason,
-                &mut suppressions,
-                &mut project.diagnostics,
-            );
             let cached = cache.get(&module_id.0, source_hash, environment_hash);
             if cached.is_none() {
                 affected_modules.insert(module_id.clone());
@@ -463,6 +456,13 @@ fn execute<P: ParserAdapter>(
             } = prepared;
             if let Some(cached) = cached {
                 incremental.restored_modules += 1;
+                suppression::collect(
+                    &module_id.0,
+                    &cached.semantics.comments,
+                    config.suppressions.require_reason,
+                    &mut suppressions,
+                    &mut project.diagnostics,
+                );
                 PipelineTelemetry::measure(&mut telemetry.classification, || {
                     apply_framework_classification(
                         &mut project,
@@ -498,6 +498,13 @@ fn execute<P: ParserAdapter>(
             })?;
             let semantics = match parsed {
                 Ok(parsed) => {
+                    suppression::collect(
+                        &module_id.0,
+                        &parsed.semantics.comments,
+                        config.suppressions.require_reason,
+                        &mut suppressions,
+                        &mut project.diagnostics,
+                    );
                     PipelineTelemetry::measure(&mut telemetry.classification, || {
                         apply_framework_classification(
                             &mut project,

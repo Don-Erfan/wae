@@ -114,7 +114,9 @@ entrypoints. Modern modes prefer `exports`; when it is absent, runtime imports u
 `main`, while type-only imports prefer `types`/`typings`. Legacy values are package-relative paths
 and do not need a `./` prefix.
 
-The resolver selects the nearest ancestor `tsconfig.json` for each importer. It supports JSONC,
+The resolver selects the nearest ancestor `tsconfig.json` for each importer and indexes only source
+importer ancestors plus required `extends` closures, so unrelated generated configs cannot stop
+analysis. It supports JSONC,
 `extends`, `baseUrl`, `paths`, workspace manifests, package `exports`/`imports`, and conditional
 targets. In Node16/NodeNext mode, the importer extension and nearest package `type` determine
 whether a static edge uses the `import` or `require` condition. Dynamic imports always use
@@ -233,8 +235,10 @@ Warnings stay visible without breaking builds unless `output.fail_on: warning`, 
 informational diagnostics are excluded from the ratchet file.
 
 Schema-v3 entries retain rule, source, target, reason and optional numeric `expiresAt` Unix time.
-Use `wae baseline list [--rule ARCH-003]` for review and `wae baseline prune` to remove expired or
-resolved entries. `check --changed` refuses an expired baseline until it is pruned.
+Use `wae baseline list [--rule ARCH-003] [--config PATH]` for review and `wae baseline prune
+[--config PATH]` to remove expired or resolved entries. Create/list/prune and `check --changed`
+resolve the baseline from the same selected configuration. Changed mode refuses an expired baseline
+until it is pruned.
 
 Fingerprint identity is structural: rule ID, canonical source/target and stable file identity.
 Messages, severity, suggestions, line/column movement and `related_rules` presentation metadata do
@@ -261,7 +265,9 @@ with no configured layers emits an explicit warning. `wae doctor` includes the s
 Git is advisory because only `check --changed` requires it.
 
 For an existing repository, `wae discover` produces a read-only proposal with explicit evidence,
-confidence, detected config files and feature clusters. It recognizes authoritative Next.js
+project-kind confidence, detected config files, feature clusters, proposed layer coverage and a
+list of unknown policy decisions that still require maintainer confirmation. Framework/tooling
+confidence never claims that inferred layer dependencies are correct. It recognizes authoritative Next.js
 dependencies/configs, `nx.json`, `turbo.json`, FSD directory segments, `tsconfig.json` and
 `jsconfig.json`. No config is written until approval:
 
@@ -272,6 +278,9 @@ wae discover --write
 # Overwriting an existing file requires both flags:
 wae discover --write --force
 ```
+
+Even `--write` writes a candidate, not an approved architecture decision; review every reported
+unknown and `canImport` relationship before treating it as policy.
 
 The resolver selects `tsconfig.json` over `jsconfig.json` when both exist in one directory; otherwise
 either file supplies the nearest configured-project `baseUrl` and `paths` aliases.

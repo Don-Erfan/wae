@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use globset::{GlobBuilder, GlobSetBuilder};
+use ignore::WalkBuilder;
 use serde::Serialize;
 use wae_config::{Config, ConfigPreset, LayerConfig};
 use wae_framework::{FrameworkAdapter, NextJsAdapter, ProjectEvidence};
@@ -22,6 +24,15 @@ pub struct Evidence {
     pub weight: u8,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalCoverage {
+    pub source_modules: usize,
+    pub modules_matched_by_suggested_layers: usize,
+    /// `None` means that the repository contains no discoverable JS/TS source files.
+    pub percent: Option<u8>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryReport {
@@ -30,6 +41,11 @@ pub struct DiscoveryReport {
     pub evidence: Vec<Evidence>,
     pub config_files: Vec<String>,
     pub feature_clusters: Vec<String>,
+    pub proposal_coverage: ProposalCoverage,
+    /// Facts the detector cannot prove and that a maintainer should decide explicitly.
+    pub unknowns: Vec<String>,
+    /// Discovery is intentionally advisory: generated architecture policy always needs review.
+    pub requires_confirmation: bool,
     pub suggested_config: Config,
 }
 
@@ -129,14 +145,103 @@ pub fn discover(root: &Path) -> Result<DiscoveryReport, String> {
     if !feature_roots.is_empty() {
         suggested_config.architecture.features.roots = feature_roots;
     }
+    let proposal_coverage = proposal_coverage(root, &suggested_config)?;
+    let mut unknowns = Vec::new();
+    if fsd_segments.is_empty() {
+        unknowns.push(
+            "No layer directories were detected; layer ownership and allowed dependencies are unknown."
+                .into(),
+        );
+    } else {
+        unknowns.push(
+            "Directory names do not prove allowed layer dependencies; review every canImport policy."
+                .into(),
+        );
+    }
+    if matches!(project_kind, ProjectKind::Nx | ProjectKind::Turborepo) {
+        unknowns.push(
+            "Workspace tooling does not prove package ownership or package dependency policy."
+                .into(),
+        );
+    }
+    if next_score > 0 {
+        unknowns.push(
+            "Framework detection does not prove feature boundaries or public entrypoints.".into(),
+        );
+    }
+    if proposal_coverage.percent.is_some_and(|percent| percent < 100) {
+        unknowns.push(format!(
+            "Suggested layers cover only {} of {} discovered source modules; unmatched modules need ownership or an explicit exemption.",
+            proposal_coverage.modules_matched_by_suggested_layers,
+            proposal_coverage.source_modules
+        ));
+    }
     Ok(DiscoveryReport {
         project_kind,
         confidence,
         evidence,
         config_files,
         feature_clusters,
+        proposal_coverage,
+        unknowns,
+        requires_confirmation: true,
         suggested_config,
     })
+}
+
+fn proposal_coverage(root: &Path, config: &Config) -> Result<ProposalCoverage, String> {
+    let mut patterns = GlobSetBuilder::new();
+    for pattern in config.architecture.layers.values().flat_map(|layer| layer.patterns.iter()) {
+        patterns.add(
+            GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|error| format!("invalid suggested layer pattern `{pattern}`: {error}"))?,
+        );
+    }
+    let patterns = patterns.build().map_err(|error| error.to_string())?;
+    let mut source_modules = 0usize;
+    let mut matched = 0usize;
+    let mut walker = WalkBuilder::new(root);
+    walker.standard_filters(true).filter_entry(|entry| {
+        !entry.file_type().is_some_and(|kind| kind.is_dir())
+            || !matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".git"
+                        | ".wae"
+                        | ".next"
+                        | "node_modules"
+                        | "target"
+                        | "dist"
+                        | "build"
+                        | "coverage"
+                )
+            )
+    });
+    for entry in walker.build().filter_map(Result::ok) {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) || !is_source(entry.path()) {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root) else { continue };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        source_modules += 1;
+        matched += usize::from(patterns.is_match(&relative));
+    }
+    let percent = (source_modules > 0)
+        .then(|| ((matched.saturating_mul(100)) / source_modules).min(100) as u8);
+    Ok(ProposalCoverage { source_modules, modules_matched_by_suggested_layers: matched, percent })
+}
+
+fn is_source(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if name.contains(".d.") {
+        return false;
+    }
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+    )
 }
 
 fn suggested_config(kind: &ProjectKind) -> Config {
@@ -221,11 +326,17 @@ mod tests {
         std::fs::create_dir_all(root.join("src/features/cart")).unwrap();
         std::fs::write(root.join("package.json"), r#"{"dependencies":{"next":"15"}}"#).unwrap();
         std::fs::write(root.join("jsconfig.json"), "{}").unwrap();
+        std::fs::write(root.join("src/features/cart/index.ts"), "export const cart = true;")
+            .unwrap();
         let report = discover(&root).unwrap();
         assert_eq!(report.project_kind, ProjectKind::NextJs);
         assert_eq!(report.confidence, 100);
         assert_eq!(report.feature_clusters, ["src/features/cart"]);
         assert_eq!(report.suggested_config.framework.enabled, ["nextjs"]);
+        assert_eq!(report.proposal_coverage.source_modules, 1);
+        assert_eq!(report.proposal_coverage.percent, Some(100));
+        assert!(report.requires_confirmation);
+        assert!(report.unknowns.iter().any(|item| item.contains("public entrypoints")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -239,6 +350,7 @@ mod tests {
         assert_eq!(report.project_kind, ProjectKind::Turborepo);
         assert!(report.suggested_config.architecture.layers.contains_key("packages"));
         assert_eq!(report.suggested_config.framework.enabled, ["nextjs"]);
+        assert!(report.unknowns.iter().any(|item| item.contains("package ownership")));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
