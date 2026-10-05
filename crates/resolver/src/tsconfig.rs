@@ -166,9 +166,21 @@ impl TsConfigIndex {
     }
 
     pub(crate) fn paths_for(&self, importer: &Path) -> Option<&TsConfigPaths> {
-        self.configs
+        if let Some(config) = self
+            .configs
             .iter()
             .find(|config| normalized_path_is_within(importer, &config.directory))
+        {
+            return Some(&config.paths);
+        }
+
+        // Keep the normal resolution path allocation- and syscall-free. Canonicalization is only
+        // the compatibility fallback for an importer reached through a filesystem alias that
+        // cannot lexically match the canonical configured-project directory.
+        let canonical = importer.canonicalize().ok()?;
+        self.configs
+            .iter()
+            .find(|config| normalized_path_is_within(&canonical, &config.directory))
             .map(|config| &config.paths)
     }
 }

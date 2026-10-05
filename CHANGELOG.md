@@ -46,8 +46,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   LSP command handling without registering duplicate commands in the Extension Host.
 - Canonicalized temporary workspace URIs in cross-platform LSP protocol tests and added bounded
   message waits, preventing macOS/Windows path aliases from hanging the CI matrix indefinitely.
-- Canonicalized source importers before TypeScript configured-project scope selection, preserving
-  explicit `baseUrl` resolution through macOS path aliases, Windows verbatim paths and symlinks.
+- Canonicalized source importers during TypeScript configured-project indexing and, only after a
+  lexical scope miss, during lookup; this preserves fast-path performance while resolving explicit
+  `baseUrl` imports through macOS path aliases, Windows verbatim paths and symlinks.
 - Accepted GNU binary-mode checksum markers for Windows release assets and added a signed,
   idempotent npm-only recovery path that never rebuilds or overwrites an existing GitHub Release.
 

@@ -375,6 +375,30 @@ mod tests {
         assert!(index.paths_for(Path::new(r"C:\repository\app.ts")).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tsconfig_scope_lookup_falls_back_for_symlinked_importers() {
+        let real = std::env::temp_dir().join(format!("wae-tsconfig-real-{}", std::process::id()));
+        let alias = std::env::temp_dir().join(format!("wae-tsconfig-link-{}", std::process::id()));
+        fs::create_dir_all(real.join("src")).unwrap();
+        fs::write(real.join("src/app.ts"), "export {};").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        let index = TsConfigIndex::single(
+            canonical.clone(),
+            TsConfigPaths {
+                base_url: canonical,
+                aliases: Vec::new(),
+                resolve_bare_specifiers: false,
+            },
+        );
+
+        assert!(index.paths_for(&alias.join("src/app.ts")).is_some());
+
+        fs::remove_file(alias).unwrap();
+        fs::remove_dir_all(real).unwrap();
+    }
+
     fn resolve_with(
         resolver: &dyn ResolutionHandler,
         importer: &Path,
