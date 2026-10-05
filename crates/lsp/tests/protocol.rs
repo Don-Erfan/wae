@@ -389,12 +389,13 @@ fn stdio_server_reports_the_shared_synthetic_app_golden() {
     while published.len() < source_modules {
         let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics" {
-            let path = Url::parse(message["params"]["uri"].as_str().unwrap())
-                .unwrap()
-                .to_file_path()
-                .unwrap();
-            let relative =
-                path.strip_prefix(&fixture).unwrap().to_string_lossy().replace('\\', "/");
+            // Compare URI text: on Windows `canonicalize` yields a `\\?\C:\...` verbatim path while
+            // `Url::to_file_path` yields `C:\...`, so filesystem path prefixes would not match.
+            let uri = message["params"]["uri"].as_str().unwrap();
+            let relative = uri
+                .strip_prefix(root_uri.as_str())
+                .unwrap_or_else(|| panic!("{uri} is outside {root_uri}"))
+                .to_string();
             published
                 .insert(relative, message["params"]["diagnostics"].as_array().unwrap().clone());
         }
