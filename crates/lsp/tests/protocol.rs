@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use url::Url;
@@ -12,11 +14,13 @@ fn send(stdin: &mut impl Write, message: &Value) {
     stdin.flush().unwrap();
 }
 
-fn receive(reader: &mut BufReader<impl Read>) -> Value {
+fn read_message(reader: &mut BufReader<impl Read>) -> Option<Value> {
     let mut length = None;
     loop {
         let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
+        if reader.read_line(&mut header).unwrap() == 0 {
+            return None;
+        }
         if header == "\r\n" {
             break;
         }
@@ -26,13 +30,33 @@ fn receive(reader: &mut BufReader<impl Read>) -> Value {
     }
     let mut body = vec![0; length.expect("LSP Content-Length")];
     reader.read_exact(&mut body).unwrap();
-    serde_json::from_slice(&body).unwrap()
+    Some(serde_json::from_slice(&body).unwrap())
+}
+
+fn message_receiver(stdout: ChildStdout) -> Receiver<Value> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(message) = read_message(&mut reader) {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn receive(receiver: &Receiver<Value>) -> Value {
+    receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("wae-lsp did not produce the expected protocol message within 30 seconds")
 }
 
 #[test]
 fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
     let root = std::env::temp_dir().join(format!("wae-lsp-e2e-{}", std::process::id()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/a.ts"), "import './missing';").unwrap();
     fs::write(root.join("wae.yaml"), "version: 1\nresolution:\n  mode: bundler\n").unwrap();
     let root_uri = Url::from_directory_path(&root).unwrap().to_string();
@@ -43,18 +67,18 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout = message_receiver(child.stdout.take().unwrap());
 
     send(
         &mut stdin,
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":root_uri}}),
     );
-    let initialized = receive(&mut stdout);
+    let initialized = receive(&stdout);
     assert_eq!(initialized["id"], 1);
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
 
     let published = loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics" {
             break message;
         }
@@ -79,7 +103,7 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
             }
         }),
     );
-    let actions = receive(&mut stdout);
+    let actions = receive(&stdout);
     assert_eq!(actions["id"], 4);
     assert_eq!(actions["result"].as_array().unwrap().len(), 2);
     assert_eq!(
@@ -93,10 +117,10 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
             "params":{"command":"wae.showSuggestion","arguments":[{"suggestion":"Resolve the missing module."}]}
         }),
     );
-    let suggestion = receive(&mut stdout);
+    let suggestion = receive(&stdout);
     assert_eq!(suggestion["method"], "window/showMessage");
     assert_eq!(suggestion["params"]["message"], "Resolve the missing module.");
-    assert_eq!(receive(&mut stdout)["id"], 5);
+    assert_eq!(receive(&stdout)["id"], 5);
 
     send(
         &mut stdin,
@@ -116,7 +140,7 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
         );
     }
     let settled = loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics"
             && message["params"]["uri"] == document_uri
             && message["params"]["diagnostics"].as_array().is_some_and(Vec::is_empty)
@@ -134,7 +158,7 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
         }),
     );
     let hover = loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["id"] == 3 {
             break message;
         }
@@ -143,7 +167,7 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
 
     send(&mut stdin, &json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit","params":null}));
-    assert_eq!(receive(&mut stdout)["id"], 2);
+    assert_eq!(receive(&stdout)["id"], 2);
     drop(stdin);
     assert!(child.wait().unwrap().success());
     fs::remove_dir_all(root).unwrap();
@@ -156,6 +180,9 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
     let broken = parent.join("broken");
     fs::create_dir_all(clean.join("src")).unwrap();
     fs::create_dir_all(broken.join("src")).unwrap();
+    let parent = parent.canonicalize().unwrap();
+    let clean = clean.canonicalize().unwrap();
+    let broken = broken.canonicalize().unwrap();
     fs::write(clean.join("src/index.ts"), "export const clean = true;").unwrap();
     let source = "const emoji = \"😀\"; import './missing';";
     fs::write(broken.join("src/index.ts"), source).unwrap();
@@ -170,7 +197,7 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout = message_receiver(child.stdout.take().unwrap());
     send(
         &mut stdin,
         &json!({
@@ -181,12 +208,12 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
             ]}
         }),
     );
-    let initialized = receive(&mut stdout);
+    let initialized = receive(&stdout);
     assert_eq!(initialized["result"]["capabilities"]["positionEncoding"], "utf-16");
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
 
     let diagnostic = loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics"
             && message["params"]["uri"] == broken_uri
             && message["params"]["diagnostics"].as_array().is_some_and(|items| !items.is_empty())
@@ -203,6 +230,7 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
 
     let added = parent.join("added");
     fs::create_dir_all(added.join("src")).unwrap();
+    let added = added.canonicalize().unwrap();
     fs::write(added.join("src/index.ts"), "import './missing';").unwrap();
     fs::write(added.join("wae.yaml"), "version: 1\n").unwrap();
     let added_root_uri = Url::from_directory_path(&added).unwrap().to_string();
@@ -215,7 +243,7 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
         }),
     );
     loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics"
             && message["params"]["uri"] == added_file_uri
             && message["params"]["diagnostics"].as_array().is_some_and(|items| !items.is_empty())
@@ -231,7 +259,7 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
         }),
     );
     loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics"
             && message["params"]["uri"] == added_file_uri
             && message["params"]["diagnostics"] == json!([])
@@ -242,7 +270,7 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
 
     send(&mut stdin, &json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit","params":null}));
-    while receive(&mut stdout)["id"] != 2 {}
+    while receive(&stdout)["id"] != 2 {}
     drop(stdin);
     assert!(child.wait().unwrap().success());
     fs::remove_dir_all(parent).unwrap();
@@ -252,6 +280,7 @@ fn stdio_server_routes_multiple_workspaces_and_uses_utf16_positions() {
 fn stdio_server_does_not_publish_suppressed_diagnostics_as_errors() {
     let root = std::env::temp_dir().join(format!("wae-lsp-suppressed-{}", std::process::id()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(
         root.join("src/a.ts"),
         "// wae-ignore-file ARCH-001 -- approved migration exception\nimport './a';",
@@ -266,15 +295,15 @@ fn stdio_server_does_not_publish_suppressed_diagnostics_as_errors() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout = message_receiver(child.stdout.take().unwrap());
     send(
         &mut stdin,
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":Url::from_directory_path(&root).unwrap().to_string()}}),
     );
-    assert_eq!(receive(&mut stdout)["id"], 1);
+    assert_eq!(receive(&stdout)["id"], 1);
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
     let diagnostics = loop {
-        let message = receive(&mut stdout);
+        let message = receive(&stdout);
         if message["method"] == "textDocument/publishDiagnostics"
             && message["params"]["uri"] == source_uri
         {
@@ -284,7 +313,7 @@ fn stdio_server_does_not_publish_suppressed_diagnostics_as_errors() {
     assert_eq!(diagnostics, json!([]));
     send(&mut stdin, &json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
     send(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit","params":null}));
-    while receive(&mut stdout)["id"] != 2 {}
+    while receive(&stdout)["id"] != 2 {}
     drop(stdin);
     assert!(child.wait().unwrap().success());
     fs::remove_dir_all(root).unwrap();
