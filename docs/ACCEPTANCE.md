@@ -13,6 +13,9 @@ fixtures form one deterministic synthetic product matrix:
 | RUNTIME-001..006 | `runtime` |
 | 12-package production workspace | `monorepo-12` |
 | Nx and Turborepo consumer layouts | `nx-workspace`, `turbo-workspace` |
+| Every rule family in one product, identical on CLI/MCP/LSP | `synthetic-app` + `expected-diagnostics.json` |
+| Baseline ratchet on a real Git history | `synthetic-app` copied into a temporary repository |
+| Rust crate dependency direction (dogfooding) | `crates/cli/tests/workspace_architecture.rs` |
 | 500-module cold/warm/fault injection | `real_world_scale` integration test |
 
 The large scenario creates a 500-module Next.js-style dependency chain, verifies a clean cold run,
@@ -27,4 +30,12 @@ cargo test -p wae-engine --release --locked \
   --test real_world_scale \
   five_hundred_module_next_project_supports_warm_analysis_and_fault_injection \
   -- --ignored --exact
+```
+
+The synthetic product and the real-world audit are described in
+[Real-world validation](REAL_WORLD_VALIDATION.md). Regenerate the synthetic golden file only after
+reviewing every changed diagnostic:
+
+```bash
+WAE_UPDATE_GOLDEN=1 cargo test -p wae-cli --test synthetic_app
 ```

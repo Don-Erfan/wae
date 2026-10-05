@@ -42,6 +42,12 @@ Diagnostics / Reporters / Integrations
 - `mcp`: thin stdio JSON-RPC/MCP adapter روی engine
 - `cli`: command parsing and thin delivery adapter
 
+جهت وابستگی crateها قرارداد اجرایی است: `core` به هیچ crate داخلی وابسته نیست، crateهای تحلیلی
+(`config`، `parser`، `resolver`، `graph`، `rules`، `framework`، `discovery`، `engine`) هرگز به adapterها
+(`cli`، `lsp`، `mcp`، `reporters`) وابسته نمی‌شوند و هیچ crateی به `cli`/`lsp`/`mcp` وابسته نیست.
+تست `crates/cli/tests/workspace_architecture.rs` این جهت را از روی `Cargo.toml`ها enforce می‌کند و
+هر crate یا یال جدید نیازمند تصمیم صریح است.
+
 ## 4) Design Pattern Map (Refactoring.Guru-aligned)
 
 ### 4.1 الگوهای پیاده‌شده
@@ -61,6 +67,13 @@ Diagnostics / Reporters / Integrations
   می‌کند و پس از crash نیز نیازمند پاک‌کردن lock-file نیست.
 - `Actor / Stateful Session`: `WorkspaceSession` نسل تحلیل فعال و cancellation token را مالک است؛
   LSP تغییرها را debounce و در worker پس‌زمینه اجرا می‌کند و result قدیمی را publish نمی‌کند.
+- `Read Model / Projection`: `wae_engine::projection` نمای فقط‌خواندنی و deterministic از یک
+  `Analysis` می‌سازد (inspection یک module با runtime و دلیل آن، و overview گروه‌بندی‌شده بر اساس
+  package/layer/feature/runtime/violation). CLI (`wae graph --module`)، LSP (hover،
+  `wae.inspectModule`، `wae.architectureOverview`) و explorerهای IDE همین projection را render
+  می‌کنند و هیچ‌کدام منطق معماری را دوباره پیاده نمی‌کنند.
+- `Single Source of Truth`: مستندات هر rule (`wae_core::rule_docs`) منبع واحد `wae explain`، LSP،
+  MCP، SARIF help و فایل تولیدشده `docs/RULES.md` است.
 - `Ports & Adapters`: قرارداد `VcsPort` و `ChangeSet` در engine قرار دارد و Git/CLI در لبه می‌مانند؛ ruleها به command یا reporter وابسته نیستند.
 
 این انتخاب‌ها با تعریف‌های Refactoring.Guru هم‌راستا هستند: Facade سطح ساده‌ای روی subsystem می‌دهد، Strategy الگوریتم‌های قابل‌تعویض را جدا می‌کند، Chain درخواست را در handlerهای مرتب عبور می‌دهد، و Composite مجموعه‌ای از اجزا را پشت قرارداد مشترک قرار می‌دهد.

@@ -75,6 +75,10 @@ enum Command {
     SuppressionsValidate,
     SuppressionsPrune,
     Graph,
+    GraphModule {
+        module: String,
+        json: bool,
+    },
     Explore {
         output: PathBuf,
     },
@@ -85,6 +89,7 @@ enum Command {
         show_unassigned: bool,
     },
     Explain(String),
+    Rules,
     Resolve {
         importer: PathBuf,
         specifier: String,
@@ -93,6 +98,7 @@ enum Command {
     },
     Version,
     Help,
+    HelpFor(&'static str),
 }
 
 pub fn run(args: &[String], cwd: &Path) -> CliOutput {
@@ -106,7 +112,13 @@ pub fn run_with_cancellation(
 ) -> CliOutput {
     let command = match parse(args) {
         Ok(command) => command,
-        Err(error) => return CliOutput::project_error(format!("{error}\n\n{}", usage())),
+        Err(error) => {
+            let hint = args.first().and_then(|name| command_help(name)).map_or_else(
+                || "Run `wae help` for the list of commands.".to_string(),
+                str::to_string,
+            );
+            return CliOutput::project_error(format!("error: {error}\n\n{hint}"));
+        }
     };
     match command {
         Command::Init { preset } => commands::init(cwd, preset),
@@ -148,27 +160,39 @@ pub fn run_with_cancellation(
         Command::SuppressionsValidate => commands::suppressions_validate(cwd, cancellation),
         Command::SuppressionsPrune => commands::suppressions_prune(cwd),
         Command::Graph => commands::graph(cwd, cancellation),
+        Command::GraphModule { module, json } => {
+            commands::graph_module(cwd, &module, json, cancellation)
+        }
         Command::Explore { output } => commands::explore(cwd, output, cancellation),
         Command::Doctor => commands::doctor(cwd, cancellation),
         Command::ConfigValidate { show_overlaps, show_coverage, show_unassigned } => {
             commands::config_validate(cwd, show_overlaps, show_coverage, show_unassigned)
         }
         Command::Explain(rule) => commands::explain(&rule),
+        Command::Rules => commands::rules(),
         Command::Resolve { importer, specifier, kind, config } => {
             commands::resolve(cwd, importer, specifier, kind, config)
         }
         Command::Version => CliOutput::success(format!("wae {}", env!("CARGO_PKG_VERSION"))),
         Command::Help => CliOutput::success(usage()),
+        Command::HelpFor(name) => {
+            CliOutput::success(command_help(name).map_or_else(usage, str::to_string))
+        }
     }
 }
 
 fn parse(args: &[String]) -> Result<Command, String> {
     let Some(command) = args.first().map(String::as_str) else { return Ok(Command::Help) };
+    if args.len() > 1 && args[1..].iter().any(|arg| arg == "--help" || arg == "-h") {
+        if let Some((name, _)) = COMMAND_HELP.iter().find(|(name, _)| *name == command) {
+            return Ok(Command::HelpFor(name));
+        }
+    }
     match command {
         "init" => parse_init(&args[1..]),
         "scan" if args.len() == 1 => Ok(Command::Scan),
         "discover" => parse_discover(&args[1..]),
-        "graph" if args.len() == 1 => Ok(Command::Graph),
+        "graph" => parse_graph(&args[1..]),
         "explore" => parse_explore(&args[1..]),
         "doctor" if args.len() == 1 => Ok(Command::Doctor),
         "config" if args.get(1).map(String::as_str) == Some("validate") => {
@@ -186,31 +210,44 @@ fn parse(args: &[String]) -> Result<Command, String> {
         "suppressions" if args.get(1).map(String::as_str) == Some("prune") && args.len() == 2 => {
             Ok(Command::SuppressionsPrune)
         }
-        "explain" if args.len() == 2 => Ok(Command::Explain(args[1].clone())),
+        "explain" if args.len() == 2 && args[1] == "--list" => Ok(Command::Rules),
+        "explain" if args.len() == 2 => Ok(Command::Explain(args[1].to_ascii_uppercase())),
+        "explain" if args.len() == 1 => Err("explain requires a rule id such as ARCH-004".into()),
+        "rules" if args.len() == 1 => Ok(Command::Rules),
         "resolve" => parse_resolve(&args[1..]),
         "check" => parse_check(&args[1..]),
         "--version" | "-V" if args.len() == 1 => Ok(Command::Version),
-        "help" | "--help" | "-h" => Ok(Command::Help),
+        "help" | "--help" | "-h" => match args.get(1).map(String::as_str) {
+            Some(name) => COMMAND_HELP
+                .iter()
+                .find(|(command, _)| *command == name)
+                .map(|(command, _)| Command::HelpFor(command))
+                .ok_or_else(|| format!("unknown command `{name}`")),
+            None => Ok(Command::Help),
+        },
         _ => Err(format!("Invalid command or arguments: {}", args.join(" "))),
     }
 }
 
 fn parse_baseline(args: &[String]) -> Result<Command, String> {
-    let Some(action) = args.first().map(String::as_str) else {
-        return Err("baseline requires create, list, or prune".into());
+    // Bare `wae baseline [--config PATH]` is an explicit request to record current violations.
+    let (action, options) = match args.first().map(String::as_str) {
+        Some(action) if !action.starts_with('-') => (action, &args[1..]),
+        _ => ("create", args),
     };
     let mut rule = None;
     let mut config = None;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
             "--rule" if action == "list" => {
                 index += 1;
-                rule = Some(args.get(index).ok_or("--rule requires a value")?.clone());
+                rule = Some(options.get(index).ok_or("--rule requires a value")?.clone());
             }
             "--config" => {
                 index += 1;
-                config = Some(PathBuf::from(args.get(index).ok_or("--config requires a value")?));
+                config =
+                    Some(PathBuf::from(options.get(index).ok_or("--config requires a value")?));
             }
             value => return Err(format!("unsupported baseline option `{value}`")),
         }
@@ -361,6 +398,37 @@ fn parse_resolve(args: &[String]) -> Result<Command, String> {
     Ok(Command::Resolve { importer, specifier, kind, config })
 }
 
+fn parse_graph(args: &[String]) -> Result<Command, String> {
+    let mut module = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--module" => {
+                index += 1;
+                module = Some(args.get(index).ok_or("--module requires a path")?.clone());
+            }
+            "--format" => {
+                index += 1;
+                json = match args.get(index).map(String::as_str) {
+                    Some("json") => true,
+                    Some("human") => false,
+                    Some(value) => return Err(format!("unsupported graph format `{value}`")),
+                    None => return Err("--format requires a value".into()),
+                };
+            }
+            value => return Err(format!("unknown graph option `{value}`")),
+        }
+        index += 1;
+    }
+    match module {
+        Some(module) => Ok(Command::GraphModule { module, json }),
+        None if !json && args.is_empty() => Ok(Command::Graph),
+        None if json => Ok(Command::Graph),
+        None => Err("graph accepts `--module PATH` and `--format human|json`".into()),
+    }
+}
+
 fn parse_explore(args: &[String]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Explore { output: PathBuf::from(".wae/explorer.html") }),
@@ -372,12 +440,72 @@ fn parse_explore(args: &[String]) -> Result<Command, String> {
 }
 
 fn usage() -> String {
-    "Usage: wae <COMMAND>\n\nCommands:\n  init [--preset blank|fsd|next|nx]\n                               Create a safe, explicit wae.yaml\n  discover [--json] [--write] [--force]\n                               Infer an evidence-backed architecture proposal\n  scan                         Analyze and report module/dependency counts\n  check [--changed] [--base REF] [--format human|json|jsonl|sarif]\n        [--config PATH] [--no-cache] [--verbose]\n        [--fail-on error|warning] [--max-warnings N]\n  resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export]\n                               Trace every resolver handler and active condition\n  baseline create              Explicitly record current violations\n  suppressions list|validate|prune\n                               Inspect, audit, or remove expired config suppressions\n  config validate [--show-overlaps] [--show-coverage] [--show-unassigned]\n                               Validate config, ownership and coverage\n  graph                        Print the real dependency graph as JSON\n  explore [--output PATH]      Build a self-contained interactive architecture explorer\n  doctor                       Validate project/config/tooling with actionable errors\n  explain <RULE_ID>            Explain an architecture rule\n\nOptions:\n  -V, --version                Print the installed WAE version\n  -h, --help                   Print help\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled"
-    .replace(
-        "baseline create              Explicitly record current violations",
-        "baseline create|list|prune [--config PATH]\n                               Create, inspect, or prune using the selected config",
-    )
+    let mut text = String::from(
+        "Web Architecture Engine: deterministic architecture checks for JavaScript and TypeScript\n\nUsage: wae <COMMAND> [OPTIONS]\n\nCommands:\n",
+    );
+    for (name, help) in COMMAND_HELP {
+        let summary = help.lines().next().unwrap_or_default();
+        text.push_str(&format!("  {name:<13}{summary}\n"));
+    }
+    text.push_str(
+        "\nOptions:\n  -V, --version  Print the installed WAE version\n  -h, --help     Print help (use `wae <COMMAND> --help` for command details)\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled",
+    );
+    text
 }
+
+fn command_help(name: &str) -> Option<&'static str> {
+    COMMAND_HELP.iter().find(|(command, _)| *command == name).map(|(_, help)| *help)
+}
+
+/// First line: one-line summary for `wae help`. The full text is printed by `wae <cmd> --help`.
+const COMMAND_HELP: &[(&str, &str)] = &[
+    (
+        "init",
+        "Create a safe, explicit wae.yaml\n\nUsage: wae init [--preset blank|fsd|next|nx]\n\nThe default `blank` preset assigns no layers, so nothing is guessed. `fsd`, `next` and `nx`\nwrite repository-anchored layer patterns. Use `wae discover` to infer a proposal instead.",
+    ),
+    (
+        "discover",
+        "Infer an evidence-backed architecture proposal\n\nUsage: wae discover [--json] [--write [--force]]\n\nOptions:\n  --json     Print the proposal as JSON\n  --write    Write the proposal to wae.yaml (refuses to overwrite)\n  --force    Overwrite an existing wae.yaml (requires --write)\n\nThe proposal lists evidence, confidence and unknown decisions to review before adoption.",
+    ),
+    ("scan", "Analyze the project and report module and dependency counts\n\nUsage: wae scan"),
+    (
+        "check",
+        "Run every enabled rule and fail on violations\n\nUsage: wae check [OPTIONS]\n\nOptions:\n  --format human|json|jsonl|sarif  Output format (default: output.format or human)\n  --changed                       Fail only on violations new since the committed baseline,\n                                  limited to changed files and their importers\n  --base REF                      Git base for --changed (default: WAE_BASE_REF or merge base)\n  --config PATH                   Use another configuration file\n  --fail-on error|warning         Lowest severity that fails the check\n  --max-warnings N                Fail when more than N warnings are reported\n  --no-cache                      Neither read nor write the incremental cache\n  -v, --verbose                   Print timing and cache details to stderr\n\nExit codes: 0 passed, 1 violations, 2 config/project error, 3 internal error, 130 cancelled",
+    ),
+    (
+        "baseline",
+        "Record, review or prune accepted existing violations\n\nUsage: wae baseline [create|list|prune] [--rule RULE_ID] [--config PATH]\n\n  create (default)  Record current fail-level violations to the baseline file\n  list              Show baseline entries (optionally filtered by --rule)\n  prune             Remove expired or already-fixed entries\n\nCommit the baseline, then use `wae check --changed` to fail only on new violations.",
+    ),
+    (
+        "explain",
+        "Explain a rule: why it exists, bad and good examples, configuration\n\nUsage: wae explain <RULE_ID>\n       wae explain --list\n\nExample: wae explain ARCH-004",
+    ),
+    ("rules", "List every rule with its title and category\n\nUsage: wae rules"),
+    (
+        "graph",
+        "Print the dependency graph, or inspect one module\n\nUsage: wae graph [--format json]\n       wae graph --module PATH [--format human|json]\n\nWith --module, prints the module's package, layer, runtime (and why it has that runtime),\nits dependencies, its dependents and every diagnostic that involves it.",
+    ),
+    (
+        "resolve",
+        "Trace how one import specifier resolves\n\nUsage: wae resolve <IMPORTER> <SPECIFIER> [--kind static|dynamic|require|type|re-export] [--config PATH]\n\nPrints every resolver handler attempt, active package conditions and the final outcome.",
+    ),
+    (
+        "explore",
+        "Write a self-contained interactive architecture explorer (HTML)\n\nUsage: wae explore [--output PATH]   (default: .wae/explorer.html)",
+    ),
+    (
+        "config",
+        "Validate configuration, layer ownership and coverage\n\nUsage: wae config validate [--show-overlaps] [--show-coverage] [--show-unassigned]",
+    ),
+    (
+        "suppressions",
+        "List, audit or prune config-level suppressions\n\nUsage: wae suppressions list|validate|prune",
+    ),
+    (
+        "doctor",
+        "Check project, configuration and tooling with actionable advice\n\nUsage: wae doctor",
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -394,6 +522,101 @@ mod tests {
             assert_eq!(output.stdout, format!("wae {}", env!("CARGO_PKG_VERSION")));
         }
     }
+    #[test]
+    fn every_command_has_help_and_help_flags_never_run_the_command() {
+        for (name, _) in COMMAND_HELP {
+            for args in
+                [vec![name.to_string(), "--help".into()], vec!["help".into(), name.to_string()]]
+            {
+                let output = run(&args, Path::new("/nonexistent-wae-root"));
+                assert_eq!(output.exit_code, EXIT_PASSED, "{args:?}: {}", output.stderr);
+                assert!(output.stdout.contains("Usage: wae"), "{args:?}");
+            }
+        }
+        let nested = run(&["config".into(), "validate".into(), "-h".into()], Path::new("."));
+        assert!(nested.stdout.contains("--show-overlaps"));
+        assert!(usage().contains("graph"));
+    }
+
+    #[test]
+    fn invalid_arguments_print_the_command_help_instead_of_the_full_usage() {
+        let output = run(&["check".into(), "--frmat".into(), "json".into()], Path::new("."));
+        assert_eq!(output.exit_code, EXIT_PROJECT);
+        assert!(output.stderr.starts_with("error: unknown check option `--frmat`"));
+        assert!(output.stderr.contains("Usage: wae check"));
+        assert!(!output.stderr.contains("Usage: wae init"));
+        let unknown = run(&["chek".into()], Path::new("."));
+        assert!(unknown.stderr.contains("Run `wae help`"));
+    }
+
+    #[test]
+    fn explain_prints_full_documentation_and_rules_lists_the_registry() {
+        let output = run(&["explain".into(), "arch-004".into()], Path::new("."));
+        assert_eq!(output.exit_code, EXIT_PASSED);
+        for section in ["ARCH-004 — Feature boundary", "Why:", "Bad:", "Good:", "Configuration:"]
+        {
+            assert!(output.stdout.contains(section), "missing {section}");
+        }
+        assert!(!output.stdout.lines().any(|line| line.ends_with(' ')));
+        let rules = run(&["rules".into()], Path::new("."));
+        assert_eq!(rules.exit_code, EXIT_PASSED);
+        for rule in wae_core::rule_registry::RULES {
+            assert!(rules.stdout.contains(rule.id));
+        }
+        assert_eq!(run(&["explain".into(), "--list".into()], Path::new(".")).stdout, rules.stdout);
+        let unknown = run(&["explain".into(), "ARCH-999".into()], Path::new("."));
+        assert_eq!(unknown.exit_code, EXIT_PROJECT);
+        assert!(unknown.stderr.contains("wae rules"));
+    }
+
+    #[test]
+    fn graph_module_explains_edges_runtime_and_diagnostics() {
+        let human = run(
+            &["graph".into(), "--module".into(), "./src/app/server.ts".into()],
+            &fixture("runtime"),
+        );
+        assert_eq!(human.exit_code, EXIT_PASSED, "{}", human.stderr);
+        assert!(human.stdout.starts_with("src/app/server.ts\n"));
+        assert!(human.stdout.contains("Dependents ("));
+        assert!(human.stdout.contains("RUNTIME-001"));
+        let json = run(
+            &[
+                "graph".into(),
+                "--module".into(),
+                "src/app/server.ts".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+            &fixture("runtime"),
+        );
+        let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+        assert_eq!(value["runtime"]["runtime"], "server");
+        assert!(
+            value["dependents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| edge["module"] == "src/app/client.tsx")
+        );
+        let missing =
+            run(&["graph".into(), "--module".into(), "src/nope.ts".into()], &fixture("runtime"));
+        assert_eq!(missing.exit_code, EXIT_PROJECT);
+        assert!(parse(&["graph".into()]).is_ok_and(|command| command == Command::Graph));
+    }
+
+    #[test]
+    fn bare_baseline_is_an_explicit_create_request() {
+        assert_eq!(parse(&["baseline".into()]).unwrap(), Command::BaselineCreate { config: None });
+        assert_eq!(
+            parse(&["baseline".into(), "--config".into(), "custom.yaml".into()]).unwrap(),
+            Command::BaselineCreate { config: Some(PathBuf::from("custom.yaml")) }
+        );
+        assert!(
+            parse(&["baseline".into(), "list".into(), "--rule".into(), "ARCH-001".into()]).is_ok()
+        );
+        assert!(parse(&["baseline".into(), "--rule".into(), "ARCH-001".into()]).is_err());
+    }
+
     #[test]
     fn circular_fixture_runs_end_to_end_without_a_diagnostic_input_file() {
         let output = run(&["check".into(), "--format".into(), "json".into()], &fixture("circular"));

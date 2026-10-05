@@ -327,6 +327,24 @@ impl ModuleGraph {
         components
     }
 
+    /// The value-level projection of this graph: TypeScript erases `import type`/`export type`,
+    /// so cycles that exist only through type-only edges never execute. Borrowed when the graph
+    /// has no type-only edges; otherwise rebuilt in O(V + E) preserving the deterministic order.
+    pub fn without_type_only_edges(&self) -> std::borrow::Cow<'_, ModuleGraph> {
+        use wae_core::domain::DependencyKind;
+        if !self.edges.iter().any(|edge| edge.kind == DependencyKind::TypeOnly) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut graph = ModuleGraph::new();
+        for node in &self.nodes {
+            graph.add_node_internal(node.clone());
+        }
+        for edge in self.edges.iter().filter(|edge| edge.kind != DependencyKind::TypeOnly) {
+            graph.add_edge_internal(edge.clone());
+        }
+        std::borrow::Cow::Owned(graph)
+    }
+
     pub fn cycles(&self) -> Vec<Vec<ModuleId>> {
         let mut cycles = Vec::new();
 

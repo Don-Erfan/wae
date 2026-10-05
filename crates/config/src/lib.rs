@@ -298,6 +298,11 @@ pub enum ResolutionMode {
 pub struct ResolutionConfig {
     pub mode: ResolutionMode,
     pub custom_conditions: Vec<String>,
+    /// Import-specifier globs for build-generated or bundler-virtual modules (for example
+    /// `contentlayer/generated` or `virtual:*`). They become opaque `virtual:` externals instead
+    /// of RESOLVE-001, but only when the normal resolver chain cannot find a real module.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub virtual_modules: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +412,8 @@ pub struct ForbiddenDependency {
 pub enum RuleConfig {
     Severity(Severity),
     Detailed(RuleOptions),
+    /// The ESLint-style `off` shorthand, equivalent to `{ enabled: false }`.
+    Off(RuleOff),
 }
 
 impl RuleConfig {
@@ -414,14 +421,37 @@ impl RuleConfig {
         match self {
             Self::Severity(value) => Some(value.clone()),
             Self::Detailed(options) if options.enabled => Some(options.severity.clone()),
-            Self::Detailed(_) => None,
+            Self::Detailed(_) | Self::Off(_) => None,
         }
     }
 
     pub fn options(&self) -> Option<&RuleOptions> {
         match self {
             Self::Detailed(options) => Some(options),
-            Self::Severity(_) => None,
+            Self::Severity(_) | Self::Off(_) => None,
+        }
+    }
+}
+
+/// Serialized as the literal string `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleOff;
+
+impl Serialize for RuleOff {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("off")
+    }
+}
+
+impl<'de> Deserialize<'de> for RuleOff {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value == "off" {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "expected error, warning, info or off, found `{value}`"
+            )))
         }
     }
 }
@@ -439,6 +469,9 @@ pub struct RuleOptions {
     pub max_fan_in: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub entrypoints: Vec<String>,
+    /// ARCH-001 only: also report cycles that exist solely through type-only imports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_type_only: Option<bool>,
 }
 impl Default for RuleOptions {
     fn default() -> Self {
@@ -449,6 +482,7 @@ impl Default for RuleOptions {
             max_fan_out: None,
             max_fan_in: None,
             entrypoints: Vec::new(),
+            include_type_only: None,
         }
     }
 }
@@ -831,6 +865,7 @@ impl Config {
                 ));
             }
         }
+        validate_patterns(&self.resolution.virtual_modules, "resolution.virtual_modules")?;
         let supported_frameworks = ["nextjs"];
         if let Some((index, framework)) = self
             .framework
@@ -903,6 +938,7 @@ impl Config {
                         || options.max_fan_out.is_some()
                         || options.max_fan_in.is_some()
                         || !options.entrypoints.is_empty()
+                        || options.include_type_only.is_some()
                 }) {
                     return Err(config_error(
                         ConfigErrorKind::ConflictingConfig,
@@ -931,6 +967,11 @@ impl Config {
                     "entrypoints",
                     !options.entrypoints.is_empty(),
                     descriptor.supports_option("entrypoints"),
+                ),
+                (
+                    "include_type_only",
+                    options.include_type_only.is_some(),
+                    descriptor.supports_option("include_type_only"),
                 ),
             ] {
                 if configured && !supported {
@@ -1238,6 +1279,24 @@ mod tests {
         assert_eq!(config.rules["ARCH-005"].severity(), Some(Severity::Error));
         assert!(config.configured);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_shorthand_disables_rules_and_overrides_and_round_trips() {
+        let config: Config = yaml_serde::from_str(
+            "version: 1\nrules:\n  ARCH-001: off\noverrides:\n  - files: ['src/legacy/**']\n    rules:\n      ARCH-003: off\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.rules["ARCH-001"], RuleConfig::Off(RuleOff));
+        assert!(!config.rule_enabled_anywhere("ARCH-001"));
+        assert_eq!(config.rule_severity_for_path("ARCH-003", "src/legacy/a.ts"), None);
+        let reparsed: Config = yaml_serde::from_str(&config.to_yaml().unwrap()).unwrap();
+        assert_eq!(reparsed.rules["ARCH-001"], RuleConfig::Off(RuleOff));
+        let error = yaml_serde::from_str::<Config>("version: 1\nrules:\n  ARCH-001: disabled\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ARCH-001") || error.contains("variant"), "{error}");
     }
 
     #[test]

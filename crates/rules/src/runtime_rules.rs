@@ -152,9 +152,18 @@ impl Rule for AmbiguousUniversalRuntimeRule {
         {
             return Ok(());
         }
+        // Only declared browser boundaries ("use client", client-only, explicit runtime) impose a
+        // browser requirement. Modules that are merely bundled for the browser because some
+        // client component imports them stay universal for this rule; otherwise every universal
+        // importer of a shared helper would be reported (the client leak itself is RUNTIME-001).
+        let declared_browser =
+            modules_with_runtime(context, Runtime::Browser).into_iter().collect::<HashSet<_>>();
+        if declared_browser.is_empty() {
+            return Ok(());
+        }
+        let browser_index = context.runtime_graph.reachability_index(&declared_browser);
         for source in modules_with_runtime(context, Runtime::Universal) {
-            let browser =
-                context.runtime_graph.shortest_path_to_runtime(&source, &[Runtime::Browser]);
+            let browser = context.runtime_graph.shortest_path_in_index(&source, &browser_index);
             let server = context
                 .runtime_graph
                 .shortest_path_to_runtime(&source, &[Runtime::Server, Runtime::Node]);

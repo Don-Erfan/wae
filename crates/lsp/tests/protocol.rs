@@ -105,10 +105,49 @@ fn stdio_server_publishes_diagnostics_and_shuts_down_cleanly() {
     );
     let actions = receive(&stdout);
     assert_eq!(actions["id"], 4);
-    assert_eq!(actions["result"].as_array().unwrap().len(), 2);
+    assert_eq!(actions["result"].as_array().unwrap().len(), 3);
+    assert_eq!(actions["result"][0]["command"]["command"], "wae.explainRule");
     assert_eq!(
-        actions["result"][1]["edit"]["changes"][&document_uri][0]["newText"],
+        actions["result"][2]["edit"]["changes"][&document_uri][0]["newText"],
         "// wae-ignore RESOLVE-001 -- \n"
+    );
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0", "id":6, "method":"workspace/executeCommand",
+            "params":{"command":"wae.explainRule","arguments":[{"ruleId":"RESOLVE-001","notify":false}]}
+        }),
+    );
+    let explained = receive(&stdout);
+    assert_eq!(explained["id"], 6);
+    assert!(explained["result"]["markdown"].as_str().unwrap().contains("### How to fix"));
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0", "id":7, "method":"workspace/executeCommand",
+            "params":{"command":"wae.inspectModule","arguments":[{"uri":document_uri.clone()}]}
+        }),
+    );
+    let inspected = receive(&stdout);
+    assert_eq!(inspected["id"], 7);
+    assert_eq!(inspected["result"]["id"], "src/a.ts");
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0", "id":8, "method":"workspace/executeCommand",
+            "params":{"command":"wae.architectureOverview","arguments":[]}
+        }),
+    );
+    let overview = receive(&stdout);
+    assert_eq!(overview["id"], 8);
+    let workspace = &overview["result"]["workspaces"][0];
+    assert_eq!(workspace["ready"], true);
+    assert!(
+        workspace["overview"]["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["ruleId"] == "RESOLVE-001")
     );
     send(
         &mut stdin,
@@ -317,4 +356,102 @@ fn stdio_server_does_not_publish_suppressed_diagnostics_as_errors() {
     drop(stdin);
     assert!(child.wait().unwrap().success());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stdio_server_reports_the_shared_synthetic_app_golden() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic-app")
+        .canonicalize()
+        .unwrap();
+    let golden: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.join("expected-diagnostics.json")).unwrap(),
+    )
+    .unwrap();
+    let root_uri = Url::from_directory_path(&fixture).unwrap().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wae-lsp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = message_receiver(child.stdout.take().unwrap());
+    send(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"rootUri":root_uri}}),
+    );
+    assert_eq!(receive(&stdout)["id"], 1);
+    send(&mut stdin, &json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+
+    let source_modules = golden["sourceModules"].as_u64().unwrap() as usize;
+    let mut published = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    while published.len() < source_modules {
+        let message = receive(&stdout);
+        if message["method"] == "textDocument/publishDiagnostics" {
+            let path = Url::parse(message["params"]["uri"].as_str().unwrap())
+                .unwrap()
+                .to_file_path()
+                .unwrap();
+            let relative =
+                path.strip_prefix(&fixture).unwrap().to_string_lossy().replace('\\', "/");
+            published
+                .insert(relative, message["params"]["diagnostics"].as_array().unwrap().clone());
+        }
+    }
+    let mut actual = published
+        .iter()
+        .flat_map(|(file, diagnostics)| {
+            diagnostics.iter().map(move |diagnostic| {
+                (
+                    diagnostic["code"].as_str().unwrap().to_string(),
+                    file.clone(),
+                    diagnostic["range"]["start"]["line"].as_u64().unwrap() + 1,
+                    diagnostic["range"]["start"]["character"].as_u64().unwrap() + 1,
+                    diagnostic["data"]["fingerprint"].as_str().unwrap().to_string(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut expected = golden["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic["ruleId"].as_str().unwrap().to_string(),
+                diagnostic["file"].as_str().unwrap().to_string(),
+                diagnostic["line"].as_u64().unwrap(),
+                diagnostic["column"].as_u64().unwrap(),
+                diagnostic["fingerprint"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected, "the editor must show exactly the CLI/MCP golden diagnostics");
+
+    // Transitive runtime violations carry their full path to the editor.
+    let runtime = published["apps/web/src/app/profile/profile-card.tsx"]
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "RUNTIME-001")
+        .unwrap();
+    assert_eq!(runtime["data"]["dependencyPath"].as_array().unwrap().len(), 4);
+    assert!(
+        runtime["message"]
+            .as_str()
+            .unwrap()
+            .contains("Path: apps/web/src/app/profile/profile-card.tsx →")
+    );
+    assert_eq!(runtime["relatedInformation"].as_array().unwrap().len(), 3);
+
+    send(&mut stdin, &json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
+    send(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    loop {
+        if receive(&stdout)["id"] == 2 {
+            break;
+        }
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
 }

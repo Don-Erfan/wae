@@ -8,9 +8,13 @@ inputs:
   version:
     description: Exact @don-erfan/wae version to install.
     required: false
-    default: "0.0.30"
+    default: "1.0.0"
+  working-directory:
+    description: Directory containing wae.yaml (the project root to analyze).
+    required: false
+    default: "."
   changed:
-    description: Check only new fail-level violations in the Git affected closure.
+    description: Check only new fail-level violations in the Git affected closure (requires a committed baseline).
     required: false
     default: "false"
   base:
@@ -18,21 +22,42 @@ inputs:
     required: false
     default: ""
   format:
-    description: Reporter format (human, json, jsonl or sarif).
+    description: Console reporter format (human, json, jsonl or sarif).
     required: false
-    default: sarif
+    default: human
   config:
-    description: Optional path to wae.yaml.
+    description: Optional path to wae.yaml, relative to working-directory.
     required: false
     default: ""
-  upload-sarif:
-    description: Upload SARIF to GitHub code scanning when security-events write permission is available.
+  annotations:
+    description: Add inline pull-request annotations for every active diagnostic.
     required: false
     default: "true"
+  summary:
+    description: Write an architecture summary (counts, regression, dependency paths) to the job summary.
+    required: false
+    default: "true"
+  upload-sarif:
+    description: Also upload SARIF to GitHub code scanning (needs security-events write and code scanning enabled).
+    required: false
+    default: "false"
   sarif-file:
     description: Path used for the generated SARIF report.
     required: false
     default: "wae-results.sarif"
+outputs:
+  exit-code:
+    description: WAE exit code (0 passed, 1 violations, 2 config/project error, 3 internal error).
+    value: ${{ steps.wae-check.outputs.status }}
+  failure-count:
+    description: Number of fail-level diagnostics.
+    value: ${{ steps.wae-report.outputs.failure-count }}
+  warning-count:
+    description: Number of warning diagnostics.
+    value: ${{ steps.wae-report.outputs.warning-count }}
+  report-file:
+    description: Path to the JSON report.
+    value: ${{ steps.wae-check.outputs.report }}
 runs:
   using: composite
   steps:
@@ -44,13 +69,13 @@ runs:
     - name: Run WAE architecture check
       id: wae-check
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         WAE_ACTION_VERSION: ${{ inputs.version }}
         WAE_ACTION_CHANGED: ${{ inputs.changed }}
         WAE_ACTION_BASE: ${{ inputs.base }}
         WAE_ACTION_FORMAT: ${{ inputs.format }}
         WAE_ACTION_CONFIG: ${{ inputs.config }}
-        WAE_ACTION_SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
         set -euo pipefail
         echo "WAE GitHub Action resolved engine version: $WAE_ACTION_VERSION"
@@ -65,24 +90,45 @@ runs:
           true|false) ;;
           *) echo "changed must be true or false" >&2; exit 2 ;;
         esac
-        args=(check --format "$WAE_ACTION_FORMAT")
+        args=(check)
         if [ "$WAE_ACTION_CHANGED" = "true" ]; then args+=(--changed); fi
         if [ -n "$WAE_ACTION_BASE" ]; then args+=(--base "$WAE_ACTION_BASE"); fi
         if [ -n "$WAE_ACTION_CONFIG" ]; then args+=(--config "$WAE_ACTION_CONFIG"); fi
+        wae() { npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "$@"; }
+        report="$RUNNER_TEMP/wae-results.json"
         set +e
-        if [ "$WAE_ACTION_FORMAT" = "sarif" ]; then
-          npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "${args[@]}" > "$WAE_ACTION_SARIF_FILE"
-          status=$?
-          cat "$WAE_ACTION_SARIF_FILE"
-        else
-          npm exec --yes --package "@don-erfan/wae@$WAE_ACTION_VERSION" -- wae "${args[@]}"
-          status=$?
+        # One machine-readable analysis drives annotations, the summary and the exit status.
+        wae "${args[@]}" --format json > "$report"
+        status=$?
+        if [ "$WAE_ACTION_FORMAT" = "json" ]; then
+          cat "$report"
+        elif [ "$status" -le 1 ]; then
+          # The incremental cache makes this console rendering cheap.
+          wae "${args[@]}" --format "$WAE_ACTION_FORMAT"
         fi
         set -e
         echo "status=$status" >> "$GITHUB_OUTPUT"
-    - name: Generate SARIF annotations
-      if: inputs.upload-sarif == 'true' && inputs.format != 'sarif' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+    - name: Annotate pull request and write job summary
+      id: wae-report
+      if: always() && steps.wae-check.outputs.report != ''
       shell: bash
+      env:
+        WAE_ACTION_ANNOTATIONS: ${{ inputs.annotations }}
+        WAE_ACTION_SUMMARY: ${{ inputs.summary }}
+        WAE_ACTION_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        WAE_REPORT: ${{ steps.wae-check.outputs.report }}
+        WAE_STATUS: ${{ steps.wae-check.outputs.status }}
+      run: |
+        set -euo pipefail
+        prefix="${WAE_ACTION_WORKING_DIRECTORY#./}"
+        prefix="${prefix%/}"
+        if [ -n "$prefix" ] && [ "$prefix" != "." ]; then export WAE_ACTION_PATH_PREFIX="$prefix/"; fi
+        node "$GITHUB_ACTION_PATH/action/report.js" "$WAE_REPORT" "$WAE_STATUS"
+    - name: Generate SARIF report
+      if: inputs.upload-sarif == 'true' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
         WAE_ACTION_VERSION: ${{ inputs.version }}
         WAE_ACTION_CHANGED: ${{ inputs.changed }}
@@ -103,7 +149,7 @@ runs:
       if: inputs.upload-sarif == 'true' && (steps.wae-check.outputs.status == '0' || steps.wae-check.outputs.status == '1')
       uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
       with:
-        sarif_file: ${{ inputs.sarif-file }}
+        sarif_file: ${{ inputs.working-directory }}/${{ inputs.sarif-file }}
         category: wae-architecture
     - name: Propagate WAE exit status
       shell: bash

@@ -3,5 +3,4 @@
 **/out/
 .idea/
 .wae/cache/
-npm/wae/bin/wae
-npm/wae/bin/wae.exe
+npm/wae/vendor/

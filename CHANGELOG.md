@@ -8,6 +8,62 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-05
+
+First stable release. Every roadmap phase was audited against its Definition of Done; the audit,
+evidence and the 1.x stability contract are in `docs/V1_RELEASE_GATE.md`. See
+`docs/MIGRATIONS.md#upgrading-to-10` before upgrading.
+
+### Added
+
+- Complete documentation for every rule (rationale, bad and good examples, fix, configuration and
+  known false positives) as a single source used by `wae explain`, the language server, the MCP
+  `architecture_explain` tool, SARIF rule help and the generated `docs/RULES.md`.
+- CLI: per-command `--help` (`wae <command> --help`, `wae help <command>`), `wae rules`,
+  `wae graph --module PATH [--format json]` (dependencies, dependents, diagnostics and why a module
+  has its runtime, including the browser propagation path), bare `wae baseline`, and next-step
+  guidance after `wae init`. Argument errors print the relevant command help instead of the full
+  usage.
+- Language server: dependency paths as clickable `relatedInformation`, rule documentation links
+  (`codeDescription`), whole-specifier ranges, richer hover, "Explain rule" and "Show dependency
+  path" code actions, and the `wae.explainRule`, `wae.showDependencyPath`, `wae.inspectModule`,
+  `wae.architectureOverview` and `wae.reanalyze` commands backed by a shared engine projection.
+- VS Code: WAE Architecture explorer (violations by rule; modules by package, layer, feature and
+  runtime), Explain Rule, Inspect Module and Check Project commands, a dependency-path picker, and
+  automatic use of the workspace's `node_modules/.bin/wae-lsp`.
+- JetBrains: automatic use of the project's `node_modules/.bin/wae-lsp`; the new LSP actions and
+  hover are available through Alt+Enter.
+- GitHub Action: inline pull-request annotations and a job summary rendered from the JSON report,
+  plus `working-directory`, `annotations` and `summary` inputs and `exit-code`, `failure-count`,
+  `warning-count` and `report-file` outputs.
+- Configuration: `off` as a rule setting, `ARCH-001.include_type_only`, and
+  `resolution.virtual_modules` for build-generated or bundler-virtual specifiers.
+- `fixtures/synthetic-app`, a product fixture that violates every rule family, with one golden
+  result asserted by the CLI, MCP and LSP test suites and a Git baseline-ratchet test.
+- A crate dependency-direction test that keeps analysis crates independent of delivery adapters.
+- Feature ownership on `Analysis::features`.
+
+### Changed
+
+- **npm: `@don-erfan/wae` is now the only package.** It downloads the native CLI, language server
+  and MCP server for the current platform from the matching GitHub Release, verifies them against
+  SHA-256 hashes embedded at publish time, installs them atomically (package `vendor/` directory or
+  the per-user cache), and repeats the same verified download on first use when install scripts are
+  disabled. `WAE_BINARY_DIR`, `WAE_SKIP_DOWNLOAD` and `WAE_CACHE_DIR` support offline and read-only
+  environments. The `@don-erfan/wae-<platform>` packages are no longer built or published.
+- `ARCH-001` ignores cycles that exist only through type-only imports by default; opt in with
+  `include_type_only: true`.
+- `RUNTIME-005` counts only declared browser boundaries as browser requirements.
+- GitHub Action: console `format` defaults to `human` and `upload-sarif` defaults to `false`.
+
+### Fixed
+
+- Type-only edges no longer merge separate runtime cycles into one component that hid real cycles
+  behind a misleading type-only path.
+- Universal modules importing a module that another client component bundles for the browser are
+  no longer reported as ambiguous (one leak previously produced a diagnostic on every universal
+  ancestor).
+
 ## [0.0.30] - 2026-10-04
 
 ### Added
@@ -408,7 +464,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Detailed module/dependency counts and standard CLI version flags.
 - Dependabot coverage and workflow concurrency controls.
 
-[Unreleased]: https://github.com/Don-Erfan/wae/compare/v0.0.30...HEAD
+[Unreleased]: https://github.com/Don-Erfan/wae/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Don-Erfan/wae/compare/v0.0.30...v1.0.0
 [0.0.30]: https://github.com/Don-Erfan/wae/compare/v0.0.29...v0.0.30
 [0.0.29]: https://github.com/Don-Erfan/wae/compare/v0.0.28...v0.0.29
 [0.0.28]: https://github.com/Don-Erfan/wae/compare/v0.0.27...v0.0.28

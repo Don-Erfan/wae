@@ -85,7 +85,8 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "mode": { "enum": ["node", "node10", "node16", "nodenext", "bundler"] },
-        "custom_conditions": { "$ref": "#/$defs/stringList" }
+        "custom_conditions": { "$ref": "#/$defs/stringList" },
+        "virtual_modules": { "$ref": "#/$defs/stringList", "description": "Import-specifier globs for generated or bundler-virtual modules that are treated as opaque externals when they cannot be resolved." }
       }
     },
     "architecture": {
@@ -135,6 +136,7 @@
     "rule": {
       "oneOf": [
         { "$ref": "#/$defs/severity" },
+        { "const": "off" },
         {
           "type": "object", "additionalProperties": false,
           "properties": {
@@ -142,7 +144,8 @@
             "max_depth": { "type": "integer", "minimum": 1 },
             "max_fan_out": { "type": "integer", "minimum": 1 },
             "max_fan_in": { "type": "integer", "minimum": 1 },
-            "entrypoints": { "$ref": "#/$defs/stringList" }
+            "entrypoints": { "$ref": "#/$defs/stringList" },
+            "include_type_only": { "type": "boolean", "description": "ARCH-001 only: also report cycles that exist solely through type-only imports." }
           }
         }
       ]

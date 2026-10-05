@@ -1,8 +1,16 @@
 {
   "name": "@don-erfan/wae",
-  "version": "0.0.30",
+  "version": "1.0.0",
   "description": "WAE CLI wrapper for frontend architecture checks",
   "license": "MIT",
+  "keywords": [
+    "architecture",
+    "lint",
+    "dependency-graph",
+    "nextjs",
+    "monorepo",
+    "typescript"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Don-Erfan/wae.git"
@@ -14,8 +22,10 @@
   "engines": {
     "node": ">=18"
   },
+  "preferUnplugged": true,
   "files": [
     "bin",
+    "lib",
     "scripts",
     "checksums.json",
     "README.md"
@@ -26,18 +36,11 @@
     "wae-mcp": "bin/wae-mcp.js"
   },
   "scripts": {
-    "recover:binaries": "node scripts/postinstall.js",
+    "postinstall": "node scripts/postinstall.js",
     "pack:check": "npm pack --dry-run",
     "test:installer": "node --test test/*.test.js"
   },
   "wae": {
     "githubRepo": "Don-Erfan/wae"
-  },
-  "optionalDependencies": {
-    "@don-erfan/wae-linux-x64": "0.0.30",
-    "@don-erfan/wae-linux-arm64": "0.0.30",
-    "@don-erfan/wae-darwin-x64": "0.0.30",
-    "@don-erfan/wae-darwin-arm64": "0.0.30",
-    "@don-erfan/wae-win32-x64": "0.0.30"
   }
 }

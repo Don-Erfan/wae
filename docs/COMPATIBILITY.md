@@ -87,7 +87,20 @@
 - هر قابلیت deprecate شده حداقل یک minor نسخه هشدار می‌دهد
 - قبل از حذف، جایگزین رسمی و migration guide ارائه می‌شود
 
-## 8) معیار Done این سند
+## 8) قرارداد پایداری 1.x
+
+از نسخه 1.0.0 این موارد در تمام نسخه‌های 1.x ثابت می‌مانند و تغییر breaking فقط در 2.0 با migration
+guide مجاز است: شناسه و معنای ruleها، schema پیکربندی `version: 1`، خروجی JSON/JSONL با
+`schemaVersion: 1` و SARIF 2.1.0، fingerprint diagnosticها برای کد و config بدون تغییر، commandها و
+flagها و exit codeهای CLI، نام commandهای LSP و toolهای MCP، و نام package `@don-erfan/wae` با
+executableهای `wae`، `wae-lsp` و `wae-mcp`. فهرست کامل در
+[V1_RELEASE_GATE.md](V1_RELEASE_GATE.md#stability-contract-for-1x) است.
+
+npm از نسخه 1.0.0 فقط یک package دارد (`@don-erfan/wae`) که binary مربوط به Linux x64/arm64،
+macOS x64/arm64 یا Windows x64 را از GitHub Release دانلود و با SHA-256 تعبیه‌شده verify می‌کند؛
+پشتیبانی Node.js برای launcher از نسخه 18 به بالا است و در CI روی Node 20، 22 و 24 تست می‌شود.
+
+## 9) معیار Done این سند
 
 - هر ادعای سازگاری، تست/CI متناظر داشته باشد
 - سند با وضعیت واقعی پروژه و roadmap sync بماند

@@ -220,7 +220,7 @@ fn tools() -> Value {
         },
         {
             "name": "architecture_explain",
-            "description": "Explain a WAE rule by stable rule id.",
+            "description": "Explain a WAE rule by stable rule id: rationale, bad and good examples, fix, configuration and known false positives.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "ruleId": { "type": "string" } },
@@ -359,12 +359,21 @@ fn execute_tool(
                 arguments.get("ruleId").and_then(Value::as_str).ok_or("ruleId is required")?;
             let descriptor = wae_core::rule_registry::descriptor(rule)
                 .ok_or_else(|| format!("unknown rule `{rule}`"))?;
+            let docs = descriptor.documentation();
             json!({
                 "id": descriptor.id,
                 "title": descriptor.title,
                 "description": descriptor.description,
                 "category": descriptor.category,
-                "configurable": descriptor.configurable
+                "configurable": descriptor.configurable,
+                "defaultBehavior": wae_core::rule_docs::default_behavior(descriptor),
+                "rationale": docs.map(|docs| docs.rationale),
+                "badExample": docs.map(|docs| docs.bad_example),
+                "goodExample": docs.map(|docs| docs.good_example),
+                "fix": docs.map(|docs| docs.fix),
+                "configuration": docs.map(|docs| docs.configuration),
+                "falsePositives": docs.map(|docs| docs.false_positives),
+                "helpUri": wae_core::rule_docs::help_uri(descriptor.id)
             })
         }
         "dependency_path" => {
@@ -585,6 +594,56 @@ mod tests {
         );
         assert!(!session.last_execution().reused_snapshot);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn architecture_check_matches_the_shared_synthetic_app_golden() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic-app")
+            .canonicalize()
+            .unwrap();
+        let server = McpServer::new(&fixture, ServerPolicy::confined(&fixture));
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "architecture_check", "arguments": {} }
+            }))
+            .unwrap();
+        let actual = response["result"]["structuredContent"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic["rule_id"].clone(),
+                    diagnostic["fingerprint"].clone(),
+                    diagnostic["primary_location"]["file"].clone(),
+                    diagnostic["primary_location"]["line"].clone(),
+                    diagnostic["dependency_path"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let golden: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.join("expected-diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        let expected = golden["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic["ruleId"].clone(),
+                    diagnostic["fingerprint"].clone(),
+                    diagnostic["file"].clone(),
+                    diagnostic["line"].clone(),
+                    diagnostic["dependencyPath"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

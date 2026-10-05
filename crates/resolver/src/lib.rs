@@ -36,7 +36,11 @@ pub use tsconfig::{IndexedAliasResolver, TsConfigIndex, TsConfigLoader, TsConfig
 #[derive(Default)]
 pub struct ResolverPipeline {
     handlers: Vec<Box<dyn ResolutionHandler>>,
+    virtual_modules: Option<globset::GlobSet>,
 }
+
+/// Handler name recorded in traces when a configured virtual module absorbs an unresolved import.
+pub const VIRTUAL_MODULE_HANDLER: &str = "virtual-module";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolutionAttempt {
@@ -52,6 +56,20 @@ impl ResolverPipeline {
     pub fn with_handler<H: ResolutionHandler + 'static>(mut self, handler: H) -> Self {
         self.handlers.push(Box::new(handler));
         self
+    }
+
+    /// Treats unresolved specifiers matching these globs as opaque `virtual:<specifier>`
+    /// externals. Real modules always win: the globs are consulted only after every handler.
+    pub fn with_virtual_modules(mut self, patterns: &[String]) -> Result<Self, String> {
+        if patterns.is_empty() {
+            return Ok(self);
+        }
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            builder.add(globset::Glob::new(pattern).map_err(|error| error.to_string())?);
+        }
+        self.virtual_modules = Some(builder.build().map_err(|error| error.to_string())?);
+        Ok(self)
     }
 
     pub fn candidate_paths(&self, request: &ResolutionRequest<'_>) -> Vec<ModulePath> {
@@ -105,6 +123,21 @@ impl ResolverPipeline {
             }
             match result {
                 Resolution::Redirect(target) => specifier = target,
+                Resolution::Unresolved
+                    if self
+                        .virtual_modules
+                        .as_ref()
+                        .is_some_and(|globs| globs.is_match(request.specifier)) =>
+                {
+                    let virtual_module =
+                        Resolution::External(format!("virtual:{}", request.specifier));
+                    attempts.push(ResolutionAttempt {
+                        specifier: request.specifier.to_string(),
+                        handler: VIRTUAL_MODULE_HANDLER,
+                        outcome: Some(virtual_module.clone()),
+                    });
+                    return (virtual_module, attempts);
+                }
                 result => return (result, attempts),
             }
         }

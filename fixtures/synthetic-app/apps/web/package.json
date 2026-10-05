@@ -1,0 +1,1 @@
+{"name":"@synthetic/web","private":true,"exports":{"./routes":"./src/shared/routes.ts"},"dependencies":{"next":"15.5.0","pg":"8.16.0","@synthetic/ui":"workspace:*"}}

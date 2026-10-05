@@ -1,0 +1,1 @@
+{"name":"synthetic-app","private":true,"workspaces":["apps/*","packages/*"]}

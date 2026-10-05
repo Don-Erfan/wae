@@ -1,13 +1,26 @@
 {
   "name": "wae-vscode",
   "displayName": "Web Architecture Engine",
-  "description": "Live WAE architecture diagnostics, hover context and quick fixes.",
-  "version": "0.0.30",
+  "description": "Live WAE architecture diagnostics, dependency paths, rule explanations and an architecture explorer.",
+  "version": "1.0.0",
   "publisher": "don-erfan",
-  "repository": { "type": "git", "url": "https://github.com/Don-Erfan/wae.git" },
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Linters", "Programming Languages"],
-  "activationEvents": ["onLanguage:javascript", "onLanguage:typescript", "onLanguage:javascriptreact", "onLanguage:typescriptreact"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Don-Erfan/wae.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescriptreact"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "configuration": {
@@ -16,17 +29,86 @@
         "wae.server.path": {
           "type": "string",
           "default": "wae-lsp",
-          "description": "Path to the wae-lsp executable."
+          "description": "Path to the wae-lsp executable. The default uses the workspace's node_modules/.bin/wae-lsp (installed with @don-erfan/wae) and falls back to wae-lsp on PATH."
         }
       }
     },
     "commands": [
-      { "command": "wae.check", "title": "WAE: Check Architecture" },
-      { "command": "wae.graph", "title": "WAE: Show Architecture Graph" },
-      { "command": "wae.reload", "title": "WAE: Reload Language Server" },
-      { "command": "wae.showSuggestion", "title": "WAE: Show Suggested Fix" },
-      { "command": "wae.suppressWithReason", "title": "WAE: Suppress with Documented Reason" }
-    ]
+      {
+        "command": "wae.check",
+        "title": "WAE: Check Project"
+      },
+      {
+        "command": "wae.explainRulePrompt",
+        "title": "WAE: Explain Rule..."
+      },
+      {
+        "command": "wae.inspectCurrentModule",
+        "title": "WAE: Inspect Module (Dependencies, Dependents, Runtime)"
+      },
+      {
+        "command": "wae.refreshArchitecture",
+        "title": "WAE: Refresh Architecture Explorer",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "wae.graph",
+        "title": "WAE: Print Dependency Graph (terminal)"
+      },
+      {
+        "command": "wae.reload",
+        "title": "WAE: Restart Language Server"
+      },
+      {
+        "command": "wae.openLocation",
+        "title": "WAE: Open Location"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "wae",
+          "title": "WAE Architecture",
+          "icon": "media/architecture.svg"
+        }
+      ]
+    },
+    "views": {
+      "wae": [
+        {
+          "id": "wae.architecture",
+          "name": "Architecture"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "wae.refreshArchitecture",
+          "when": "view == wae.architecture",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "wae.inspectCurrentModule",
+          "when": "view == wae.architecture && viewItem == waeModule"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "wae.inspectCurrentModule",
+          "when": "resourceLangId =~ /^(javascript|typescript)(react)?$/",
+          "group": "navigation@90"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "wae.openLocation",
+          "when": "false"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=out/extension.js",

@@ -1,0 +1,200 @@
+{
+  "schemaVersion": 1,
+  "sourceModules": 20,
+  "dependencies": 23,
+  "failureCount": 14,
+  "diagnostics": [
+    {
+      "ruleId": "ARCH-001",
+      "fingerprint": "e70698973839db1d",
+      "severity": "error",
+      "file": "apps/web/src/shared/format.ts",
+      "line": 2,
+      "column": 27,
+      "message": "Circular dependency detected",
+      "dependencyPath": [
+        "apps/web/src/shared/format.ts",
+        "apps/web/src/shared/currency.ts",
+        "apps/web/src/shared/format.ts"
+      ]
+    },
+    {
+      "ruleId": "ARCH-002",
+      "fingerprint": "d1cfcb2c5e2e283b",
+      "severity": "error",
+      "file": "apps/web/src/app/admin/page.tsx",
+      "line": 2,
+      "column": 21,
+      "message": "Dependency is forbidden by architecture policy",
+      "dependencyPath": [
+        "apps/web/src/app/admin/page.tsx",
+        "apps/web/src/server/db.ts"
+      ]
+    },
+    {
+      "ruleId": "ARCH-003",
+      "fingerprint": "2fe7fbf351f25f1a",
+      "severity": "error",
+      "file": "apps/web/src/entities/order.ts",
+      "line": 2,
+      "column": 23,
+      "message": "Layer `entities` cannot import `features`",
+      "dependencyPath": [
+        "apps/web/src/entities/order.ts",
+        "apps/web/src/features/cart/index.ts"
+      ]
+    },
+    {
+      "ruleId": "ARCH-004",
+      "fingerprint": "a77914e24da7803f",
+      "severity": "error",
+      "file": "apps/web/src/features/cart/ui.tsx",
+      "line": 2,
+      "column": 29,
+      "message": "Importer `cart` accesses internals of feature `user` in package `@synthetic/web`",
+      "dependencyPath": [
+        "apps/web/src/features/cart/ui.tsx",
+        "apps/web/src/features/user/model/session.ts"
+      ]
+    },
+    {
+      "ruleId": "ARCH-005",
+      "fingerprint": "105bb5e5e305f865",
+      "severity": "error",
+      "file": "apps/web/src/features/checkout/pay.ts",
+      "line": 2,
+      "column": 24,
+      "message": "Private module imported outside its public API",
+      "dependencyPath": [
+        "apps/web/src/features/checkout/pay.ts",
+        "apps/web/src/features/user/internal/token.ts"
+      ]
+    },
+    {
+      "ruleId": "PACKAGE-001",
+      "fingerprint": "0b6b108ff47da57b",
+      "severity": "error",
+      "file": "packages/ui/src/button.tsx",
+      "line": 2,
+      "column": 25,
+      "message": "Circular workspace package dependency detected",
+      "dependencyPath": [
+        "package:@synthetic/ui",
+        "package:@synthetic/web",
+        "package:@synthetic/ui"
+      ]
+    },
+    {
+      "ruleId": "PACKAGE-002",
+      "fingerprint": "2189083e2d370fe4",
+      "severity": "error",
+      "file": "packages/ui/src/button.tsx",
+      "line": 2,
+      "column": 25,
+      "message": "Package dependency is forbidden by architecture policy",
+      "dependencyPath": [
+        "package:@synthetic/ui",
+        "package:@synthetic/web"
+      ]
+    },
+    {
+      "ruleId": "PACKAGE-003",
+      "fingerprint": "f4375c562afdeb59",
+      "severity": "error",
+      "file": "packages/ui/src/button.tsx",
+      "line": 2,
+      "column": 25,
+      "message": "Workspace package `@synthetic/web` is not declared by `@synthetic/ui`",
+      "dependencyPath": [
+        "packages/ui/src/button.tsx",
+        "apps/web/src/shared/format.ts"
+      ]
+    },
+    {
+      "ruleId": "PACKAGE-003",
+      "fingerprint": "d65cd96c60c9aab8",
+      "severity": "error",
+      "file": "packages/ui/src/index.ts",
+      "line": 2,
+      "column": 25,
+      "message": "Workspace package `@synthetic/web` is not declared by `@synthetic/ui`",
+      "dependencyPath": [
+        "packages/ui/src/index.ts",
+        "apps/web/src/shared/routes.ts"
+      ]
+    },
+    {
+      "ruleId": "PACKAGE-004",
+      "fingerprint": "42a0d49b10c30b46",
+      "severity": "error",
+      "file": "packages/ui/src/button.tsx",
+      "line": 2,
+      "column": 25,
+      "message": "Relative import crosses package boundary from `@synthetic/ui` to `@synthetic/web`",
+      "dependencyPath": [
+        "packages/ui/src/button.tsx",
+        "apps/web/src/shared/format.ts"
+      ]
+    },
+    {
+      "ruleId": "RUNTIME-001",
+      "fingerprint": "234ca471c61f9a33",
+      "severity": "error",
+      "file": "apps/web/src/app/profile/profile-card.tsx",
+      "line": 5,
+      "column": 41,
+      "message": "Browser module transitively depends on server-only code",
+      "dependencyPath": [
+        "apps/web/src/app/profile/profile-card.tsx",
+        "apps/web/src/features/user/index.ts",
+        "apps/web/src/features/user/api.ts",
+        "apps/web/src/server/db.ts"
+      ]
+    },
+    {
+      "ruleId": "RUNTIME-002",
+      "fingerprint": "5db9d8f6c5132866",
+      "severity": "error",
+      "file": "apps/web/src/app/profile/profile-card.tsx",
+      "line": 5,
+      "column": 41,
+      "message": "Browser module transitively depends on Node-only code",
+      "dependencyPath": [
+        "apps/web/src/app/profile/profile-card.tsx",
+        "apps/web/src/features/user/index.ts",
+        "apps/web/src/features/user/avatar.ts",
+        "builtin:node:path"
+      ]
+    },
+    {
+      "ruleId": "RUNTIME-003",
+      "fingerprint": "fc0aa164016ba14d",
+      "severity": "error",
+      "file": "apps/web/src/app/profile/profile-card.tsx",
+      "line": 5,
+      "column": 41,
+      "message": "Browser module reaches a browser-incompatible package",
+      "dependencyPath": [
+        "apps/web/src/app/profile/profile-card.tsx",
+        "apps/web/src/features/user/index.ts",
+        "apps/web/src/features/user/api.ts",
+        "apps/web/src/server/db.ts",
+        "external:pg"
+      ]
+    },
+    {
+      "ruleId": "RUNTIME-004",
+      "fingerprint": "57e82c7aace675f0",
+      "severity": "error",
+      "file": "apps/web/src/middleware.ts",
+      "line": 2,
+      "column": 23,
+      "message": "Edge module reaches a dependency unavailable in the Edge runtime",
+      "dependencyPath": [
+        "apps/web/src/middleware.ts",
+        "apps/web/src/server/hash.ts",
+        "builtin:node:crypto"
+      ]
+    }
+  ]
+}

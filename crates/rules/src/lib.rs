@@ -278,7 +278,19 @@ impl Rule for CircularDependencyRule {
         context: &RuleContext<'_>,
         sink: &mut dyn DiagnosticSink,
     ) -> Result<(), String> {
-        for cycle in context.graph.cycles() {
+        let include_type_only = context
+            .config
+            .rules
+            .get("ARCH-001")
+            .and_then(|rule| rule.options())
+            .and_then(|options| options.include_type_only)
+            .unwrap_or(false);
+        let graph = if include_type_only {
+            std::borrow::Cow::Borrowed(context.graph)
+        } else {
+            context.graph.without_type_only_edges()
+        };
+        for cycle in graph.cycles() {
             let primary = edge_location(context.project, &cycle[0], &cycle[1]);
             let mut diagnostic = Diagnostic::new("ARCH-001", "Circular dependency detected");
             diagnostic.primary_location = primary;

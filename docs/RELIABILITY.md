@@ -2,13 +2,16 @@
 
 ## False-positive budget
 
-The deterministic clean corpus currently contains 32 source modules across a minimal project,
-TypeScript aliases, a 12-package workspace, Nx/Turborepo layouts and the semantic Next.js consumer. Every enabled rule
-must produce zero diagnostics on that corpus. This is a blocking test, so the current measured
-fixture false-positive rate is **0/32 (0%)**. The 500-module acceptance scenario adds a clean cold
-and warm run before fault injection.
+The deterministic clean corpus contains a minimal project, TypeScript aliases, a 12-package
+workspace, Nx/Turborepo layouts and the semantic Next.js consumer. Every enabled rule must produce
+zero diagnostics on that corpus; this is a blocking test. Three public Next.js App Router projects
+(vercel/commerce, shadcn-ui/taxonomy, vercel/ai-chatbot) were audited diagnostic by diagnostic for
+1.0: every remaining finding is a true positive, and the three false-positive classes found were
+fixed with regression tests (see [Real-world validation](REAL_WORLD_VALIDATION.md)). vercel/commerce
+is re-audited in CI on every change and must stay clean. The 500-module acceptance scenario adds a
+clean cold and warm run before fault injection.
 
-This number describes the maintained corpus, not an unsupported claim about all JavaScript code.
+These numbers describe the maintained corpus, not an unsupported claim about all JavaScript code.
 New framework conventions must first add a clean fixture and may not raise the zero-noise budget.
 
 ## Robustness gates

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -8,7 +8,8 @@ use crossbeam_channel::{Sender, bounded, unbounded};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use serde_json::{Value, json};
 use url::Url;
-use wae_core::domain::{Diagnostic, ModuleKind, Severity};
+use wae_core::domain::{Diagnostic, ModuleId, ModuleKind, Severity, SourceLocation};
+use wae_engine::projection::{architecture_overview, inspect_module};
 use wae_engine::{Analysis, AnalysisError, AnalysisTicket, WorkspaceSession};
 
 fn main() {
@@ -313,9 +314,13 @@ impl ServerState {
         match completed.result {
             Ok(analysis) => {
                 let mut by_file = std::collections::BTreeMap::<String, Vec<Value>>::new();
-                for diagnostic in
-                    analysis.diagnostics.iter().filter(|diagnostic| !diagnostic.suppressed)
-                {
+                let active = analysis
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| !diagnostic.suppressed)
+                    .collect::<Vec<_>>();
+                let edges = EdgeLocations::for_diagnostics(&analysis, active.iter().copied());
+                for diagnostic in active {
                     let Some(location) = &diagnostic.primary_location else { continue };
                     let source = workspace.documents.get(&location.file).cloned().or_else(|| {
                         std::fs::read_to_string(completed.root.join(&location.file)).ok()
@@ -324,6 +329,7 @@ impl ServerState {
                         &completed.root,
                         diagnostic,
                         source.as_deref(),
+                        &edges,
                     ));
                 }
                 let current = analysis
@@ -364,7 +370,7 @@ fn handle_request(
     let result = match request.method.as_str() {
         "textDocument/hover" => hover(state, &request.params),
         "textDocument/codeAction" => code_actions(&request.params),
-        "workspace/executeCommand" => match execute_command(connection, &request.params) {
+        "workspace/executeCommand" => match execute_command(connection, state, &request.params) {
             Ok(value) => value,
             Err(message) => {
                 connection
@@ -395,27 +401,62 @@ fn hover(state: &ServerState, params: &Value) -> Value {
     };
     let Some(root) = state.root_for_uri(uri) else { return Value::Null };
     let Some(path) = uri_path(&root, uri) else { return Value::Null };
-    let Some(module) = state
-        .workspaces
-        .get(&root)
-        .and_then(|workspace| workspace.analysis.as_ref())
-        .as_ref()
-        .and_then(|analysis| analysis.project.modules.iter().find(|module| module.id.0 == path))
+    let Some(analysis) =
+        state.workspaces.get(&root).and_then(|workspace| workspace.analysis.as_ref())
     else {
         return Value::Null;
     };
-    json!({
-        "contents": {
-            "kind": "markdown",
-            "value": format!(
-                "**WAE architecture**\n\n- Package: `{}`\n- Layer: `{}`\n- Runtime: `{:?}`\n- Framework: `{}`",
-                module.package.0,
-                module.layer.as_ref().map_or("unassigned", |layer| layer.0.as_str()),
-                module.runtime,
-                module.framework_metadata.adapter_id.as_deref().unwrap_or("none")
-            )
+    let Some(inspection) = inspect_module(analysis, &ModuleId(path.clone())) else {
+        return Value::Null;
+    };
+    let hovered_line = params.pointer("/position/line").and_then(Value::as_u64);
+    let mut value = String::new();
+    for diagnostic in analysis.diagnostics.iter().filter(|diagnostic| {
+        !diagnostic.suppressed
+            && diagnostic.primary_location.as_ref().is_some_and(|location| {
+                location.file == path
+                    && hovered_line == Some(location.line.saturating_sub(1) as u64)
+            })
+    }) {
+        let rule = wae_core::rule_registry::descriptor(&diagnostic.rule_id.0);
+        value.push_str(&format!(
+            "**{} — {}**\n\n{}\n\n",
+            diagnostic.rule_id.0,
+            rule.map_or("WAE diagnostic", |rule| rule.title),
+            diagnostic.message
+        ));
+        if diagnostic.dependency_path.len() > 1 {
+            let path = diagnostic
+                .dependency_path
+                .iter()
+                .map(|module| format!("`{}`", module.0))
+                .collect::<Vec<_>>();
+            value.push_str(&format!("Dependency path: {}\n\n", path.join(" → ")));
         }
-    })
+        if let Some(why) = rule.and_then(|rule| rule.documentation()) {
+            let first_paragraph = why.rationale.split("\n\n").next().unwrap_or_default();
+            value.push_str(&format!("{}\n\n", first_paragraph.replace('\n', " ")));
+        }
+        value.push_str(&format!(
+            "[Rule documentation]({})\n\n---\n\n",
+            wae_core::rule_docs::help_uri(&diagnostic.rule_id.0)
+        ));
+    }
+    value.push_str(&format!(
+        "**WAE architecture**\n\n- Package: `{}`\n- Layer: `{}`\n- Feature: `{}`\n- Runtime: `{}` ({})\n- Framework: `{}`\n- Dependencies: {} · Dependents: {}",
+        inspection.package,
+        inspection.layer.as_deref().unwrap_or("unassigned"),
+        inspection.feature.as_deref().unwrap_or("none"),
+        inspection.runtime.runtime,
+        inspection.runtime.reason,
+        inspection.framework.as_deref().unwrap_or("none"),
+        inspection.dependencies.len(),
+        inspection.dependents.len(),
+    ));
+    if let Some(via) = &inspection.runtime.propagation_path {
+        value.push_str(&format!("\n- Browser via: {}", via.join(" → ")));
+    }
+    json!({ "contents": { "kind": "markdown", "value": value } })
 }
 
 fn code_actions(params: &Value) -> Value {
@@ -458,6 +499,31 @@ fn code_actions(params: &Value) -> Value {
                     }
                 }));
             }
+            let path = data.get("dependencyPath").and_then(Value::as_array).cloned().unwrap_or_default();
+            if path.len() > 1 {
+                actions.push(json!({
+                    "title": format!("Show dependency path for {rule} ({} modules)", path.len()),
+                    "kind": "quickfix",
+                    "diagnostics": [diagnostic],
+                    "isPreferred": false,
+                    "command": {
+                        "title": "Show WAE dependency path",
+                        "command": "wae.showDependencyPath",
+                        "arguments": [{ "uri": uri, "ruleId": rule, "path": path }]
+                    }
+                }));
+            }
+            actions.push(json!({
+                "title": format!("Explain {rule}"),
+                "kind": "quickfix",
+                "diagnostics": [diagnostic],
+                "isPreferred": false,
+                "command": {
+                    "title": "Explain WAE rule",
+                    "command": "wae.explainRule",
+                    "arguments": [{ "ruleId": rule }]
+                }
+            }));
             actions.push(json!({
                     "title": format!("Suppress {rule} after documenting a reason"),
                     "kind": "quickfix",
@@ -485,11 +551,18 @@ fn code_actions(params: &Value) -> Value {
     Value::Array(actions)
 }
 
-fn execute_command(connection: &Connection, params: &Value) -> Result<Value, String> {
+fn execute_command(
+    connection: &Connection,
+    state: &ServerState,
+    params: &Value,
+) -> Result<Value, String> {
+    let argument = params.pointer("/arguments/0").cloned().unwrap_or(Value::Null);
+    // Clients with their own UI (the VS Code extension) pass `notify: false` and render results.
+    let notify = argument.get("notify").and_then(Value::as_bool).unwrap_or(true);
     match params.get("command").and_then(Value::as_str) {
         Some("wae.showSuggestion") => {
-            let suggestion = params
-                .pointer("/arguments/0/suggestion")
+            let suggestion = argument
+                .get("suggestion")
                 .and_then(Value::as_str)
                 .unwrap_or("No WAE suggestion was provided.");
             send_notification(
@@ -497,6 +570,7 @@ fn execute_command(connection: &Connection, params: &Value) -> Result<Value, Str
                 "window/showMessage",
                 json!({ "type": 3, "message": suggestion }),
             )?;
+            Ok(Value::Null)
         }
         Some("wae.suppressWithReason") => {
             // VS Code supplies a reason through its richer prompt. Generic LSP clients (including
@@ -509,49 +583,223 @@ fn execute_command(connection: &Connection, params: &Value) -> Result<Value, Str
                     "message": "Use the WAE suppression-template quick fix, then enter a concrete reason after `--`."
                 }),
             )?;
+            Ok(Value::Null)
         }
-        Some(command) => {
-            return Err(format!("unsupported WAE command `{command}`"));
+        Some("wae.explainRule") => {
+            let rule =
+                argument.get("ruleId").and_then(Value::as_str).ok_or("ruleId is required")?;
+            let descriptor = wae_core::rule_registry::descriptor(rule)
+                .ok_or_else(|| format!("unknown rule `{rule}`"))?;
+            if notify {
+                let fix = descriptor
+                    .documentation()
+                    .map(|docs| docs.fix.replace('\n', " "))
+                    .unwrap_or_default();
+                send_notification(
+                    connection,
+                    "window/showMessage",
+                    json!({
+                        "type": 3,
+                        "message": format!(
+                            "{} — {}: {} Fix: {} Docs: {}",
+                            descriptor.id,
+                            descriptor.title,
+                            descriptor.description,
+                            fix,
+                            wae_core::rule_docs::help_uri(descriptor.id)
+                        )
+                    }),
+                )?;
+            }
+            Ok(json!({
+                "ruleId": descriptor.id,
+                "title": descriptor.title,
+                "markdown": format!("# {}\n\n{}", descriptor.id, wae_core::rule_docs::markdown_body(descriptor)),
+                "helpUri": wae_core::rule_docs::help_uri(descriptor.id)
+            }))
         }
-        None => return Err("workspace/executeCommand requires `command`".into()),
+        Some("wae.showDependencyPath") => {
+            let path = argument
+                .get("path")
+                .and_then(Value::as_array)
+                .ok_or("path is required")?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if notify {
+                let rule = argument.get("ruleId").and_then(Value::as_str).unwrap_or("WAE");
+                send_notification(
+                    connection,
+                    "window/showMessage",
+                    json!({ "type": 3, "message": format!("{rule} dependency path: {}", path.join(" → ")) }),
+                )?;
+            }
+            Ok(json!({ "path": path }))
+        }
+        Some("wae.inspectModule") => {
+            let uri = argument.get("uri").and_then(Value::as_str).ok_or("uri is required")?;
+            let Some(root) = state.root_for_uri(uri) else { return Ok(Value::Null) };
+            let Some(path) = uri_path(&root, uri) else { return Ok(Value::Null) };
+            let inspection = state
+                .workspaces
+                .get(&root)
+                .and_then(|workspace| workspace.analysis.as_ref())
+                .and_then(|analysis| inspect_module(analysis, &ModuleId(path)));
+            serde_json::to_value(inspection).map_err(err)
+        }
+        Some("wae.architectureOverview") => {
+            let workspaces = state
+                .workspaces
+                .iter()
+                .map(|(root, workspace)| {
+                    Ok(json!({
+                        "root": Url::from_directory_path(root).map(|url| url.to_string()).unwrap_or_default(),
+                        "ready": workspace.analysis.is_some(),
+                        "overview": workspace
+                            .analysis
+                            .as_ref()
+                            .map(|analysis| architecture_overview(analysis))
+                    }))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(json!({ "workspaces": workspaces }))
+        }
+        Some("wae.reanalyze") => {
+            state.schedule_all(true);
+            Ok(Value::Null)
+        }
+        Some(command) => Err(format!("unsupported WAE command `{command}`")),
+        None => Err("workspace/executeCommand requires `command`".into()),
     }
-    Ok(Value::Null)
 }
 
-fn lsp_diagnostic(root: &Path, diagnostic: &Diagnostic, source: Option<&str>) -> Value {
+/// Import locations for the dependency-path edges of the diagnostics being published, gathered
+/// in one pass over the project's dependencies.
+struct EdgeLocations {
+    locations: HashMap<(String, String), SourceLocation>,
+}
+
+impl EdgeLocations {
+    fn for_diagnostics<'a>(
+        analysis: &Analysis,
+        diagnostics: impl Iterator<Item = &'a Diagnostic>,
+    ) -> Self {
+        let wanted = diagnostics
+            .flat_map(|diagnostic| {
+                diagnostic
+                    .dependency_path
+                    .windows(2)
+                    .map(|edge| (edge[0].0.clone(), edge[1].0.clone()))
+            })
+            .collect::<HashSet<_>>();
+        let mut locations = HashMap::new();
+        if !wanted.is_empty() {
+            for dependency in &analysis.project.dependencies {
+                let key = (dependency.from.0.clone(), dependency.to.0.clone());
+                if wanted.contains(&key) {
+                    locations.entry(key).or_insert_with(|| dependency.location.clone());
+                }
+            }
+        }
+        Self { locations }
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self { locations: HashMap::new() }
+    }
+
+    fn get(&self, from: &str, to: &str) -> Option<&SourceLocation> {
+        self.locations.get(&(from.to_owned(), to.to_owned()))
+    }
+}
+
+fn lsp_diagnostic(
+    root: &Path,
+    diagnostic: &Diagnostic,
+    source: Option<&str>,
+    edges: &EdgeLocations,
+) -> Value {
     let location = diagnostic.primary_location.as_ref();
     let line = location.map_or(0, |location| location.line.saturating_sub(1));
-    let column =
-        location.map_or(0, |location| utf16_column(source, location.line, location.column));
+    let (column, end_column) = location.map_or((0, 1), |location| {
+        let start = utf16_column(source, location.line, location.column);
+        let end = token_end_column(source, location.line, location.column)
+            .map(|end| utf16_column(source, location.line, end))
+            .unwrap_or(start.saturating_add(1));
+        (start, end.max(start.saturating_add(1)))
+    });
+    let path =
+        diagnostic.dependency_path.iter().map(|module| module.0.as_str()).collect::<Vec<_>>();
+    let mut message = diagnostic.message.clone();
+    if path.len() > 2 {
+        message.push_str(&format!("\nPath: {}", path.join(" → ")));
+    }
+    let mut related = diagnostic
+        .secondary_locations
+        .iter()
+        .filter_map(|location| {
+            related_location(root, location, "Related architecture location".into())
+        })
+        .collect::<Vec<_>>();
+    let steps = path.len().saturating_sub(1);
+    for (index, edge) in path.windows(2).enumerate() {
+        if let Some(location) = edges.get(edge[0], edge[1]) {
+            let step = format!("Path {}/{steps}: {} imports {}", index + 1, edge[0], edge[1]);
+            related.extend(related_location(root, location, step));
+        }
+    }
     json!({
         "range": {
             "start": { "line": line, "character": column },
-            "end": { "line": line, "character": column.saturating_add(1) }
+            "end": { "line": line, "character": end_column }
         },
         "severity": match diagnostic.severity { Severity::Error => 1, Severity::Warning => 2, Severity::Info => 3 },
         "code": diagnostic.rule_id.0,
+        "codeDescription": { "href": wae_core::rule_docs::help_uri(&diagnostic.rule_id.0) },
         "source": "wae",
-        "message": diagnostic.message,
-        "relatedInformation": diagnostic.secondary_locations.iter().filter_map(|location| {
-            let related_source = std::fs::read_to_string(root.join(&location.file)).ok();
-            let related_column = utf16_column(
-                related_source.as_deref(),
-                location.line,
-                location.column,
-            );
-            Some(json!({
-                "location": {
-                    "uri": file_uri(root, &location.file)?,
-                    "range": {
-                        "start": { "line": location.line.saturating_sub(1), "character": related_column },
-                        "end": { "line": location.line.saturating_sub(1), "character": related_column.saturating_add(1) }
-                    }
-                },
-                "message": "Related architecture location"
-            }))
-        }).collect::<Vec<_>>(),
-        "data": { "ruleId": diagnostic.rule_id.0, "suggestion": diagnostic.suggestion }
+        "message": message,
+        "relatedInformation": related,
+        "data": {
+            "ruleId": diagnostic.rule_id.0,
+            "fingerprint": diagnostic.fingerprint,
+            "suggestion": diagnostic.suggestion,
+            "dependencyPath": path
+        }
     })
+}
+
+fn related_location(root: &Path, location: &SourceLocation, message: String) -> Option<Value> {
+    let source = std::fs::read_to_string(root.join(&location.file)).ok();
+    let column = utf16_column(source.as_deref(), location.line, location.column);
+    let end = token_end_column(source.as_deref(), location.line, location.column)
+        .map(|end| utf16_column(source.as_deref(), location.line, end))
+        .unwrap_or(column.saturating_add(1));
+    Some(json!({
+        "location": {
+            "uri": file_uri(root, &location.file)?,
+            "range": {
+                "start": { "line": location.line.saturating_sub(1), "character": column },
+                "end": { "line": location.line.saturating_sub(1), "character": end.max(column.saturating_add(1)) }
+            }
+        },
+        "message": message
+    }))
+}
+
+/// One-based, exclusive code-point column after a quoted specifier starting at `column`, so the
+/// editor underlines the whole import string instead of a single character.
+fn token_end_column(
+    source: Option<&str>,
+    one_based_line: usize,
+    one_based_column: usize,
+) -> Option<usize> {
+    let line = source?.lines().nth(one_based_line.checked_sub(1)?)?;
+    let mut characters = line.chars().skip(one_based_column.checked_sub(1)?);
+    let quote = characters.next().filter(|quote| matches!(quote, '"' | '\'' | '`'))?;
+    let length = characters.position(|character| character == quote)?;
+    Some(one_based_column + length + 2)
 }
 
 fn utf16_column(source: Option<&str>, one_based_line: usize, one_based_column: usize) -> usize {
@@ -571,7 +819,15 @@ fn capabilities() -> Value {
             "hoverProvider": true,
             "codeActionProvider": true,
             "executeCommandProvider": {
-                "commands": ["wae.showSuggestion", "wae.suppressWithReason"]
+                "commands": [
+                    "wae.showSuggestion",
+                    "wae.suppressWithReason",
+                    "wae.explainRule",
+                    "wae.showDependencyPath",
+                    "wae.inspectModule",
+                    "wae.architectureOverview",
+                    "wae.reanalyze"
+                ]
             },
             "workspace": { "workspaceFolders": { "supported": true, "changeNotifications": true } }
         },
@@ -670,7 +926,8 @@ mod tests {
             suggestion: Some("Move the dependency".into()),
             ..Diagnostic::default()
         };
-        let value = lsp_diagnostic(Path::new("/project"), &diagnostic, None);
+        let value =
+            lsp_diagnostic(Path::new("/project"), &diagnostic, None, &EdgeLocations::empty());
         assert_eq!(value["range"]["start"]["line"], 2);
         assert_eq!(value["range"]["start"]["character"], 4);
         assert_eq!(value["data"]["ruleId"], "ARCH-003");
@@ -678,16 +935,76 @@ mod tests {
             "textDocument": { "uri": "file:///project/src/a.ts" },
             "context": { "diagnostics": [value] }
         }));
-        assert_eq!(actions.as_array().unwrap().len(), 3);
+        assert_eq!(actions.as_array().unwrap().len(), 4);
         assert_eq!(actions[0]["command"]["command"], "wae.showSuggestion");
         assert!(actions[0]["edit"].is_null());
-        assert_eq!(actions[1]["command"]["command"], "wae.suppressWithReason");
-        assert!(actions[1]["edit"].is_null());
+        assert_eq!(actions[1]["command"]["command"], "wae.explainRule");
+        assert_eq!(actions[1]["command"]["arguments"][0]["ruleId"], "ARCH-003");
+        assert_eq!(actions[2]["command"]["command"], "wae.suppressWithReason");
+        assert!(actions[2]["edit"].is_null());
         assert_eq!(
-            actions[2]["edit"]["changes"]["file:///project/src/a.ts"][0]["newText"],
+            actions[3]["edit"]["changes"]["file:///project/src/a.ts"][0]["newText"],
             "// wae-ignore ARCH-003 -- \n"
         );
-        assert!(actions[2]["command"].is_null());
+        assert!(actions[3]["command"].is_null());
+        assert_eq!(value["codeDescription"]["href"], wae_core::rule_docs::help_uri("ARCH-003"));
+    }
+
+    #[test]
+    fn transitive_paths_become_clickable_related_information_and_actions() {
+        let root = std::env::temp_dir().join(format!("wae-lsp-path-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "import { b } from './b';\n").unwrap();
+        std::fs::write(root.join("src/b.ts"), "import { c } from \"./c\";\n").unwrap();
+        let mut analysis = Analysis::new(Default::default(), Default::default(), Vec::new());
+        for (from, to, file) in
+            [("src/a.ts", "src/b.ts", "src/a.ts"), ("src/b.ts", "src/c.ts", "src/b.ts")]
+        {
+            analysis.project.dependencies.push(wae_core::domain::Dependency {
+                from: ModuleId(from.into()),
+                to: ModuleId(to.into()),
+                kind: wae_core::domain::DependencyKind::Static,
+                location: SourceLocation { file: file.into(), line: 1, column: 19 },
+            });
+        }
+        let mut diagnostic = Diagnostic::new("RUNTIME-001", "Browser module reaches server code");
+        diagnostic.primary_location =
+            Some(SourceLocation { file: "src/a.ts".into(), line: 1, column: 19 });
+        diagnostic.dependency_path = vec![
+            ModuleId("src/a.ts".into()),
+            ModuleId("src/b.ts".into()),
+            ModuleId("src/c.ts".into()),
+        ];
+        let edges = EdgeLocations::for_diagnostics(&analysis, std::iter::once(&diagnostic));
+        let source = std::fs::read_to_string(root.join("src/a.ts")).unwrap();
+        let value = lsp_diagnostic(&root, &diagnostic, Some(&source), &edges);
+        // The whole './b' specifier (quotes included) is underlined.
+        assert_eq!(value["range"]["start"]["character"], 18);
+        assert_eq!(value["range"]["end"]["character"], 23);
+        assert!(
+            value["message"].as_str().unwrap().ends_with("Path: src/a.ts → src/b.ts → src/c.ts")
+        );
+        let related = value["relatedInformation"].as_array().unwrap();
+        assert_eq!(related.len(), 2);
+        assert_eq!(related[1]["message"], "Path 2/2: src/b.ts imports src/c.ts");
+        assert!(related[1]["location"]["uri"].as_str().unwrap().ends_with("src/b.ts"));
+        assert_eq!(value["data"]["dependencyPath"].as_array().unwrap().len(), 3);
+        let actions = code_actions(&json!({
+            "textDocument": { "uri": "file:///project/src/a.ts" },
+            "context": { "diagnostics": [value] }
+        }));
+        assert_eq!(actions[0]["command"]["command"], "wae.showDependencyPath");
+        assert_eq!(actions[0]["command"]["arguments"][0]["path"][2], "src/c.ts");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn token_end_covers_quoted_specifiers_only() {
+        let source = "import x from 'pkg/sub'; const y = 1;";
+        assert_eq!(token_end_column(Some(source), 1, 15), Some(24));
+        assert_eq!(token_end_column(Some(source), 1, 1), None);
+        assert_eq!(token_end_column(Some("import 'unterminated"), 1, 8), None);
+        assert_eq!(token_end_column(None, 1, 1), None);
     }
 
     #[test]
@@ -705,7 +1022,12 @@ mod tests {
         let mut diagnostic = Diagnostic::new("RESOLVE-001", "missing");
         diagnostic.primary_location =
             Some(SourceLocation { file: "src/a.ts".into(), line: 1, column: code_point_column });
-        let value = lsp_diagnostic(Path::new("/project"), &diagnostic, Some(source));
+        let value = lsp_diagnostic(
+            Path::new("/project"),
+            &diagnostic,
+            Some(source),
+            &EdgeLocations::empty(),
+        );
         assert_eq!(
             value["range"]["start"]["character"],
             source[..specifier_column].encode_utf16().count()

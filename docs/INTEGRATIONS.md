@@ -13,7 +13,8 @@ identities and are parsed or registry-synchronized in the Rust test suite.
 
 - `architecture_check`: versioned diagnostics, incremental counters, analysis timings and bounded
   session metrics;
-- `architecture_explain`: stable rule metadata;
+- `architecture_explain`: stable rule metadata plus rationale, bad and good examples, fix,
+  configuration, known false positives and the documentation URL (the same text as `wae explain`);
 - `dependency_path`: the deterministic shortest path between two resolved modules;
 - `architecture_model`: modules, packages, layers, runtimes, framework metadata, edges and
   diagnostics.
@@ -77,21 +78,25 @@ The repository root contains a composite `action.yml`. Pin a release tag and an 
 ```yaml
 permissions:
   contents: read
-  security-events: write
 
 steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
-  - uses: Don-Erfan/wae@v0.0.30
+  - uses: Don-Erfan/wae@v1.0.0
     with:
-      version: 0.0.30
+      version: 1.0.0
       changed: "true"
       base: origin/main
-      format: sarif
-      upload-sarif: "true"
 ```
 
+The Action runs one machine-readable (`--format json`) analysis and renders it with
+`action/report.js` as inline pull-request annotations (rule, message, dependency path, suggestion)
+and a job summary (totals, layer coverage, existing/introduced/fixed counts and a violation table).
+This adapter only formats the versioned JSON contract; it never evaluates rules. The console shows
+the `format` input (default `human`), SARIF upload to code scanning is opt-in (`upload-sarif:
+"true"`), and the original WAE exit status is propagated last so annotations never hide a failed
+gate. All inputs and outputs are listed in the [CI guide](guides/CI.md).
+
 Ratchet mode still requires a reviewed, committed `.wae/baseline.json`; the Action never creates
-one implicitly. The Action uploads WAE SARIF through GitHub CodeQL's upload adapter and then
-propagates the original WAE exit status, so annotations never hide a failed architecture gate.
+one implicitly.

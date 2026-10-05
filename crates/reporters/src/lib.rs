@@ -238,15 +238,23 @@ fn sarif_rule(rule_id: &str, severity: &Severity) -> serde_json::Value {
     let description =
         descriptor.map_or("Reports a Web Architecture Engine diagnostic.", |rule| rule.description);
     let category = descriptor.map_or("architecture", |rule| rule.category);
-    json!({
+    let mut rule = json!({
         "id": rule_id,
         "name": title.replace(' ', ""),
         "shortDescription": { "text": title },
         "fullDescription": { "text": description },
-        "helpUri": format!("https://github.com/Don-Erfan/wae/blob/master/docs/RULES.md#{}", rule_id.to_ascii_lowercase()),
+        "helpUri": wae_core::rule_docs::help_uri(rule_id),
         "defaultConfiguration": { "level": sarif_level(severity) },
         "properties": { "tags": ["architecture", category] }
-    })
+    });
+    if let Some(descriptor) = descriptor {
+        // GitHub code scanning renders `help.markdown` next to every alert of this rule.
+        rule["help"] = json!({
+            "text": format!("{}: {}", descriptor.title, descriptor.description),
+            "markdown": wae_core::rule_docs::markdown_body(descriptor)
+        });
+    }
+    rule
 }
 
 fn sarif_result(diagnostic: &Diagnostic) -> serde_json::Value {

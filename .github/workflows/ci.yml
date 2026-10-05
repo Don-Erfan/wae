@@ -183,6 +183,8 @@ jobs:
         env:
           WAE_SKIP_DOWNLOAD: "1"
         run: npm pack --dry-run
+      - name: Test GitHub Action annotation and summary renderer
+        run: node --test action/report.test.js
 
   next-compatibility:
     name: Next.js ${{ matrix.next }} compatibility
@@ -336,15 +338,22 @@ jobs:
           git -C "$consumer" remote add origin https://github.com/vercel/commerce.git
           git -C "$consumer" fetch --depth=1 origin 3761e52e60df9c6a316e067dbfd7032e494d3634
           git -C "$consumer" checkout --detach FETCH_HEAD
-          set +e
+          # Default policy: the only cycle in this app is closed by `import type`, which
+          # TypeScript erases, so the false-positive audit requires a clean result.
           (cd "$consumer" && "$GITHUB_WORKSPACE/target/debug/wae-cli" check --no-cache --format json) \
             > target/vercel-commerce-audit.json
+          test "$(jq -r '.sourceModules' target/vercel-commerce-audit.json)" = 66
+          test "$(jq -r '.dependencies' target/vercel-commerce-audit.json)" = 210
+          test "$(jq -r '.failureCount' target/vercel-commerce-audit.json)" = 0
+          # Opting in to design-time cycles reports the same stable identity as before.
+          printf 'version: 1\nrules:\n  ARCH-001:\n    include_type_only: true\n' > "$consumer/wae-type-cycles.yaml"
+          set +e
+          (cd "$consumer" && "$GITHUB_WORKSPACE/target/debug/wae-cli" check --no-cache --format json --config wae-type-cycles.yaml) \
+            > target/vercel-commerce-type-cycles.json
           status=$?
           set -e
           test "$status" = 1
-          test "$(jq -r '.sourceModules' target/vercel-commerce-audit.json)" = 66
-          test "$(jq -r '.dependencies' target/vercel-commerce-audit.json)" = 210
-          test "$(jq -r '.failureCount' target/vercel-commerce-audit.json)" = 1
+          test "$(jq -r '.failureCount' target/vercel-commerce-type-cycles.json)" = 1
           jq -e '
             .diagnostics | length == 1 and
             .[0].rule_id == "ARCH-001" and
@@ -354,7 +363,7 @@ jobs:
               "components/layout/search/filter/dropdown.tsx",
               "components/layout/search/filter/index.tsx"
             ]
-          ' target/vercel-commerce-audit.json
+          ' target/vercel-commerce-type-cycles.json
       - name: Validate npm sidecar installer contract
         working-directory: npm/wae
         run: npm run test:installer

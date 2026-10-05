@@ -2,7 +2,12 @@
   <id>com.donerfan.wae</id>
   <name>Web Architecture Engine</name>
   <vendor>Don Erfan</vendor>
-  <description>Live WAE architecture diagnostics, hover information and quick fixes.</description>
+  <description><![CDATA[
+    Live Web Architecture Engine (WAE) diagnostics for JavaScript and TypeScript in WebStorm and
+    IntelliJ IDEA: layer, feature, package and Next.js runtime boundary violations with the full
+    dependency path, rule explanations, architecture hover and documented-suppression quick fixes
+    (Alt+Enter). Uses the project-local <code>wae-lsp</code> from <code>@don-erfan/wae</code>.
+  ]]></description>
   <depends>com.intellij.modules.platform</depends>
   <depends>com.intellij.modules.ultimate</depends>
   <extensions defaultExtensionNs="com.intellij">

@@ -4,11 +4,9 @@
 
 1. Protect `master` and require the `quality`, `tests`, `audit`, `npm-installer`, and
    `v1 readiness` CI jobs.
-2. Configure npm Trusted Publishing for the wrapper and every native package, repository
-   `Don-Erfan/wae`, and workflow `release-binaries.yml`:
-   `@don-erfan/wae`, `@don-erfan/wae-linux-x64`, `@don-erfan/wae-linux-arm64`,
-   `@don-erfan/wae-darwin-x64`, `@don-erfan/wae-darwin-arm64`, and
-   `@don-erfan/wae-win32-x64`.
+2. Configure npm Trusted Publishing for `@don-erfan/wae` only, repository `Don-Erfan/wae`, and
+   workflow `release-binaries.yml`. Since 1.0.0 WAE publishes a single npm package; the former
+   `@don-erfan/wae-<platform>` packages are no longer built or published.
 3. Keep Cargo, npm, and tag versions identical.
 4. Enable GitHub's immutable releases setting before publishing the first immutable release.
 
@@ -34,10 +32,12 @@ GitHub Actions builds the CLI, LSP and MCP server for every supported native tar
 asset inventory and CycloneDX dependency SBOM from the repository/Cargo.lock,
 and records GitHub SLSA build-provenance attestations for every binary. The curated section for the
 version in `CHANGELOG.md` is prepended to GitHub's generated pull-request notes. npm publication
-uses OIDC; no long-lived `NPM_TOKEN` or interactive OTP belongs in CI. The native packages are
-checksum-verified, published first, and pinned as exact optional dependencies of the portable
-wrapper. The first publication of each new scoped package name may require an npm owner to
-create/authorize that package before Trusted Publishing can take over subsequent releases.
+uses OIDC; no long-lived `NPM_TOKEN` or interactive OTP belongs in CI. The npm job verifies the
+Sigstore-signed `SHA256SUMS`, embeds the 15 component/platform hashes into
+`npm/wae/checksums.json`, checks that the tarball contains only the JavaScript launchers, publishes
+`@don-erfan/wae`, and then installs the published version twice (with and without lifecycle
+scripts) to prove both the `postinstall` download and the first-run download produce a working
+`wae --version` and `wae-mcp`.
 
 Verify a downloaded release exactly as a consumer should:
 
@@ -56,7 +56,12 @@ manifest, binding the release inventory and dependency tree to the same workflow
 
 ## Recovery
 
-- Never move a published tag.
+- Never move a published tag. A tag counts as published once its run has created a GitHub Release
+  or an npm version. A tag whose release run stopped before either (for example `v1.0.0`, first
+  pushed on the pre-release commit and stopped at release-notes extraction) may be deleted and
+  re-created, signed, on the correct commit after that commit's readiness checks are green.
+- Editor packages are attached to the GitHub Release; publishing them to the VS Code Marketplace or
+  JetBrains Marketplace is a separate, manual step with the maintainer's publisher accounts.
 - If every GitHub Release asset was published successfully but the downstream npm job failed,
   fix the release workflow on `master`, wait for CI, and recover only npm from the existing signed
   assets with:

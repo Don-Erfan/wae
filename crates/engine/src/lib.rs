@@ -30,6 +30,7 @@ mod framework_context;
 mod incremental;
 mod persistence;
 mod pipeline;
+pub mod projection;
 mod resolution_context;
 mod suppression;
 mod telemetry;
@@ -114,6 +115,8 @@ pub struct Analysis {
     pub project: Project,
     pub graph: ModuleGraph,
     pub ownership: ArchitectureOwnershipIndex,
+    /// Feature ownership derived from `architecture.features`, keyed by source module.
+    pub features: BTreeMap<ModuleId, FeatureId>,
     pub diagnostics: Vec<Diagnostic>,
     pub failure_policy: FailurePolicy,
     pub incremental: IncrementalStats,
@@ -127,6 +130,7 @@ impl Analysis {
             project,
             graph,
             ownership: ArchitectureOwnershipIndex::default(),
+            features: BTreeMap::new(),
             diagnostics,
             failure_policy: FailurePolicy::default(),
             incremental: IncrementalStats::default(),
@@ -323,7 +327,9 @@ pub fn trace_resolution(request: TraceResolutionRequest) -> Result<ResolutionTra
         tsconfigs,
         workspaces,
         config.resolution.mode,
-    );
+    )
+    .with_virtual_modules(&config.resolution.virtual_modules)
+    .map_err(AnalysisError::Internal)?;
     let candidate_paths = resolver
         .candidate_paths(&resolution_request)
         .into_iter()
@@ -1265,6 +1271,143 @@ mod tests {
                     .as_ref()
                     .is_some_and(|location| location.file == "services/store/app/client.ts")
         }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configured_virtual_modules_replace_unresolved_generated_imports() {
+        // Real-world case: a tsconfig alias to a gitignored, build-generated directory.
+        let root = std::env::temp_dir().join(format!("wae-virtual-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"contentlayer/generated":["./.contentlayer/generated"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/page.ts"),
+            "import { allPosts } from 'contentlayer/generated';\nimport sw from 'virtual:pwa-register';\nimport { x } from './missing';\nexport const p = [allPosts, sw, x];\n",
+        )
+        .unwrap();
+        let unresolved = |config: &str| {
+            fs::write(root.join("wae.yaml"), config).unwrap();
+            let analysis =
+                Engine::default().analyze(AnalyzeRequest::new(&root).without_cache()).unwrap();
+            let mut messages = analysis
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.rule_id.0 == "RESOLVE-001")
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>();
+            messages.sort();
+            (messages, analysis)
+        };
+        let (before, _) = unresolved("version: 1\nresolution:\n  mode: bundler\n");
+        assert_eq!(
+            before,
+            ["Cannot resolve `./missing`", "Cannot resolve `contentlayer/generated`"]
+        );
+        let (after, analysis) = unresolved(
+            "version: 1\nresolution:\n  mode: bundler\n  virtual_modules: ['contentlayer/generated', 'virtual:*']\n",
+        );
+        assert_eq!(after, ["Cannot resolve `./missing`"]);
+        assert!(analysis.project.modules.iter().any(|module| {
+            module.id.0 == "external:virtual:contentlayer/generated"
+                && module.kind == ModuleKind::External
+        }));
+        let trace = trace_resolution(TraceResolutionRequest {
+            root: root.clone(),
+            importer: PathBuf::from("src/page.ts"),
+            specifier: "contentlayer/generated".into(),
+            dependency_kind: wae_core::domain::DependencyKind::Static,
+            config_path: None,
+        })
+        .unwrap();
+        assert_eq!(trace.outcome, "external:virtual:contentlayer/generated");
+        assert!(trace.attempts.iter().any(|attempt| attempt.handler == "virtual-module"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn type_only_cycles_are_ignored_by_default_and_reported_on_request() {
+        // False-positive regression from a real Next.js app: `import type` is erased by
+        // TypeScript, so a cycle closed only by a type import never executes.
+        let root = std::env::temp_dir().join(format!("wae-type-cycle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/db.ts"), "import type { Visibility } from './selector';\nexport const q = (v: Visibility) => v;\n").unwrap();
+        fs::write(
+            root.join("src/selector.ts"),
+            "import { q } from './db';\nexport type Visibility = 'public';\nexport const s = q;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/a.ts"), "import { b } from './b';\nexport const a = 1;\n")
+            .unwrap();
+        fs::write(root.join("src/b.ts"), "import { a } from './a';\nexport const b = a;\n")
+            .unwrap();
+        let cycles = |config: &str| {
+            fs::write(root.join("wae.yaml"), config).unwrap();
+            let analysis =
+                Engine::default().analyze(AnalyzeRequest::new(&root).without_cache()).unwrap();
+            let mut paths = analysis
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.rule_id.0 == "ARCH-001")
+                .map(|diagnostic| diagnostic.dependency_path[0].0.clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        assert_eq!(cycles("version: 1\n"), ["src/a.ts"]);
+        assert_eq!(
+            cycles("version: 1\nrules:\n  ARCH-001:\n    include_type_only: true\n"),
+            ["src/a.ts", "src/db.ts"]
+        );
+        fs::write(
+            root.join("wae.yaml"),
+            "version: 1\nrules:\n  ARCH-003:\n    include_type_only: true\n",
+        )
+        .unwrap();
+        assert!(Engine::default().analyze(AnalyzeRequest::new(&root)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modules_bundled_for_the_browser_by_another_importer_do_not_make_universal_callers_ambiguous()
+    {
+        // False-positive regression: `user/index.ts` is browser-bundled only because a client
+        // component imports it. A universal module importing the same entrypoint must not be
+        // reported as combining browser and server requirements; the leak is RUNTIME-001 once.
+        let root = std::env::temp_dir().join(format!("wae-runtime-005-fp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        fs::create_dir_all(root.join("src/user")).unwrap();
+        fs::create_dir_all(root.join("src/cart")).unwrap();
+        fs::write(root.join("package.json"), r#"{"dependencies":{"next":"16.3.4"}}"#).unwrap();
+        fs::write(root.join("wae.yaml"), "version: 1\nresolution:\n  mode: bundler\n").unwrap();
+        fs::write(
+            root.join("src/app/card.tsx"),
+            "'use client';\nimport { profile } from '../user';\nexport const Card = profile;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/user/index.ts"), "export { profile } from './api';\n").unwrap();
+        fs::write(
+            root.join("src/user/api.ts"),
+            "import 'server-only';\nexport const profile = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/cart/ui.ts"),
+            "import { profile } from '../user';\nexport const ui = profile;\n",
+        )
+        .unwrap();
+        let analysis = Engine::default().analyze(AnalyzeRequest::new(&root)).unwrap();
+        let rules = |id: &str| {
+            analysis.diagnostics.iter().filter(|diagnostic| diagnostic.rule_id.0 == id).count()
+        };
+        assert_eq!(rules("RUNTIME-001"), 1, "{:?}", analysis.diagnostics);
+        assert_eq!(rules("RUNTIME-005"), 0, "{:?}", analysis.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }
 

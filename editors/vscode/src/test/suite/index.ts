@@ -2,6 +2,11 @@ import * as assert from "node:assert/strict";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
+// With `codeDescription`, VS Code exposes the rule ID as `{ value, target }` (a docs link).
+function ruleOf(diagnostic: vscode.Diagnostic): string | number | undefined {
+  return typeof diagnostic.code === "object" ? diagnostic.code.value : diagnostic.code;
+}
+
 export async function run(): Promise<void> {
     const serverPath = process.env.WAE_LSP_PATH;
     assert.ok(serverPath, "WAE_LSP_PATH must point to the test language server");
@@ -21,17 +26,42 @@ export async function run(): Promise<void> {
     let diagnostics: readonly vscode.Diagnostic[] = [];
     while (Date.now() < deadline) {
       diagnostics = vscode.languages.getDiagnostics(uri);
-      if (diagnostics.some((diagnostic) => diagnostic.code === "ARCH-001")) break;
+      if (diagnostics.some((diagnostic) => ruleOf(diagnostic) === "ARCH-001")) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.ok(
-      diagnostics.some((diagnostic) => diagnostic.code === "ARCH-001"),
-      `expected ARCH-001, got ${diagnostics.map((diagnostic) => diagnostic.code).join(", ")}`,
+      diagnostics.some((diagnostic) => ruleOf(diagnostic) === "ARCH-001"),
+      `expected ARCH-001, got ${diagnostics.map(ruleOf).join(", ")}`,
     );
     const commands = await vscode.commands.getCommands(true);
-    assert.ok(commands.includes("wae.check"));
-    assert.ok(commands.includes("wae.showSuggestion"));
-    assert.ok(commands.includes("wae.suppressWithReason"));
+    for (const command of [
+      "wae.check", "wae.showSuggestion", "wae.suppressWithReason", "wae.explainRule",
+      "wae.explainRulePrompt", "wae.showDependencyPath", "wae.inspectCurrentModule",
+      "wae.architectureOverview", "wae.refreshArchitecture",
+    ]) {
+      assert.ok(commands.includes(command), `missing command ${command}`);
+    }
+
+    const arch001 = diagnostics.find((diagnostic) => ruleOf(diagnostic) === "ARCH-001");
+    assert.ok(typeof arch001?.code === "object" && arch001.code.target.toString().includes("RULES.md#arch-001"),
+      "the rule code links to its documentation");
+    assert.ok(arch001?.relatedInformation?.some((related) => related.message.startsWith("Path 1/")),
+      "ARCH-001 must expose its dependency path as related information");
+
+    const explained = await vscode.commands.executeCommand<{ markdown: string }>(
+      "wae.explainRule", { ruleId: "ARCH-001" });
+    assert.match(explained.markdown, /### How to fix/);
+
+    const overview = await vscode.commands.executeCommand<{
+      workspaces: { ready: boolean; overview: { violations: { ruleId: string }[] } | null }[]
+    }>("wae.architectureOverview");
+    assert.ok(overview.workspaces[0].ready);
+    assert.ok(overview.workspaces[0].overview?.violations.some((group) => group.ruleId === "ARCH-001"));
+
+    const inspection = await vscode.commands.executeCommand<{ id: string; dependents: unknown[] }>(
+      "wae.inspectModule", { uri: uri.toString() });
+    assert.equal(inspection.id, "src/a.ts");
+    assert.ok(inspection.dependents.length > 0);
 
     const applied = await vscode.commands.executeCommand<boolean>("wae.suppressWithReason", {
       uri: uri.toString(),

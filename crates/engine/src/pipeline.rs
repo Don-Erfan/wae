@@ -300,7 +300,9 @@ fn execute<P: ParserAdapter>(
         tsconfigs,
         workspace_resolver,
         config.resolution.mode,
-    );
+    )
+    .with_virtual_modules(&config.resolution.virtual_modules)
+    .map_err(AnalysisError::Internal)?;
     let default_package =
         Package { name: PackageName(project_name(&root)), root_path: normalize(&root) };
     let mut project = Project::default();
@@ -959,6 +961,7 @@ fn execute<P: ParserAdapter>(
         project,
         graph,
         ownership,
+        features: features.into_iter().collect(),
         diagnostics,
         failure_policy: crate::FailurePolicy::from_output(&config.output),
         incremental,

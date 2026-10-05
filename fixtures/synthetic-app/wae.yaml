@@ -1,0 +1,41 @@
+# Synthetic product fixture (Phase 36): every rule family is violated on purpose, exactly once
+# where possible. `expected-diagnostics.json` is the golden result shared by the CLI, MCP and LSP
+# tests. Regenerate it with `WAE_UPDATE_GOLDEN=1 cargo test -p wae-cli synthetic_app`.
+version: 1
+project:
+  include: ["**/*.ts", "**/*.tsx"]
+  exclude: ["**/node_modules/**"]
+resolution:
+  mode: bundler
+runtime:
+  browser_incompatible_packages: ["pg"]
+  edge_incompatible_packages: ["node:*"]
+architecture:
+  layers:
+    app:
+      patterns: ["apps/web/src/app/**", "apps/web/src/middleware.ts"]
+      canImport: [features, entities, shared, server, packages]
+    features:
+      patterns: ["apps/web/src/features/**"]
+      canImport: [entities, shared, server]
+    server:
+      patterns: ["apps/web/src/server/**"]
+      canImport: [entities, shared]
+    entities:
+      patterns: ["apps/web/src/entities/**"]
+      canImport: [shared]
+    shared:
+      patterns: ["apps/web/src/shared/**"]
+      canImport: []
+    packages:
+      patterns: ["packages/*/src/**"]
+      canImport: [packages, shared]
+  features:
+    roots: ["src/features"]
+    public_entrypoints: ["index.ts", "index.tsx"]
+  forbidden_dependencies:
+    - from: "apps/web/src/app/**"
+      to: "apps/web/src/server/db.ts"
+  forbidden_package_dependencies:
+    - from: "@synthetic/ui"
+      to: "@synthetic/web"

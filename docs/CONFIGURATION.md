@@ -26,6 +26,7 @@ project:
 resolution:
   mode: nodenext
   custom_conditions: []
+  virtual_modules: ["contentlayer/generated"]
 
 framework:
   auto_detect: true
@@ -53,6 +54,7 @@ architecture:
 rules:
   ARCH-001: error
   ARCH-004: warning
+  ARCH-007: off              # same as `{ enabled: false }`
   ARCH-006:
     severity: warning
     max_depth: 8
@@ -83,6 +85,25 @@ overrides:
     rules:
       ARCH-003: warning
 ```
+
+## Rule settings
+
+A rule is set to a severity (`error`, `warning`, `info`), to `off`, or to an object:
+
+```yaml
+rules:
+  ARCH-003: warning
+  ARCH-010: off
+  ARCH-001:
+    severity: error
+    include_type_only: true   # also report cycles closed only by `import type`
+```
+
+`enabled: false` is equivalent to `off`. Structural options are rule-specific and validated:
+`max_depth` and `entrypoints` (ARCH-006), `max_fan_out` (ARCH-007), `max_fan_in` (ARCH-008),
+`entrypoints` (ARCH-009) and `include_type_only` (ARCH-001). By default `ARCH-001` ignores cycles
+that exist only through type-only imports, because TypeScript erases them and they never execute.
+Run `wae explain <RULE_ID>` for each rule's options and examples.
 
 ## Inheritance and path overrides
 
@@ -163,6 +184,12 @@ continuations, before resolution. AST traversal is iterative so deeply nested
 or minified valid files do not consume the Rust call stack.
 
 Absolute module specifiers are rejected because they escape the project analysis boundary.
+
+`resolution.virtual_modules` lists import-specifier globs (`*` also matches `/`) for modules that
+exist only after a build step or inside a bundler, such as `contentlayer/generated`. When the
+normal resolver chain cannot find a real module for a matching specifier, WAE records an opaque
+`external:virtual:<specifier>` node instead of `RESOLVE-001`. Real files always win, and
+`wae resolve` shows the `virtual-module` step in its trace.
 Duplicate workspace package names are configuration errors.
 
 ## Framework adapters

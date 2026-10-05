@@ -29,7 +29,7 @@ resolution:
 architecture:
   layers:
     tooling:
-      patterns: ["editors/**", "npm/**"]
+      patterns: ["editors/**", "npm/**", "action/**"]
       canImport: []
     app:
       patterns: ["**/app/**"]

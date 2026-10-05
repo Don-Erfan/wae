@@ -1,3 +1,5 @@
+pub mod rule_docs;
+
 pub const ENGINE_NAME: &str = "Web Architecture Engine";
 pub const ENGINE_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
@@ -686,12 +688,17 @@ pub mod rule_registry {
             }
         }
 
+        pub fn documentation(&self) -> Option<&'static crate::rule_docs::RuleDocumentation> {
+            crate::rule_docs::documentation(self.id)
+        }
+
         pub fn supports_option(&self, option: &str) -> bool {
             match option {
                 "max_depth" => self.id == "ARCH-006",
                 "max_fan_out" => self.id == "ARCH-007",
                 "max_fan_in" => self.id == "ARCH-008",
                 "entrypoints" => matches!(self.id, "ARCH-006" | "ARCH-009"),
+                "include_type_only" => self.id == "ARCH-001",
                 _ => false,
             }
         }

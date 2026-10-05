@@ -34,7 +34,17 @@ pub fn init(root: &Path, preset: ConfigPreset) -> CliOutput {
             path: Some(path.display().to_string()),
         })
     }) {
-        Ok(()) => CliOutput::success(format!("Created {}", path.display())),
+        Ok(()) => {
+            let preset_note = if preset == ConfigPreset::Blank {
+                "blank preset: no layers are assumed"
+            } else {
+                "review the generated layer patterns before enforcing them"
+            };
+            CliOutput::success(format!(
+                "Created {} ({preset_note}).\n\nNext steps:\n  wae discover   Propose layers and features from this repository\n  wae check      Run every enabled rule (exit 1 on violations)\n  wae baseline   Accept existing violations, then gate CI with `wae check --changed`\n  wae explain <RULE_ID>  Learn what a rule protects and how to fix it",
+                path.display()
+            ))
+        }
         Err(error) => CliOutput::project_error(config_error(&error)),
     }
 }
@@ -578,12 +588,89 @@ pub fn config_validate(
 
 pub fn explain(rule: &str) -> CliOutput {
     let Some(descriptor) = wae_core::rule_registry::descriptor(rule) else {
-        return CliOutput::project_error(format!("Unknown rule id: {rule}"));
+        return CliOutput::project_error(format!(
+            "Unknown rule id: {rule}\nRun `wae rules` to list every rule."
+        ));
     };
-    CliOutput::success(format!(
-        "{}\n{}: {}",
-        descriptor.id, descriptor.title, descriptor.description
-    ))
+    CliOutput::success(wae_core::rule_docs::explain_text(descriptor).trim_end().to_string())
+}
+
+pub fn rules() -> CliOutput {
+    let mut output = format!("{:<13} {:<34} {}\n", "RULE", "TITLE", "CATEGORY");
+    for rule in wae_core::rule_registry::RULES {
+        output.push_str(&format!("{:<13} {:<34} {}\n", rule.id, rule.title, rule.category));
+    }
+    output.push_str("\nRun `wae explain <RULE_ID>` for examples and configuration.");
+    CliOutput::success(output)
+}
+
+pub fn graph_module(
+    root: &Path,
+    query: &str,
+    json: bool,
+    cancellation: &CancellationToken,
+) -> CliOutput {
+    use wae_engine::projection::{find_module, inspect_module};
+    let analysis = match analyze(root, cancellation) {
+        Ok(result) => result,
+        Err(output) => return output,
+    };
+    let Some(inspection) =
+        find_module(&analysis, query).and_then(|id| inspect_module(&analysis, &id))
+    else {
+        return CliOutput::project_error(format!(
+            "module `{query}` is not part of the analyzed project; pass a project-relative path such as src/app/page.tsx"
+        ));
+    };
+    if json {
+        return match serde_json::to_string_pretty(&inspection) {
+            Ok(value) => CliOutput::success(value),
+            Err(error) => CliOutput::internal_error(error.to_string()),
+        };
+    }
+    let mut out = format!("{}\n", inspection.id);
+    out.push_str(&format!("  kind:      {}\n", inspection.kind));
+    out.push_str(&format!("  package:   {}\n", inspection.package));
+    out.push_str(&format!(
+        "  layer:     {}\n",
+        inspection.layer.as_deref().unwrap_or("unassigned")
+    ));
+    out.push_str(&format!(
+        "  runtime:   {} ({}: {})\n",
+        inspection.runtime.runtime, inspection.runtime.source, inspection.runtime.reason
+    ));
+    if let Some(path) = &inspection.runtime.propagation_path {
+        out.push_str(&format!("  via:       {}\n", path.join(" → ")));
+    }
+    if let Some(framework) = &inspection.framework {
+        let role = inspection.framework_attributes.get("role").map_or("module", String::as_str);
+        out.push_str(&format!("  framework: {framework} ({role})\n"));
+    }
+    for (title, edges) in
+        [("Dependencies", &inspection.dependencies), ("Dependents", &inspection.dependents)]
+    {
+        out.push_str(&format!("\n{title} ({}):\n", edges.len()));
+        for edge in edges {
+            out.push_str(&format!(
+                "  {:<48} {:<9} {}:{}:{}\n",
+                edge.module, edge.kind, edge.file, edge.line, edge.column
+            ));
+        }
+    }
+    out.push_str(&format!("\nDiagnostics ({}):\n", inspection.diagnostics.len()));
+    for diagnostic in &inspection.diagnostics {
+        let state = if diagnostic.suppressed { " (suppressed)" } else { "" };
+        out.push_str(&format!(
+            "  {} [{}] {}{state}\n",
+            diagnostic.rule_id.0, diagnostic.fingerprint, diagnostic.message
+        ));
+        if diagnostic.dependency_path.len() > 1 {
+            let path =
+                diagnostic.dependency_path.iter().map(|id| id.0.as_str()).collect::<Vec<_>>();
+            out.push_str(&format!("    path: {}\n", path.join(" → ")));
+        }
+    }
+    CliOutput::success(out.trim_end().to_string())
 }
 
 pub fn resolve(
