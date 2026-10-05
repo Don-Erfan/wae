@@ -110,6 +110,13 @@ impl TsConfigIndex {
         let project_root = project_root.canonicalize().map_err(|error| error.to_string())?;
         let mut directories = BTreeSet::new();
         for importer in importers {
+            // The project root is canonical, so importer paths must use the same identity before
+            // ancestor comparisons. This matters for `/var` -> `/private/var` on macOS, Windows
+            // verbatim paths, and repositories reached through a symlink. Discovered importers
+            // normally exist; the lexical fallback keeps overlays/deleted files analyzable.
+            let importer =
+                if importer.is_absolute() { importer.clone() } else { project_root.join(importer) };
+            let importer = importer.canonicalize().unwrap_or(importer);
             let mut directory = importer.parent();
             while let Some(candidate) = directory {
                 if !normalized_path_is_within(candidate, &project_root) {
